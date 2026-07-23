@@ -10,8 +10,15 @@
 --     toggle on/off, set display names (aliases). New entities that
 --     appear later just need a quick toggle here.
 --   Screen 2 - Layout editor: move & resize each panel directly on
---     the monitor with arrow keys / WASD, add group titles and
---     separator lines for a proper dashboard.
+--     the monitor with arrow keys / WASD, add group titles, separator
+--     lines and action buttons (k), edit which properties/calculated
+--     properties a panel shows (f), or generate a whole dashboard at
+--     once with auto-layout (g), which groups entities by
+--     provider/topic kind (falling back to a name-prefix guess) and
+--     sizes each panel from its actual field count.
+--
+-- Action buttons run entity.action (with a fixed args value) on tap,
+-- confirmed in the monitor's top status bar for a few seconds.
 --
 -- In display mode, newly announced entities are added to the config
 -- automatically (disabled) and a hint is printed.
@@ -266,9 +273,18 @@ end
 
 local function requestRegistry() send({ type = "registry" }) end
 
--- for later use (e.g. touch buttons):
 local function sendCommand(entity, action, cmdArgs)
   send({ type = "command", entity = entity, action = action, args = cmdArgs })
+end
+
+-- turns a raw typed string into a number/boolean/string, same rule the
+-- broker's own terminal browser uses, so buttons behave consistently
+local function parseArg(raw)
+  if not raw or raw == "" then return nil end
+  if tonumber(raw) then return tonumber(raw) end
+  if raw:lower() == "true" then return true end
+  if raw:lower() == "false" then return false end
+  return raw
 end
 
 -- returns true if a NEW provider entity was added to the config
@@ -287,13 +303,16 @@ local function handleNet(msg, senderId)
     local e = ents[msg.entity]
     e.data, e.lastSeen, e.stale = msg.data, os.clock(), false
     if msg.topic then e.kind = msg.topic:match("^([^/]+)/") or e.kind end
+    if msg.actions and #msg.actions > 0 then e.actions = msg.actions end
 
   elseif msg.type == "registry" and msg.entities then
     for name, info in pairs(msg.entities) do
       if info.kind == "provider" then
-        registry[name] = { kind = info.kind, online = info.online }
+        local acts = info.actions or (info.meta and info.meta.actions) or {}
+        registry[name] = { kind = info.kind, online = info.online, actions = acts }
         ents[name] = ents[name] or {}
         if info.meta then ents[name].meta = info.meta end
+        if #acts > 0 then ents[name].actions = acts end
         if cfg.entities[name] == nil then
           cfg.entities[name] = { enabled = false }
           newFound = true
@@ -357,6 +376,43 @@ local function entityTitle(name)
   if c and c.alias and c.alias ~= "" then return c.alias end
   local e = ents[name]
   return (e and e.meta and e.meta.title) or tostring(name)
+end
+
+local function getEntityActions(name)
+  local e = ents[name]
+  local reg = registry[name]
+  if e and e.actions and #e.actions > 0 then return e.actions end
+  if e and e.meta and e.meta.actions and #e.meta.actions > 0 then return e.meta.actions end
+  if reg and reg.actions and #reg.actions > 0 then return reg.actions end
+  return {}
+end
+
+local function availableFieldsFor(name)
+  local e = ents[name]
+  if e and e.meta and e.meta.fields and #e.meta.fields > 0 then return e.meta.fields end
+  if e and e.data then return autoFields(e.data) end
+  return {}
+end
+
+--------------------------------------------------------------------
+-- calculated fields: small sandboxed Lua expressions over an
+-- entity's live data table, e.g. "output - input" or "energy / maxEnergy"
+--------------------------------------------------------------------
+local CALC_MATH = {
+  floor = math.floor, ceil = math.ceil, abs = math.abs,
+  min = math.min, max = math.max, sqrt = math.sqrt, huge = math.huge,
+}
+
+local function evalCalc(expr, data)
+  local env = { math = CALC_MATH }
+  for k, v in pairs(data or {}) do
+    if type(k) == "string" and k:sub(1, 1) ~= "_" then env[k] = v end
+  end
+  local chunk, err = load("return (" .. expr .. ")", "calc", "t", env)
+  if not chunk then return nil, err end
+  local ok, result = pcall(chunk)
+  if not ok then return nil, result end
+  return result
 end
 
 --------------------------------------------------------------------
@@ -432,7 +488,8 @@ local function gaugeRow(win, y, w, label, frac, invert)
   return y + 1
 end
 
-local function renderPanel(win, name)
+local function renderPanel(win, item)
+  local name = item.entity
   win.setVisible(false)
   win.setBackgroundColor(colors.black)
   win.clear()
@@ -491,10 +548,42 @@ local function renderPanel(win, name)
   local d = ent.data
   local meta = ent.meta
   local y = 2
-  for _, f in ipairs((meta and meta.fields) or autoFields(d)) do
+
+  -- pick which fields to show: an explicit per-panel selection
+  -- (toggled properties + user-added calculated properties) if one
+  -- was configured, otherwise fall back to showing everything
+  local fieldList
+  if item.fields and #item.fields > 0 then
+    fieldList = {}
+    for _, cf in ipairs(item.fields) do
+      if cf.source == "calc" then
+        -- evalCalc never throws: on failure it returns nil plus a
+        -- non-nil error string, so that's what distinguishes a real
+        -- error from an expression that legitimately evaluates to nil
+        local val, err = evalCalc(cf.expr, d)
+        fieldList[#fieldList + 1] = {
+          key = cf.key, label = cf.label, type = cf.type or "number", invert = cf.invert,
+          _calcVal = val, _calcErr = err ~= nil,
+        }
+      else
+        local def
+        for _, mf in ipairs((meta and meta.fields) or autoFields(d)) do
+          if mf.key == cf.key then def = mf break end
+        end
+        fieldList[#fieldList + 1] = def or { key = cf.key, label = cf.key, type = "number" }
+      end
+    end
+  else
+    fieldList = (meta and meta.fields) or autoFields(d)
+  end
+
+  for _, f in ipairs(fieldList) do
     if y > h then break end
-    local v = d[f.key]
-    if v ~= nil then
+    local v = (f._calcVal ~= nil or f._calcErr) and f._calcVal or d[f.key]
+    if v == nil and f._calcErr then
+      row(win, y, w, f.label, "ERR", colors.red)
+      y = y + 1
+    elseif v ~= nil then
       if f.type == "gauge" then
         y = gaugeRow(win, y, w, f.label, v, f.invert)
       else
@@ -527,15 +616,13 @@ end
 
 local function drawDecor(item)
   if item.type == "title" then
-    local win = item._win
-    if not win then return end
-    local w, h = win.getSize()
-    win.setBackgroundColor(colors.black)
-    win.clear()
-    win.setCursorPos(1, 1)
-    win.setTextColor(colors.white)
+    mon.setBackgroundColor(colors.black)
+    mon.setCursorPos(item.x, item.y)
+    mon.write(string.rep(" ", item.w))
+    mon.setCursorPos(item.x, item.y)
+    mon.setTextColor(colors.white)
     local txt = "-- " .. (item.text or "Group") .. " "
-    win.write(txt .. string.rep("-", math.max(0, w - #txt)))
+    mon.write(txt:sub(1, item.w) .. string.rep("-", math.max(0, item.w - #txt)))
   elseif item.type == "line" then
     mon.setBackgroundColor(colors.gray)
     for dy = 0, item.h - 1 do
@@ -544,6 +631,25 @@ local function drawDecor(item)
     end
     mon.setBackgroundColor(colors.black)
   end
+end
+
+-- action button: solid color block with centered label, tapped via
+-- monitor_touch (see runDisplay). Drawn straight to the monitor like
+-- "line" decor since it never needs its own scrollable window.
+local function renderButton(item)
+  local w, h = item.w, item.h
+  mon.setBackgroundColor(colors[item.bg] or colors.blue)
+  for dy = 0, h - 1 do
+    mon.setCursorPos(item.x, item.y + dy)
+    mon.write(string.rep(" ", w))
+  end
+  local label = tostring(item.label or item.action or "?")
+  local ty = item.y + math.floor((h - 1) / 2)
+  local tx = item.x + math.max(0, math.floor((w - #label) / 2))
+  mon.setCursorPos(tx, ty)
+  mon.setTextColor(colors[item.fg] or colors.white)
+  mon.write(label:sub(1, w))
+  mon.setBackgroundColor(colors.black)
 end
 
 local function itemVisible(item)
@@ -559,6 +665,14 @@ end
 --------------------------------------------------------------------
 local animPos, animDir = 1, 1
 local ANIM_W = 8
+local MON_BANNER_TIME = 3
+local monBanner = nil
+
+-- called when a dashboard button is tapped; shown in the top bar for
+-- a few seconds so the user gets visible confirmation of the click
+local function setMonBanner(msg)
+  monBanner = { text = msg, time = os.clock() }
+end
 
 local function drawStatusBar()
   local W = mon.getSize()
@@ -595,9 +709,16 @@ local function drawStatusBar()
   end
   local clock = os.date("%H:%M")
   local right = ("%d/%d ok  %s"):format(ok, total, clock)
+
+  -- a fresh button click overrides the right side for a few seconds
+  if monBanner and os.clock() - monBanner.time <= MON_BANNER_TIME then
+    right = "> " .. monBanner.text
+  end
+
   if #right < W then
     mon.setCursorPos(W - #right + 1, 1)
-    mon.setTextColor(ok < total and colors.red or colors.gray)
+    mon.setTextColor((monBanner and os.clock() - monBanner.time <= MON_BANNER_TIME) and colors.yellow
+      or (ok < total and colors.red or colors.gray))
     mon.write(right)
   end
 end
@@ -610,7 +731,7 @@ local function renderAll(sel)
       if item.type == "panel" then
         item._win = item._win or window.create(mon, item.x, item.y, item.w, item.h, false)
         item._win.reposition(item.x, item.y, item.w, item.h)
-        local ok, err = pcall(renderPanel, item._win, item.entity)
+        local ok, err = pcall(renderPanel, item._win, item)
         if not ok then
           pcall(function()
             item._win.setBackgroundColor(colors.black)
@@ -627,6 +748,8 @@ local function renderAll(sel)
             item._win.setVisible(true)
           end)
         end
+      elseif item.type == "button" then
+        pcall(renderButton, item)
       else
         pcall(drawDecor, item)
       end
@@ -667,7 +790,8 @@ end
 local function clampItem(item)
   local W, H = mon.getSize()
   local top = 1 + STATUS_ROWS   -- row 1 is reserved for the status bar
-  local minW = item.type == "panel" and 8 or item.type == "title" and 3 or 1
+  local minW = item.type == "panel" and 8 or item.type == "title" and 3
+    or item.type == "button" and 4 or 1
   local minH = item.type == "panel" and 3 or 1
   if item.type == "title" then item.h = 1 end
   item.w = math.max(minW, math.min(item.w, W))
@@ -718,6 +842,101 @@ local function ensurePanels()
 end
 
 --------------------------------------------------------------------
+-- auto-layout: group entities by provider/topic kind (falling back to
+-- a name-prefix guess) and shelf-pack each group into a compact grid,
+-- sizing every panel from its actual field count instead of a fixed
+-- one-size-fits-all box.
+--------------------------------------------------------------------
+local function titleCase(s)
+  return (s:gsub("^%l", string.upper))
+end
+
+-- topic-derived kind ("energy", "reactor", ...) if known, else fall
+-- back to the entity name with trailing digits stripped ("reactor1"
+-- -> "reactor"), else "misc"
+local function guessGroup(name)
+  local e = ents[name]
+  if e and e.kind and e.kind ~= "" then return e.kind end
+  local base = name:match("^(.-)%d*$")
+  if base and base ~= "" then return base end
+  return "misc"
+end
+
+local function panelSize(name)
+  local e = ents[name]
+  local meta = e and e.meta
+  local fields = (meta and meta.fields) or (e and e.data and autoFields(e.data)) or {}
+  local n = math.max(#fields, 1)
+  local h = math.min(14, math.max(3, n + 1))
+  local title = entityTitle(name)
+  local w = math.max(20, math.min(30, #title + 8))
+  return w, h
+end
+
+-- regenerates panel placement + group titles from scratch; keeps any
+-- per-panel field selections (matched by entity name) and leaves
+-- manually placed buttons/titles/lines untouched
+local function autoLayout()
+  local oldFields = {}
+  for _, item in ipairs(cfg.layout) do
+    if item.type == "panel" and item.fields then oldFields[item.entity] = item.fields end
+  end
+
+  local kept = {}
+  for _, item in ipairs(cfg.layout) do
+    if item.type ~= "panel" and not item.autoGroup then
+      kept[#kept + 1] = item
+    end
+  end
+
+  local groups, groupOrder = {}, {}
+  for name, c in pairs(cfg.entities) do
+    if c.enabled then
+      local g = guessGroup(name)
+      if not groups[g] then groups[g] = {} groupOrder[#groupOrder + 1] = g end
+      groups[g][#groups[g] + 1] = name
+    end
+  end
+  table.sort(groupOrder)
+  for _, list in pairs(groups) do table.sort(list) end
+
+  local W, H = mon.getSize()
+  local cursorY = 1 + STATUS_ROWS
+  local newItems = {}
+  local GAP = 1
+
+  for _, g in ipairs(groupOrder) do
+    local list = groups[g]
+    if #list > 0 then
+      newItems[#newItems + 1] = {
+        type = "title", text = ("%s (%d)"):format(titleCase(g), #list),
+        x = 1, y = cursorY, w = W, h = 1, autoGroup = true,
+      }
+      cursorY = cursorY + 1
+
+      local x, shelfY, shelfH = 1, cursorY, 0
+      for _, name in ipairs(list) do
+        local w, h = panelSize(name)
+        if x > 1 and x + w - 1 > W then
+          shelfY = shelfY + shelfH + GAP
+          x, shelfH = 1, 0
+        end
+        local item = { type = "panel", entity = name, x = x, y = shelfY, w = w, h = h }
+        if oldFields[name] then item.fields = oldFields[name] end
+        newItems[#newItems + 1] = item
+        x = x + w
+        shelfH = math.max(shelfH, h)
+      end
+      cursorY = shelfY + shelfH + GAP + 1
+    end
+  end
+
+  for _, item in ipairs(newItems) do kept[#kept + 1] = item end
+  cfg.layout = kept
+  saveConfig()
+end
+
+--------------------------------------------------------------------
 -- terminal UI helpers (setup mode)
 --------------------------------------------------------------------
 local function tClear()
@@ -743,6 +962,69 @@ local function prompt(label, default)
   term.write(label)
   term.setTextColor(colors.white)
   return read(nil, nil, nil, default)
+end
+
+local COLOR_NAMES = {
+  "white", "orange", "magenta", "lightBlue", "yellow", "lime", "pink", "gray",
+  "lightGray", "cyan", "purple", "blue", "brown", "green", "red", "black",
+}
+
+-- simple arrow-key single-select list, used for entity/action/color
+-- pickers when configuring a button. allowCustom appends a free-text
+-- entry. Returns the chosen string, or nil if the user cancelled.
+local function pickList(title, items, allowCustom, colorFn)
+  local list = {}
+  for _, v in ipairs(items) do list[#list + 1] = v end
+  if allowCustom then list[#list + 1] = "<custom...>" end
+  if #list == 0 then return nil end
+
+  local sel, offset = 1, 0
+  local function draw()
+    local w, h = term.getSize()
+    tClear()
+    tLine(1, title, colors.yellow)
+    tLine(2, string.rep("-", w), colors.gray)
+    local listH = h - 4
+    if sel - offset > listH then offset = sel - listH end
+    if sel - offset < 1 then offset = sel - 1 end
+    for i = 1, listH do
+      local idx = i + offset
+      local it = list[idx]
+      if not it then break end
+      term.setCursorPos(1, 2 + i)
+      term.clearLine()
+      if idx == sel then
+        term.setTextColor(colors.black)
+        term.setBackgroundColor(colors.yellow)
+        term.write(it:sub(1, w))
+        term.setBackgroundColor(colors.black)
+      else
+        term.setTextColor((colorFn and colorFn(it)) or colors.white)
+        term.write(it:sub(1, w))
+      end
+    end
+    tLine(h, "up/down: select  enter: choose  esc: cancel", colors.lightGray)
+  end
+
+  draw()
+  while true do
+    local ev = { os.pullEvent("key") }
+    local k = ev[2]
+    if k == keys.up then
+      sel = math.max(1, sel - 1) draw()
+    elseif k == keys.down then
+      sel = math.min(#list, sel + 1) draw()
+    elseif k == keys.enter then
+      local chosen = list[sel]
+      if chosen == "<custom...>" then
+        local txt = prompt("value: ", "")
+        return txt ~= "" and txt or nil
+      end
+      return chosen
+    elseif k == keys.escape then
+      return nil
+    end
+  end
 end
 
 --------------------------------------------------------------------
@@ -845,6 +1127,8 @@ local function itemLabel(item)
     return ("panel  %s%s"):format(entityTitle(item.entity), off)
   elseif item.type == "title" then
     return ('title  "%s"'):format(item.text or "?")
+  elseif item.type == "button" then
+    return ("button %s -> %s.%s"):format(item.label or item.action or "?", item.entity, item.action)
   else
     return "line"
   end
@@ -903,6 +1187,167 @@ local function editItem(item)
   end
 end
 
+-- panel property/calculated-property editor: choose which of the
+-- entity's fields show up on this specific panel, and add custom
+-- calculated fields (small Lua expressions over the entity's data)
+local function fieldsScreen(item)
+  local selIdx, offset = 1, 0
+
+  local function availFields() return availableFieldsFor(item.entity) end
+
+  local function rows()
+    local list = {}
+    for _, f in ipairs(availFields()) do
+      list[#list + 1] = { kind = "meta", f = f }
+    end
+    if item.fields then
+      for _, cf in ipairs(item.fields) do
+        if cf.source == "calc" then list[#list + 1] = { kind = "calc", f = cf } end
+      end
+    end
+    return list
+  end
+
+  local function isChecked(f)
+    if not item.fields then return true end
+    for _, cf in ipairs(item.fields) do
+      if cf.source == "meta" and cf.key == f.key then return true end
+    end
+    return false
+  end
+
+  -- first edit converts the implicit "show everything" default into
+  -- an explicit list seeded with everything currently shown
+  local function ensureExplicit()
+    if not item.fields then
+      item.fields = {}
+      for _, f in ipairs(availFields()) do
+        item.fields[#item.fields + 1] = { source = "meta", key = f.key }
+      end
+    end
+  end
+
+  local function toggleMeta(f)
+    ensureExplicit()
+    for i, cf in ipairs(item.fields) do
+      if cf.source == "meta" and cf.key == f.key then
+        table.remove(item.fields, i)
+        return
+      end
+    end
+    item.fields[#item.fields + 1] = { source = "meta", key = f.key }
+  end
+
+  local function drawTerm()
+    local w, h = term.getSize()
+    tClear()
+    tLine(1, "fields: " .. entityTitle(item.entity), colors.yellow)
+    tLine(2, string.rep("-", w), colors.gray)
+    local list = rows()
+    if selIdx > #list then selIdx = math.max(1, #list) end
+    local listH = h - 6
+    if selIdx - offset > listH then offset = selIdx - listH end
+    if selIdx - offset < 1 then offset = selIdx - 1 end
+    for i = 1, listH do
+      local idx = i + offset
+      local r = list[idx]
+      if not r then break end
+      local line
+      if r.kind == "meta" then
+        local mark = isChecked(r.f) and "[x]" or "[ ]"
+        line = ("%s %s (%s)"):format(mark, r.f.label or r.f.key, r.f.type or "number")
+      else
+        line = ("[calc] %s = %s"):format(r.f.label or r.f.key, r.f.expr)
+      end
+      term.setCursorPos(1, 2 + i)
+      term.clearLine()
+      if idx == selIdx then
+        term.setTextColor(colors.black)
+        term.setBackgroundColor(colors.yellow)
+        term.write(line:sub(1, w))
+        term.setBackgroundColor(colors.black)
+      else
+        term.setTextColor(colors.white)
+        term.write(line:sub(1, w))
+      end
+    end
+    if #list == 0 then tLine(4, "no fields known yet - waiting for data...", colors.gray) end
+    tLine(h - 2, ("mode: %s"):format(item.fields and "custom selection" or "showing all (default)"), colors.lightGray)
+    tLine(h - 1, "space: toggle  c: +calculated  x: delete calc  r: reset all", colors.lightGray)
+    tLine(h, "enter/b: back", colors.lightGray)
+  end
+
+  local function drawMon()
+    clearMonitor()
+    renderAll(item)
+  end
+
+  drawTerm()
+  drawMon()
+  local nextMon = os.clock() + 1
+  while true do
+    os.startTimer(1)   -- guaranteed wake-up, see runDisplay
+    local ev = { os.pullEvent() }
+    local list = rows()
+
+    if ev[1] == "key" then
+      local k = ev[2]
+      if k == keys.up then selIdx = math.max(1, selIdx - 1) drawTerm()
+      elseif k == keys.down then selIdx = math.min(math.max(1, #list), selIdx + 1) drawTerm()
+      elseif k == keys.enter then saveConfig() return
+      end
+    elseif ev[1] == "char" then
+      local c = ev[2]
+      local r = list[selIdx]
+      if c == " " and r and r.kind == "meta" then
+        toggleMeta(r.f)
+        saveConfig()
+        drawTerm() drawMon()
+      elseif c == "c" then
+        local label = prompt("label: ", "")
+        if label ~= "" then
+          local expr = prompt("expression (e.g. output - input): ", "")
+          if expr ~= "" then
+            local typ = pickList("value type:", { "number", "gauge", "energy", "rate", "text" }) or "number"
+            local invert = false
+            if typ == "gauge" then
+              local ans = prompt("invert (high = bad)? y/n: ", "n")
+              invert = ans:lower():sub(1, 1) == "y"
+            end
+            ensureExplicit()
+            item.fields[#item.fields + 1] = {
+              source = "calc", key = "calc_" .. tostring(os.epoch and os.epoch("utc") or os.clock()),
+              label = label, expr = expr, type = typ, invert = invert,
+            }
+            saveConfig()
+          end
+        end
+        drawTerm() drawMon()
+      elseif c == "x" and r and r.kind == "calc" then
+        for i, cf in ipairs(item.fields) do
+          if cf == r.f then table.remove(item.fields, i) break end
+        end
+        saveConfig()
+        drawTerm() drawMon()
+      elseif c == "r" then
+        item.fields = nil
+        saveConfig()
+        drawTerm() drawMon()
+      elseif c == "b" then
+        saveConfig()
+        return
+      end
+    elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
+      pcall(handleNet, ev[3])
+    end
+
+    if os.clock() >= nextMon then
+      drawMon()
+      nextMon = os.clock() + 1
+    end
+  end
+end
+
 local function layoutScreen()
   ensurePanels()
   local sel, offset = 1, 0
@@ -935,8 +1380,8 @@ local function layoutScreen()
         term.write(line:sub(1, w))
       end
     end
-    tLine(h - 1, "enter: move/resize  t: +title  l: +line  x: delete", colors.lightGray)
-    tLine(h, "b: back to entities  q: save & exit setup", colors.lightGray)
+    tLine(h - 1, "enter:edit t:+title l:+line k:+button f:fields x:del", colors.lightGray)
+    tLine(h, "g: auto-layout  b: back to entities  q: save & exit", colors.lightGray)
   end
 
   local function preview(withSel)
@@ -988,6 +1433,43 @@ local function layoutScreen()
         sel = #cfg.layout
         saveConfig()
         editItem(item)
+        draw()
+        preview(true)
+      elseif c == "k" then
+        local entities = sortedEntityNames()
+        local entity = pickList("select entity for button:", entities)
+        if entity then
+          local acts = getEntityActions(entity)
+          local action = pickList("select action on " .. entity .. ":", acts, true)
+          if action then
+            local label = prompt("button label: ", action:upper())
+            local argsRaw = prompt("args (blank = none): ", "")
+            local fg = pickList("text color:", COLOR_NAMES, false, function(n) return colors[n] end) or "white"
+            local bg = pickList("button color:", COLOR_NAMES, false, function(n) return colors[n] end) or "blue"
+            local item = {
+              type = "button", entity = entity, action = action, args = parseArg(argsRaw),
+              label = label ~= "" and label or action:upper(), fg = fg, bg = bg,
+              x = 1, y = 1, w = math.max(10, #(label ~= "" and label or action) + 4), h = 3,
+            }
+            autoPlace(item)
+            clampItem(item)
+            cfg.layout[#cfg.layout + 1] = item
+            sel = #cfg.layout
+            saveConfig()
+            editItem(item)
+          end
+        end
+        draw()
+        preview(true)
+      elseif c == "f" and cfg.layout[sel] and cfg.layout[sel].type == "panel" then
+        fieldsScreen(cfg.layout[sel])
+        draw()
+        preview(true)
+      elseif c == "g" then
+        local ans = prompt("regenerate auto-layout? this replaces panel positions (y/n): ", "n")
+        if ans:lower():sub(1, 1) == "y" then
+          autoLayout()
+        end
         draw()
         preview(true)
       elseif c == "x" and cfg.layout[sel] then
@@ -1343,7 +1825,16 @@ local function runDisplay()
       handleTerminalChar(ev)
 
     elseif ev[1] == "monitor_touch" then
-      -- later: hit-test panels here
+      local tx, ty = ev[3], ev[4]
+      for _, item in ipairs(cfg.layout) do
+        if item.type == "button" and tx >= item.x and tx <= item.x + item.w - 1
+           and ty >= item.y and ty <= item.y + item.h - 1 then
+          sendCommand(item.entity, item.action, item.args)
+          setMonBanner(("sent '%s' -> %s"):format(item.action, entityTitle(item.entity)))
+          renderAll()
+          break
+        end
+      end
     end
 
     local ok, err = pcall(tick)
