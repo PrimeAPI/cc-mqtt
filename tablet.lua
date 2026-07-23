@@ -260,6 +260,7 @@ end
 local function renderScreen()
   local w, h = term.getSize()
   term.setBackgroundColor(colors.black)
+  term.clear()
 
   if statusBanner and (os.clock() - statusBanner.time > 5) then
     statusBanner = nil
@@ -934,8 +935,24 @@ end
 --------------------------------------------------------------------
 loadConfig()
 
--- Auto-update check on startup as requested
-pcall(checkAndApplyUpdate, "tablet.lua")
+term.clear()
+term.setCursorPos(1, 1)
+term.setTextColor(colors.yellow)
+print("[Updater] Checking GitHub for updates...")
+
+local ok, updated = pcall(checkAndApplyUpdate, "tablet.lua")
+if ok then
+  if updated then
+    print("[Updater] Update applied! Rebooting...")
+    return
+  else
+    print(("[Updater] Up to date (v:%s)"):format(getShortVer(currentVersion)))
+  end
+else
+  printError("[Updater] Update check error: " .. tostring(updated))
+end
+
+sleep(0.5)
 
 findBroker()
 subscribe()
