@@ -4,6 +4,7 @@
 -- * Subscribes to telemetry streams across the cbus network
 -- * Evaluates user-defined rules and triggers automatic actions
 -- * Supports dynamic expression scaling (e.g. fillPercent * 100MFE/t)
+-- * Interactive Rule Creator / Editor Wizard directly on terminal!
 -- * Renders live automation status & audit logs on attached monitors
 -- * Terminal runs interactive TUI (toggle rules, force-test, inspect state)
 --
@@ -30,9 +31,13 @@ local entities      = {}  -- entName -> { id, kind, topics, actions, lastSeen, o
 local state         = {}  -- entName -> { propKey -> propVal }
 local auditLog      = {}  -- list of { time, ruleId, ruleName, entity, action, args, status }
 local rules         = {}  -- list of rule tables
-local viewMode      = "RULES" -- "RULES", "INSPECT", "ENTITIES"
+local viewMode      = "RULES" -- "RULES", "INSPECT", "ENTITIES", "WIZARD"
 local selectedIndex = 1
 local statusBanner  = nil
+local pendingDelete = false
+
+-- Wizard state for creating/editing rules
+local wizardData    = nil
 
 --------------------------------------------------------------------
 -- auto updater
@@ -262,7 +267,6 @@ local function loadConfig()
     end
   end
 
-  -- Default creation on first boot
   rules = defaultRules.rules
   saveConfig()
   setBanner("Created default automations.cfg", false)
@@ -286,7 +290,6 @@ local function findEntityState(entQuery)
     end
   end
 
-  -- Fallback prefix match (e.g. "fisionReactor" -> "fissionReactor1")
   for name, data in pairs(state) do
     local norm = normalizeKey(name)
     if norm:find(targetNorm, 1, true) or targetNorm:find(norm, 1, true) then
@@ -303,12 +306,10 @@ local function getEntityProp(entQuery, propKey)
 
   local pNorm = normalizeKey(propKey)
 
-  -- Direct table match
   for k, v in pairs(entData) do
     if normalizeKey(k) == pNorm then return v end
   end
 
-  -- Property alias mappings
   if pNorm == "waste" or pNorm == "wastepercent" or pNorm == "wastepct" then
     return entData.wastePercent or entData.waste or entData.wastePct or 0
   elseif pNorm == "fillpercent" or pNorm == "fill" or pNorm == "fillpct" or pNorm == "percent" then
@@ -336,15 +337,12 @@ local function preprocessExpression(expr)
   if type(expr) ~= "string" then return tostring(expr or "") end
 
   local s = expr
-  -- Case insensitive logical operators
   s = s:gsub("%f[%w]AND%f[%W]", " and "):gsub("%f[%w]And%f[%W]", " and ")
   s = s:gsub("%f[%w]OR%f[%W]", " or "):gsub("%f[%w]Or%f[%W]", " or ")
   s = s:gsub("%f[%w]NOT%f[%W]", " not "):gsub("%f[%w]Not%f[%W]", " not ")
 
-  -- Percentage sign removal (e.g. "20%" -> "20")
   s = s:gsub("([0-9%.]+)%%", "%1")
 
-  -- Unit suffix expansions
   s = s:gsub("([0-9%.]+)%s*GFE/t", "(%1 * 1000000000)")
   s = s:gsub("([0-9%.]+)%s*GFE",   "(%1 * 1000000000)")
   s = s:gsub("([0-9%.]+)%s*MFE/t", "(%1 * 1000000)")
@@ -354,7 +352,6 @@ local function preprocessExpression(expr)
   s = s:gsub("([0-9%.]+)%s*FE/t",  "(%1 * 1)")
   s = s:gsub("([0-9%.]+)%s*FE",    "(%1 * 1)")
 
-  -- Method call shortcuts
   s = s:gsub("([%w%-_]+)%.isActive%(%s*%)", "%1.isActive")
   s = s:gsub("([%w%-_]+)%.isOperational%(%s*%)", "%1.operational")
   s = s:gsub("([%w%-_]+)%.isFormed%(%s*%)", "%1.formed")
@@ -377,18 +374,15 @@ local function createEvalEnv()
     t = 1,
   }
 
-  -- Proxy table for entity lookups: e.g. fissionReactor.waste
   setmetatable(env, {
     __index = function(t, entName)
       if rawget(t, entName) ~= nil then return rawget(t, entName) end
 
-      -- Entity proxy object
       local proxy = {}
       setmetatable(proxy, {
         __index = function(_, propName)
           local val = getEntityProp(entName, propName)
           if val == nil then
-            -- Allow calling as function (e.g. ent.isActive())
             if propName == "isActive" or propName == "isOperational" or propName == "isFormed" then
               return function()
                 local b = getEntityProp(entName, propName)
@@ -441,7 +435,6 @@ local function sendCommand(entName, actionName, rawArgs)
 
   local parsedArgs = rawArgs
   if type(rawArgs) == "string" then
-    -- Try evaluating argument if it contains math/units or entity refs
     local evalVal, err = safeEval(rawArgs)
     if err == nil and evalVal ~= nil then
       parsedArgs = evalVal
@@ -581,7 +574,6 @@ local function redrawMonitor()
     if y + 1 >= h - 4 then break end
     if i > maxRuleRows then break end
 
-    -- Row 1: Status badge & Name
     mon.setCursorPos(1, y)
     mon.setBackgroundColor(colors.black)
 
@@ -612,7 +604,6 @@ local function redrawMonitor()
     local cntStr = (" (x%d)"):format(r._execCount or 0)
     mon.write(cntStr)
 
-    -- Row 2: Condition summary
     y = y + 1
     mon.setCursorPos(8, y)
     mon.setTextColor(colors.lightGray)
@@ -623,7 +614,6 @@ local function redrawMonitor()
     y = y + 1
   end
 
-  -- Audit Log Header
   if y < h - 4 then
     mon.setCursorPos(1, h - 5)
     mon.setBackgroundColor(colors.gray)
@@ -652,6 +642,129 @@ local function redrawMonitor()
       logY = logY + 1
     end
   end
+end
+
+--------------------------------------------------------------------
+-- interactive rule wizard logic
+--------------------------------------------------------------------
+local function startWizard(existingRuleIndex)
+  viewMode = "WIZARD"
+  if existingRuleIndex and rules[existingRuleIndex] then
+    local r = rules[existingRuleIndex]
+    wizardData = {
+      editingIndex = existingRuleIndex,
+      step = 1,
+      name = r.name or r.id,
+      mode = r.mode or "edge",
+      condition = r.condition or "",
+      actionEntity = r.actions and r.actions[1] and r.actions[1].entity or "",
+      actionName = r.actions and r.actions[1] and r.actions[1].action or "",
+      actionArgs = r.actions and r.actions[1] and tostring(r.actions[1].args or "") or "",
+      hasElse = not not (r.elseActions and #r.elseActions > 0),
+      elseEntity = r.elseActions and r.elseActions[1] and r.elseActions[1].entity or "",
+      elseName = r.elseActions and r.elseActions[1] and r.elseActions[1].action or "",
+      elseArgs = r.elseActions and r.elseActions[1] and tostring(r.elseActions[1].args or "") or "",
+      inputBuffer = r.name or r.id or "",
+    }
+  else
+    wizardData = {
+      editingIndex = nil,
+      step = 1,
+      name = "",
+      mode = "edge",
+      condition = "",
+      actionEntity = "",
+      actionName = "",
+      actionArgs = "",
+      hasElse = false,
+      elseEntity = "",
+      elseName = "",
+      elseArgs = "",
+      inputBuffer = "",
+    }
+  end
+end
+
+local function getDiscoveredEntitiesList()
+  local list = {}
+  local seen = {}
+
+  for n in pairs(state) do
+    if not seen[n] then
+      list[#list + 1] = n
+      seen[n] = true
+    end
+  end
+  for n in pairs(entities) do
+    if not seen[n] then
+      list[#list + 1] = n
+      seen[n] = true
+    end
+  end
+
+  table.sort(list)
+  return list
+end
+
+local function getDiscoveredActionsFor(entName)
+  local acts = {}
+  local e = entities[entName]
+  if e and e.actions then
+    for _, a in ipairs(e.actions) do acts[#acts + 1] = a end
+  end
+
+  if #acts == 0 then
+    local norm = normalizeKey(entName)
+    if norm:find("reactor") or norm:find("fission") then
+      acts = { "scram", "activate", "setBurnRate" }
+    elseif norm:find("matrix") or norm:find("sps") or norm:find("energy") then
+      acts = { "setMaxFlow" }
+    elseif norm:find("chat") then
+      acts = { "chat" }
+    else
+      acts = { "activate", "deactivate", "toggle", "setMaxFlow" }
+    end
+  end
+
+  return acts
+end
+
+local function finishWizard()
+  if not wizardData then return end
+
+  local ruleId = wizardData.name:lower():gsub("%s+", "_"):gsub("[^%w_]", "")
+  if ruleId == "" then ruleId = "rule_" .. tostring(os.epoch("utc")) end
+
+  local ruleObj = {
+    id = ruleId,
+    name = wizardData.name ~= "" and wizardData.name or ruleId,
+    enabled = true,
+    mode = wizardData.mode,
+    minInterval = 1.0,
+    condition = wizardData.condition,
+    actions = {
+      { entity = wizardData.actionEntity, action = wizardData.actionName, args = wizardData.actionArgs }
+    }
+  }
+
+  if wizardData.hasElse and wizardData.elseEntity ~= "" and wizardData.elseName ~= "" then
+    ruleObj.elseActions = {
+      { entity = wizardData.elseEntity, action = wizardData.elseName, args = wizardData.elseArgs }
+    }
+  end
+
+  if wizardData.editingIndex then
+    rules[wizardData.editingIndex] = ruleObj
+    setBanner("Updated rule: " .. ruleObj.name, false)
+  else
+    table.insert(rules, ruleObj)
+    selectedIndex = #rules
+    setBanner("Created new rule: " .. ruleObj.name, false)
+  end
+
+  saveConfig()
+  wizardData = nil
+  viewMode = "RULES"
 end
 
 --------------------------------------------------------------------
@@ -732,6 +845,250 @@ local function redrawTerminal()
       if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
     end
 
+  elseif viewMode == "WIZARD" and wizardData then
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.yellow)
+    local stepTitle = (" INTERACTIVE RULE CREATOR / EDITOR (Step %d) "):format(wizardData.step)
+    term.write(stepTitle .. string.rep(" ", math.max(0, w - #stepTitle)))
+
+    term.setBackgroundColor(colors.black)
+
+    if wizardData.step == 1 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 1: ")
+      term.setTextColor(colors.white)
+      term.write("Rule Title / Friendly Name")
+
+      term.setCursorPos(1, 7)
+      term.setTextColor(colors.gray)
+      term.write("e.g. 'Fission Reactor Emergency Scram'")
+
+      term.setCursorPos(1, 9)
+      term.setTextColor(colors.yellow)
+      term.write("Title: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 2 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 2: ")
+      term.setTextColor(colors.white)
+      term.write("Select Execution Mode:")
+
+      term.setCursorPos(1, 7)
+      term.setTextColor(colors.lime)
+      term.write("[1] edge       ")
+      term.setTextColor(colors.lightGray)
+      term.write("- Trigger once when condition turns true")
+
+      term.setCursorPos(1, 8)
+      term.setTextColor(colors.lime)
+      term.write("[2] continuous ")
+      term.setTextColor(colors.lightGray)
+      term.write("- Dynamic proportional scaling (e.g. fill * MFE)")
+
+      term.setCursorPos(1, 9)
+      term.setTextColor(colors.lime)
+      term.write("[3] state      ")
+      term.setTextColor(colors.lightGray)
+      term.write("- State transitions (then on true, else on false)")
+
+      term.setCursorPos(1, 11)
+      term.setTextColor(colors.yellow)
+      term.write("Press 1, 2, or 3 to select mode.")
+
+    elseif wizardData.step == 3 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 3: ")
+      term.setTextColor(colors.white)
+      term.write("Condition Expression:")
+
+      term.setCursorPos(1, 7)
+      term.setTextColor(colors.gray)
+      term.write("Monitored Telemetry Suggestions:")
+      local disco = getDiscoveredEntitiesList()
+      local y = 8
+      for idx, ent in ipairs(disco) do
+        if y >= 11 then break end
+        term.setCursorPos(2, y)
+        term.setTextColor(colors.lime)
+        term.write("* " .. ent)
+        term.setTextColor(colors.lightGray)
+        local props = state[ent] or {}
+        local pList = {}
+        for pk in pairs(props) do if pk:sub(1,1)~="_" then pList[#pList+1]=pk end end
+        term.write(" (" .. table.concat(pList, ", "):sub(1, w - #ent - 6) .. ")")
+        y = y + 1
+      end
+
+      term.setCursorPos(1, 12)
+      term.setTextColor(colors.yellow)
+      term.write("Condition: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 4 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 4: ")
+      term.setTextColor(colors.white)
+      term.write("Select Action Target Entity:")
+
+      local disco = getDiscoveredEntitiesList()
+      local y = 7
+      for idx, ent in ipairs(disco) do
+        if y >= 11 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.lime)
+        term.write((" [%d] %s"):format(idx, ent))
+        y = y + 1
+      end
+      term.setCursorPos(1, y)
+      term.setTextColor(colors.yellow)
+      term.write((" [%d] Type Custom Entity Name..."):format(#disco + 1))
+
+      term.setCursorPos(1, 13)
+      term.setTextColor(colors.yellow)
+      term.write("Selection / Input: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 5 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 5: ")
+      term.setTextColor(colors.white)
+      term.write("Select Action Name for " .. wizardData.actionEntity .. ":")
+
+      local acts = getDiscoveredActionsFor(wizardData.actionEntity)
+      local y = 7
+      for idx, act in ipairs(acts) do
+        if y >= 11 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.lime)
+        term.write((" [%d] %s"):format(idx, act))
+        y = y + 1
+      end
+      term.setCursorPos(1, y)
+      term.setTextColor(colors.yellow)
+      term.write((" [%d] Type Custom Action..."):format(#acts + 1))
+
+      term.setCursorPos(1, 13)
+      term.setTextColor(colors.yellow)
+      term.write("Selection / Input: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 6 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 6: ")
+      term.setTextColor(colors.white)
+      term.write("Action Arguments (math/units/string):")
+
+      term.setCursorPos(1, 7)
+      term.setTextColor(colors.gray)
+      term.write("e.g. 'fillPercent * 100MFE/t' or '5MFE/t' or leave blank")
+
+      term.setCursorPos(1, 9)
+      term.setTextColor(colors.yellow)
+      term.write("Args: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 7 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 7: ")
+      term.setTextColor(colors.white)
+      term.write("Configure Else Action (when condition is false)?")
+
+      term.setCursorPos(1, 7)
+      term.setTextColor(colors.lime)
+      term.write("[1] No  - Finish and save rule")
+
+      term.setCursorPos(1, 8)
+      term.setTextColor(colors.lime)
+      term.write("[2] Yes - Add Else Action")
+
+      term.setCursorPos(1, 10)
+      term.setTextColor(colors.yellow)
+      term.write("Press 1 or 2.")
+
+    elseif wizardData.step == 8 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 8: ")
+      term.setTextColor(colors.white)
+      term.write("Else Action Target Entity:")
+
+      local disco = getDiscoveredEntitiesList()
+      local y = 7
+      for idx, ent in ipairs(disco) do
+        if y >= 11 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.lime)
+        term.write((" [%d] %s"):format(idx, ent))
+        y = y + 1
+      end
+      term.setCursorPos(1, y)
+      term.setTextColor(colors.yellow)
+      term.write((" [%d] Type Custom Entity..."):format(#disco + 1))
+
+      term.setCursorPos(1, 13)
+      term.setTextColor(colors.yellow)
+      term.write("Selection / Input: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 9 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 9: ")
+      term.setTextColor(colors.white)
+      term.write("Else Action Name for " .. wizardData.elseEntity .. ":")
+
+      local acts = getDiscoveredActionsFor(wizardData.elseEntity)
+      local y = 7
+      for idx, act in ipairs(acts) do
+        if y >= 11 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.lime)
+        term.write((" [%d] %s"):format(idx, act))
+        y = y + 1
+      end
+      term.setCursorPos(1, y)
+      term.setTextColor(colors.yellow)
+      term.write((" [%d] Type Custom Action..."):format(#acts + 1))
+
+      term.setCursorPos(1, 13)
+      term.setTextColor(colors.yellow)
+      term.write("Selection / Input: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.step == 10 then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Step 10: ")
+      term.setTextColor(colors.white)
+      term.write("Else Action Arguments:")
+
+      term.setCursorPos(1, 7)
+      term.setTextColor(colors.gray)
+      term.write("e.g. '0' or '500kFE/t' or leave blank")
+
+      term.setCursorPos(1, 9)
+      term.setTextColor(colors.yellow)
+      term.write("Else Args: ")
+      term.setTextColor(colors.white)
+      term.write(wizardData.inputBuffer .. "_")
+    end
+
   elseif viewMode == "INSPECT" then
     local r = rules[selectedIndex]
     term.setCursorPos(1, 3)
@@ -775,8 +1132,19 @@ local function redrawTerminal()
         end
       end
 
+      if r.elseActions and #r.elseActions > 0 then
+        term.setCursorPos(1, 12)
+        term.setTextColor(colors.cyan)
+        term.write("Else Actions:")
+        term.setTextColor(colors.white)
+        for idx, act in ipairs(r.elseActions) do
+          term.setCursorPos(13, 12 + idx - 1)
+          term.write(("%s -> %s(%s)"):format(act.entity, act.action, tostring(act.args or "")))
+        end
+      end
+
       if r._lastErr then
-        term.setCursorPos(1, 14)
+        term.setCursorPos(1, 15)
         term.setTextColor(colors.red)
         term.write("Last Error: " .. tostring(r._lastErr))
       end
@@ -833,12 +1201,145 @@ local function redrawTerminal()
   term.setCursorPos(1, h)
   term.setBackgroundColor(colors.blue)
   term.setTextColor(colors.white)
-  local ctrlStr = " [Space]Toggle | [T]Test | [E]Inspect | [R]Reload | [Tab]View"
-  term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
+
+  if viewMode == "WIZARD" then
+    local ctrlStr = " [Enter]Next Step | [Esc]Cancel Wizard"
+    term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
+  else
+    local ctrlStr = " [N]New | [E]Edit | [D]Delete | [Space]Toggle | [T]Test | [Tab]View"
+    term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
+  end
+end
+
+local function handleWizardInput(val)
+  if not wizardData then return end
+  local step = wizardData.step
+
+  if step == 1 then
+    wizardData.name = val
+    wizardData.step = 2
+    wizardData.inputBuffer = ""
+
+  elseif step == 2 then
+    if val == "1" or val:lower():find("edge") then wizardData.mode = "edge"
+    elseif val == "2" or val:lower():find("cont") then wizardData.mode = "continuous"
+    elseif val == "3" or val:lower():find("state") then wizardData.mode = "state"
+    else wizardData.mode = "edge" end
+
+    wizardData.step = 3
+    wizardData.inputBuffer = wizardData.condition or ""
+
+  elseif step == 3 then
+    wizardData.condition = val
+    wizardData.step = 4
+    wizardData.inputBuffer = ""
+
+  elseif step == 4 then
+    local disco = getDiscoveredEntitiesList()
+    local num = tonumber(val)
+    if num and num >= 1 and num <= #disco then
+      wizardData.actionEntity = disco[num]
+    else
+      wizardData.actionEntity = val
+    end
+    wizardData.step = 5
+    wizardData.inputBuffer = ""
+
+  elseif step == 5 then
+    local acts = getDiscoveredActionsFor(wizardData.actionEntity)
+    local num = tonumber(val)
+    if num and num >= 1 and num <= #acts then
+      wizardData.actionName = acts[num]
+    else
+      wizardData.actionName = val
+    end
+    wizardData.step = 6
+    wizardData.inputBuffer = wizardData.actionArgs or ""
+
+  elseif step == 6 then
+    wizardData.actionArgs = val
+    wizardData.step = 7
+    wizardData.inputBuffer = ""
+
+  elseif step == 7 then
+    if val == "2" or val:lower() == "y" or val:lower() == "yes" then
+      wizardData.hasElse = true
+      wizardData.step = 8
+      wizardData.inputBuffer = ""
+    else
+      wizardData.hasElse = false
+      finishWizard()
+    end
+
+  elseif step == 8 then
+    local disco = getDiscoveredEntitiesList()
+    local num = tonumber(val)
+    if num and num >= 1 and num <= #disco then
+      wizardData.elseEntity = disco[num]
+    else
+      wizardData.elseEntity = val
+    end
+    wizardData.step = 9
+    wizardData.inputBuffer = ""
+
+  elseif step == 9 then
+    local acts = getDiscoveredActionsFor(wizardData.elseEntity)
+    local num = tonumber(val)
+    if num and num >= 1 and num <= #acts then
+      wizardData.elseName = acts[num]
+    else
+      wizardData.elseName = val
+    end
+    wizardData.step = 10
+    wizardData.inputBuffer = wizardData.elseArgs or ""
+
+  elseif step == 10 then
+    wizardData.elseArgs = val
+    finishWizard()
+  end
 end
 
 local function handleTerminalKey(ev)
   local key = ev[2]
+
+  if viewMode == "WIZARD" then
+    if key == keys.escape then
+      wizardData = nil
+      viewMode = "RULES"
+      setBanner("Cancelled rule wizard", false)
+      redrawTerminal()
+
+    elseif key == keys.backspace then
+      if wizardData and #wizardData.inputBuffer > 0 then
+        wizardData.inputBuffer = wizardData.inputBuffer:sub(1, -2)
+        redrawTerminal()
+      end
+
+    elseif key == keys.enter then
+      if wizardData then
+        handleWizardInput(wizardData.inputBuffer)
+        redrawTerminal()
+      end
+    end
+    return
+  end
+
+  if pendingDelete then
+    if key == keys.y then
+      local rName = rules[selectedIndex] and rules[selectedIndex].name or ""
+      table.remove(rules, selectedIndex)
+      if selectedIndex > #rules then selectedIndex = math.max(1, #rules) end
+      saveConfig()
+      setBanner("Deleted rule: " .. rName, false)
+      pendingDelete = false
+      redrawTerminal()
+    else
+      pendingDelete = false
+      setBanner("Cancelled delete", false)
+      redrawTerminal()
+    end
+    return
+  end
 
   if key == keys.tab then
     if viewMode == "RULES" then viewMode = "ENTITIES"
@@ -855,12 +1356,29 @@ local function handleTerminalKey(ev)
       selectedIndex = math.min(#rules, selectedIndex + 1)
       redrawTerminal()
 
+    elseif key == keys.n then
+      startWizard(nil)
+      redrawTerminal()
+
+    elseif key == keys.e or key == keys.enter then
+      if #rules > 0 and rules[selectedIndex] then
+        startWizard(selectedIndex)
+        redrawTerminal()
+      end
+
+    elseif key == keys.d or key == keys.delete then
+      if #rules > 0 and rules[selectedIndex] then
+        pendingDelete = true
+        setBanner("Delete rule '" .. rules[selectedIndex].name .. "'? Press [Y] to confirm", true)
+        redrawTerminal()
+      end
+
     elseif key == keys.space then
       local r = rules[selectedIndex]
       if r then
         r.enabled = not r.enabled
         saveConfig()
-        setBanner(("Rule '%s' %s"):format(r.id, r.enabled and "ENABLED" or "DISABLED"), false)
+        setBanner(("Rule '%s' %s"):format(r.name or r.id, r.enabled and "ENABLED" or "DISABLED"), false)
         redrawTerminal()
       end
 
@@ -870,15 +1388,9 @@ local function handleTerminalKey(ev)
         r._lastRun = 0
         r._lastState = nil
         evaluateRule(r)
-        setBanner("Force triggered rule: " .. r.id, false)
+        setBanner("Force triggered rule: " .. r.name, false)
         redrawTerminal()
         redrawMonitor()
-      end
-
-    elseif key == keys.e or key == keys.enter then
-      if #rules > 0 then
-        viewMode = "INSPECT"
-        redrawTerminal()
       end
 
     elseif key == keys.r then
@@ -888,8 +1400,21 @@ local function handleTerminalKey(ev)
     end
 
   elseif viewMode == "INSPECT" then
-    if key == keys.backspace or key == keys.b or key == keys.escape or key == keys.left then
+    if key == keys.e then
+      startWizard(selectedIndex)
+      redrawTerminal()
+    elseif key == keys.backspace or key == keys.b or key == keys.escape or key == keys.left then
       viewMode = "RULES"
+      redrawTerminal()
+    end
+  end
+end
+
+local function handleTerminalChar(ev)
+  if viewMode == "WIZARD" and wizardData then
+    local ch = ev[2]
+    if ch and #ch == 1 then
+      wizardData.inputBuffer = wizardData.inputBuffer .. ch
       redrawTerminal()
     end
   end
@@ -953,7 +1478,6 @@ while not findBroker(false) do
   sleep(2)
 end
 
--- Subscribe to all topics & fetch registry
 rednet.send(broker, {
   type = "subscribe",
   patterns = { "#" },
@@ -980,6 +1504,9 @@ while true do
 
   elseif ev[1] == "key" then
     handleTerminalKey(ev)
+
+  elseif ev[1] == "char" then
+    handleTerminalChar(ev)
   end
 
   local t = now()

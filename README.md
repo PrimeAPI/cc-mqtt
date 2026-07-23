@@ -73,13 +73,16 @@ If you are familiar with the **MQTT** protocol (ISO/IEC 20922), `cc:mqtt` implem
 ### 4. `controller.lua` — Automation & Control Server
 * **Role**: Evaluates triggers and automations across all connected network entities, executing remote actions automatically and displaying live rule status & audit logs on attached monitors.
 * **Features**:
+  * **Interactive Terminal Rule Creator / Editor Wizard**: Create or edit automation rules directly on the computer terminal step-by-step with live entity and action suggestions!
   * **Flexible Expression Engine**: Evaluates conditions and dynamic action arguments with built-in unit constants (`MFE/t`, `kFE/t`, `GFE/t`) and property proxies.
   * **Multiple Execution Modes**: Supports `edge` (trigger once on state change), `continuous` (dynamic proportional scaling), and `state` (then/else state transitions).
   * **Monitor Status & Audit Log**: Renders rule health badges (`[OK]`, `[TRIG]`, `[ACT]`, `[OFF]`, `[ERR]`) and a real-time scrolling audit log of invoked actions.
   * **Interactive Terminal TUI**:
+    * `[N]`: Launch **Interactive Rule Creator Wizard** to add a new automation rule step-by-step.
+    * `[E]` / `[Enter]`: Launch **Interactive Rule Editor Wizard** to edit the selected rule.
+    * `[D]` / `[Del]`: Delete the selected rule (with `[Y]` confirmation).
     * `[Space]`: Toggle individual automation rules on/off.
     * `[T]`: Force test/trigger selected rule manually.
-    * `[E]` / `[Enter]`: Inspect detailed rule conditions, actions, and evaluation errors.
     * `[Tab]`: Switch between Rules view and Monitored Entities telemetry state.
 
 ---
