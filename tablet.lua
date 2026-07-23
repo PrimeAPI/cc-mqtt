@@ -353,10 +353,11 @@ end
 --------------------------------------------------------------------
 -- UI state & non-flicker rendering engine
 --------------------------------------------------------------------
-local activeTab       = "DASHBOARD" -- "DASHBOARD", "ACTIONS", "ENTITIES", "SETTINGS", "INSPECT", "ADD_METRIC", "ADD_ACTION", "INPUT_ARG"
+local activeTab       = "DASHBOARD" -- "DASHBOARD", "ACTIONS", "ENTITIES", "SETTINGS", "INSPECT", "WIZARD_ENTITY", "WIZARD_FIELD", "WIZARD_ACTION", "INPUT_ARG", "RENAME_METRIC"
 local inspectEntity   = nil
 local inspectScroll   = 1
 local selectedAction  = nil
+local editMetricIdx   = nil
 local inputBuffer     = ""
 local statusBanner    = nil
 
@@ -423,20 +424,43 @@ local function renderScreen()
 
         term.setCursorPos(1, y)
         term.setBackgroundColor(colors.black)
+
+        -- 1. Custom Label Column (6 chars + 1 space = 7 chars total)
         term.setTextColor(colors.cyan)
-        local entName = m.entity:sub(1, 9)
-        term.write(entName .. " ")
-        term.setTextColor(colors.lightGray)
-        local keyName = m.key:sub(1, 8)
-        term.write(keyName .. string.rep(" ", math.max(1, 9 - #keyName)))
+        local rawLabel = m.label or m.entity
+        local displayLabel = rawLabel:sub(1, 6)
+        term.write(displayLabel .. string.rep(" ", math.max(1, 7 - #displayLabel)))
+
+        -- 2. Value / Bar Area (w - 7 chars = 19 chars on w=26)
+        local availW = math.max(10, w - 7)
 
         if not ent or not ent.data then
           term.setTextColor(colors.gray)
           term.write("offline")
+        elseif type(val) == "number" then
+          local kLower = m.key:lower()
+          if (val >= 0 and val <= 1) and (kLower:find("percent") or kLower:find("fill") or kLower == "fuel" or kLower == "coolant" or kLower == "waste" or kLower == "damage" or kLower == "steam" or kLower == "charge") then
+            local pct = math.floor(val * 100 + 0.5)
+            local pctStr = string.format("%3d%%", pct)
+            local barW = math.max(3, availW - #pctStr - 1)
+            local fill = math.floor(val * barW + 0.5)
+            local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
+
+            term.setTextColor(isDanger and colors.red or colors.lime)
+            term.write(string.rep("#", fill))
+            term.setTextColor(colors.gray)
+            term.write(string.rep(".", barW - fill))
+            term.setTextColor(colors.white)
+            term.write(" " .. pctStr)
+          else
+            local formatted, valColor = formatSmartValue(m.key, val)
+            term.setTextColor(valColor)
+            term.write(formatted:sub(1, availW))
+          end
         else
           local formatted, valColor = formatSmartValue(m.key, val)
           term.setTextColor(valColor)
-          term.write(formatted:sub(1, math.max(1, w - 20)))
+          term.write(formatted:sub(1, availW))
         end
 
         local cx, _ = term.getCursorPos()
@@ -671,9 +695,18 @@ local function renderScreen()
       for idx, m in ipairs(cfg.metrics) do
         if y >= h - 5 then break end
         term.setCursorPos(1, y)
+        term.setTextColor(colors.cyan)
+        local nick = (m.label or m.entity):sub(1, 6)
+        term.write(nick .. string.rep(" ", math.max(1, 7 - #nick)))
+
+        term.setTextColor(colors.lightGray)
+        local keyText = (m.entity .. "." .. m.key)
+        term.write(keyText:sub(1, math.max(1, w - 15)))
+
+        term.setCursorPos(w - 7, y)
+        term.setBackgroundColor(colors.blue)
         term.setTextColor(colors.white)
-        local mText = padLine(("%d. %s.%s"):format(idx, m.entity, m.key), w - 4)
-        term.write(mText)
+        term.write("[N]")
         term.setBackgroundColor(colors.red)
         term.setTextColor(colors.white)
         term.write(" [X]")
@@ -849,6 +882,32 @@ local function renderScreen()
       term.setBackgroundColor(colors.black)
       term.write(string.rep(" ", w))
     end
+
+  elseif activeTab == "RENAME_METRIC" then
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.yellow)
+    term.write(padLine(" RENAME METRIC NICKNAME", w))
+
+    local target = cfg.metrics[editMetricIdx]
+    term.setCursorPos(1, 4)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.cyan)
+    term.write("Metric: " .. (target and (target.entity .. "." .. target.key) or "?"))
+
+    term.setCursorPos(1, 6)
+    term.setTextColor(colors.yellow)
+    term.write("Enter short nickname (max 6):")
+
+    term.setCursorPos(1, 8)
+    term.setTextColor(colors.white)
+    term.write(" > " .. inputBuffer .. "_")
+
+    for r = 9, h - 2 do
+      term.setCursorPos(1, r)
+      term.setBackgroundColor(colors.black)
+      term.write(string.rep(" ", w))
+    end
   end
 
   -- Status Banner Line (Line h-1)
@@ -1000,37 +1059,42 @@ local function handleTouch(x, y)
       renderScreen()
 
     elseif y >= 7 then
-      -- Delete buttons touch handling
-      if x >= w - 4 then
-        -- Check metric deletion vs action deletion
-        local metricCount = #cfg.metrics
-        local mStart = 7
-        local mEnd = mStart + (metricCount > 0 and metricCount or 1) - 1
+      -- Metric rename vs deletion touch handling
+      local metricCount = #cfg.metrics
+      local mStart = 7
+      local mEnd = mStart + (metricCount > 0 and metricCount or 1) - 1
 
-        if metricCount > 0 and y >= mStart and y <= mEnd then
-          local delIdx = y - mStart + 1
-          if cfg.metrics[delIdx] then
-            local removed = table.remove(cfg.metrics, delIdx)
+      if metricCount > 0 and y >= mStart and y <= mEnd then
+        local idx = y - mStart + 1
+        if cfg.metrics[idx] then
+          if x >= w - 4 then
+            local removed = table.remove(cfg.metrics, idx)
             saveConfig()
-            setBanner("Removed metric: " .. removed.entity .. "." .. removed.key, false)
+            setBanner("Removed metric: " .. (removed.label or (removed.entity .. "." .. removed.key)), false)
+            renderScreen()
+            return
+          elseif x >= w - 8 then
+            editMetricIdx = idx
+            inputBuffer = cfg.metrics[idx].label or cfg.metrics[idx].entity
+            activeTab = "RENAME_METRIC"
             renderScreen()
             return
           end
         end
+      end
 
-        local aStart = mEnd + 2
-        local actionCount = #cfg.quickActions
-        local aEnd = aStart + (actionCount > 0 and actionCount or 1) - 1
+      local aStart = mEnd + 2
+      local actionCount = #cfg.quickActions
+      local aEnd = aStart + (actionCount > 0 and actionCount or 1) - 1
 
-        if actionCount > 0 and y >= aStart and y <= aEnd then
-          local delIdx = y - aStart + 1
-          if cfg.quickActions[delIdx] then
-            local removed = table.remove(cfg.quickActions, delIdx)
-            saveConfig()
-            setBanner("Removed action: " .. (removed.label or removed.action), false)
-            renderScreen()
-            return
-          end
+      if actionCount > 0 and y >= aStart and y <= aEnd then
+        local delIdx = y - aStart + 1
+        if cfg.quickActions[delIdx] then
+          local removed = table.remove(cfg.quickActions, delIdx)
+          saveConfig()
+          setBanner("Removed action: " .. (removed.label or removed.action), false)
+          renderScreen()
+          return
         end
       end
     end
@@ -1146,9 +1210,13 @@ while true do
     end
     renderScreen()
 
-  elseif ev[1] == "char" and activeTab == "INPUT_ARG" then
-    inputBuffer = inputBuffer .. ev[2]
-    renderScreen()
+  elseif ev[1] == "char" and (activeTab == "INPUT_ARG" or activeTab == "RENAME_METRIC") then
+    if activeTab == "RENAME_METRIC" and #inputBuffer >= 6 then
+      -- max 6 chars for label
+    else
+      inputBuffer = inputBuffer .. ev[2]
+      renderScreen()
+    end
 
   elseif ev[1] == "key" then
     local key = ev[2]
@@ -1160,6 +1228,23 @@ while true do
         inspectScroll = inspectScroll + 1
         renderScreen()
       end
+    elseif activeTab == "RENAME_METRIC" then
+      if key == keys.backspace then
+        inputBuffer = inputBuffer:sub(1, -2)
+        renderScreen()
+      elseif key == keys.enter then
+        if editMetricIdx and cfg.metrics[editMetricIdx] then
+          cfg.metrics[editMetricIdx].label = inputBuffer ~= "" and inputBuffer or nil
+          saveConfig()
+          setBanner("Metric nickname updated!", false)
+        end
+        activeTab = "SETTINGS"
+        renderScreen()
+      elseif key == keys.escape then
+        activeTab = "SETTINGS"
+        renderScreen()
+      end
+
     elseif activeTab == "INPUT_ARG" then
       if key == keys.backspace then
         inputBuffer = inputBuffer:sub(1, -2)
