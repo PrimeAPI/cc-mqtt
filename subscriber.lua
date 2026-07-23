@@ -357,7 +357,7 @@ local function gaugeRow(win, y, w, label, frac, invert)
   local trackW = w - #lab - #pct - 3
   if trackW < 3 then
     row(win, y, w, label, pct, colors.white)
-    return
+    return y + 1
   end
   win.setCursorPos(1, y)
   win.setBackgroundColor(colors.black)
@@ -377,6 +377,7 @@ local function gaugeRow(win, y, w, label, frac, invert)
   win.setBackgroundColor(colors.black)
   win.setTextColor(colors.white)
   win.write(" " .. pct)
+  return y + 1
 end
 
 local function renderPanel(win, name)
