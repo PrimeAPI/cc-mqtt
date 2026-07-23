@@ -99,22 +99,26 @@ reboot
 
 ---
 
-### 3. Dashboard Subscriber Setup
-On a ComputerCraft computer connected to a Monitor:
+## 🖥️ Interactive Terminal TUIs & Features
 
-```bash
-wget https://raw.githubusercontent.com/PrimeAPI/cc-mqtt/refs/heads/main/subscriber.lua startup.lua
-```
+### 📡 Broker Interactive TUI (`broker.lua`)
+* **Live Network Overview**: Displays all registered providers, subscribers, and topics with short commit hashes (`VER`).
+* **Entity Inspector**: Browse retained telemetry, view actions, and trigger entity commands.
+* **Offline Entity Management**: Remove individual offline entities (`[D]`) or purge all offline entities (`[P]`).
 
-To configure the dashboard layout for the first time, run:
-```bash
-startup setup
-```
-Follow the on-screen prompts to select entities, set aliases, and position your dashboard elements on the monitor. After saving, simply run:
-```bash
-reboot
-```
-to launch the live dashboard view.
+### ⚙️ Provider Interactive TUI (`provider.lua`)
+* **Real-time Countdown Timers**: Live countdown timers for `Push` (telemetry poll), `Announce` (rednet announce), and `Update` (GitHub auto-update).
+* **Sensor Value Inspector**: Select any attached device to inspect current sensor values in real-time.
+* **Action Simulator**: Select any peripheral action (e.g. `scram`, `setBurnRate`) and simulate triggering it locally with custom arguments as if sent over MQTT!
+* **Immediate State Sync**: Simulated actions automatically publish updated sensor states to the broker immediately.
+
+### 📊 Subscriber Interactive TUI (`subscriber.lua`)
+* **Live Timer Subtitles**: Displays real-time countdown timers for `Draw` (monitor refresh), `Reg` (registry sync), `Sub` (topic re-subscribe), and `Update` (auto-update check).
+* **Live Config Management**:
+  * `[Space]`: Toggle entities **ENABLED** / **DISABLED** directly from the terminal without quitting!
+  * `[A]` / `[Enter]`: Edit display aliases for entities on the fly.
+  * `[S]`: Launch the visual monitor setup editor.
+* **Dual Monitor & Terminal Rendering**: Runs full interactive management TUI on the computer terminal while driving high-performance visual dashboards on attached Monitors.
 
 ---
 
