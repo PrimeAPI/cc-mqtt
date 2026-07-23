@@ -471,6 +471,12 @@ local function renderPanel(win, name)
           end
         else
           text = type(v) == "number" and si(v) or tostring(v)
+          local sUpper = text:upper()
+          if sUpper:find("RUNNING") or sUpper:find("ACTIVE") or sUpper:find("ONLINE") then
+            col = colors.lime
+          elseif sUpper:find("SCRAM") or sUpper:find("OFFLINE") or sUpper:find("STOP") or sUpper:find("DISABLED") then
+            col = colors.red
+          end
         end
         row(win, y, w, f.label, text, col)
         y = y + 1
