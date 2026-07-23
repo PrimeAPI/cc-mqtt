@@ -862,20 +862,54 @@ local function guessGroup(name)
   return "misc"
 end
 
+-- used only when we genuinely have no idea how many fields an entity
+-- will show (no registry meta AND no data received yet) - guessing
+-- low here is what made freshly auto-laid-out panels come out tiny,
+-- since a real entity almost never has just one field
+local DEFAULT_FIELD_GUESS = 6
+
 local function panelSize(name)
   local e = ents[name]
   local meta = e and e.meta
-  local fields = (meta and meta.fields) or (e and e.data and autoFields(e.data)) or {}
-  local n = math.max(#fields, 1)
-  local h = math.min(14, math.max(3, n + 1))
+  local fields = (meta and meta.fields and #meta.fields > 0 and meta.fields)
+    or (e and e.data and autoFields(e.data))
+  local n = fields and math.max(#fields, 1) or DEFAULT_FIELD_GUESS
+  local h = math.min(16, math.max(3, n + 1))
   local title = entityTitle(name)
-  local w = math.max(20, math.min(30, #title + 8))
+  local w = math.max(18, math.min(30, #title + 8))
   return w, h
 end
 
 -- regenerates panel placement + group titles from scratch; keeps any
 -- per-panel field selections (matched by entity name) and leaves
 -- manually placed buttons/titles/lines untouched
+local HGAP = 1              -- horizontal gap between panels on a shelf
+local STRETCH_MAX_W = 44     -- don't let a single panel get absurdly wide
+
+-- once a shelf's members are fixed, grow them to actually use the
+-- monitor's width instead of leaving a big empty strip on the right -
+-- this is what makes the dashboard fill available space
+local function distributeShelfWidths(shelf, W, gap)
+  local n = #shelf
+  if n == 0 then return end
+  local used = gap * (n - 1)
+  for _, it in ipairs(shelf) do used = used + it.w end
+  local leftover = W - used
+  if leftover > 0 then
+    local share = math.floor(leftover / n)
+    local rem = leftover - share * n
+    for i, it in ipairs(shelf) do
+      local grow = share + (i <= rem and 1 or 0)
+      it.w = math.min(STRETCH_MAX_W, it.w + grow)
+    end
+  end
+  local x = 1
+  for _, it in ipairs(shelf) do
+    it.x = x
+    x = x + it.w + gap
+  end
+end
+
 local function autoLayout()
   local oldFields = {}
   for _, item in ipairs(cfg.layout) do
@@ -914,20 +948,32 @@ local function autoLayout()
       }
       cursorY = cursorY + 1
 
-      local x, shelfY, shelfH = 1, cursorY, 0
+      local function flushShelf(shelf, shelfH)
+        if #shelf == 0 then return end
+        distributeShelfWidths(shelf, W, HGAP)
+        for _, it in ipairs(shelf) do
+          local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
+          if oldFields[it.name] then item.fields = oldFields[it.name] end
+          newItems[#newItems + 1] = item
+        end
+        cursorY = cursorY + shelfH + GAP
+      end
+
+      local shelf, usedW, shelfH = {}, 0, 0
       for _, name in ipairs(list) do
         local w, h = panelSize(name)
-        if x > 1 and x + w - 1 > W then
-          shelfY = shelfY + shelfH + GAP
-          x, shelfH = 1, 0
+        local addW = (#shelf == 0) and w or (HGAP + w)
+        if #shelf > 0 and usedW + addW > W then
+          flushShelf(shelf, shelfH)
+          shelf, usedW, shelfH = {}, 0, 0
+          addW = w
         end
-        local item = { type = "panel", entity = name, x = x, y = shelfY, w = w, h = h }
-        if oldFields[name] then item.fields = oldFields[name] end
-        newItems[#newItems + 1] = item
-        x = x + w
+        shelf[#shelf + 1] = { name = name, w = w, h = h }
+        usedW = usedW + addW
         shelfH = math.max(shelfH, h)
       end
-      cursorY = shelfY + shelfH + GAP + 1
+      flushShelf(shelf, shelfH)
+      cursorY = cursorY + 1
     end
   end
 
@@ -1476,6 +1522,21 @@ local function layoutScreen()
       elseif c == "g" then
         local ans = prompt("regenerate layout? (y/n): ", "n")
         if ans:lower():sub(1, 1) == "y" then
+          -- refresh known field counts first: layoutScreen (unlike the
+          -- entities screen) never polls the registry on its own, so
+          -- without this, sizing would fall back on a bare guess and
+          -- panels come out smaller than the entity actually needs
+          local _, termH = term.getSize()
+          tLine(termH, "fetching field data...", colors.yellow)
+          requestRegistry()
+          local deadline = os.clock() + 1.5
+          while os.clock() < deadline do
+            os.startTimer(0.2)
+            local ev2 = { os.pullEvent() }
+            if ev2[1] == "rednet_message" and ev2[4] == PROTOCOL then
+              pcall(handleNet, ev2[3])
+            end
+          end
           autoLayout()
         end
         draw()
