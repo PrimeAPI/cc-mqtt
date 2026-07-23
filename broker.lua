@@ -738,7 +738,7 @@ local function handle(id, msg)
       end
     end
 
-  elseif msg.type == "registry" then
+  elseif msg.type == "registry" or msg.type == "req_registry" then
     local list = {}
     for name, e in pairs(entities) do
       list[name] = {
