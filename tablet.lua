@@ -418,32 +418,10 @@ local function renderScreen()
         if not ent or not ent.data then
           term.setTextColor(colors.gray)
           term.write("offline")
-        elseif type(val) == "number" then
-          if val >= 0 and val <= 1 and (m.key:find("Percent") or m.key == "fuel" or m.key == "damage" or m.key == "coolant" or m.key == "waste") then
-            local barW = math.max(3, w - 21)
-            local fill = math.floor(val * barW + 0.5)
-            term.setBackgroundColor(colors.lime)
-            term.write(string.rep(" ", fill))
-            term.setBackgroundColor(colors.gray)
-            term.write(string.rep(" ", barW - fill))
-            term.setBackgroundColor(colors.black)
-            term.setTextColor(colors.white)
-            term.write(string.format(" %2d%%", math.floor(val * 100 + 0.5)))
-          else
-            term.setTextColor(colors.lime)
-            term.write(si(val))
-          end
         else
-          local sVal = tostring(val or "?")
-          local sUpper = sVal:upper()
-          if sUpper:find("RUNNING") or sUpper:find("ACTIVE") or sUpper:find("ONLINE") then
-            term.setTextColor(colors.lime)
-          elseif sUpper:find("SCRAM") or sUpper:find("OFFLINE") or sUpper:find("DISABLED") then
-            term.setTextColor(colors.red)
-          else
-            term.setTextColor(colors.cyan)
-          end
-          term.write(sVal:sub(1, math.max(1, w - 20)))
+          local formatted, valColor = formatSmartValue(m.key, val)
+          term.setTextColor(valColor)
+          term.write(formatted:sub(1, math.max(1, w - 20)))
         end
 
         local cx, _ = term.getCursorPos()

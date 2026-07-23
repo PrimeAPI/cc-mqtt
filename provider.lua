@@ -104,11 +104,17 @@ local HANDLERS = {
     collect = function(p)
       if not isFormed(p) then return { formed = false } end
       local input, output = toFE(tryCall(p, "getLastInput")), toFE(tryCall(p, "getLastOutput"))
+      local energy = toFE(tryCall(p, "getEnergy")) or 0
+      local maxEnergy = toFE(tryCall(p, "getMaxEnergy")) or 0
+      local pct = tryCall(p, "getEnergyFilledPercentage")
+      if (pct == nil or pct == 0) and maxEnergy > 0 then
+        pct = energy / maxEnergy
+      end
       return {
         formed = true,
-        percent = tryCall(p, "getEnergyFilledPercentage") or 0,
-        energy = toFE(tryCall(p, "getEnergy")),
-        maxEnergy = toFE(tryCall(p, "getMaxEnergy")),
+        percent = pct or 0,
+        energy = energy,
+        maxEnergy = maxEnergy,
         input = input, output = output, net = input - output,
         cells = tryCall(p, "getInstalledCells"),
         providers = tryCall(p, "getInstalledProviders"),
