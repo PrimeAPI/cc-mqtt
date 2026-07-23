@@ -274,6 +274,21 @@ local function getSortedEntities()
   return sorted
 end
 
+local function getEntityFields(name)
+  local fields = {}
+  local e = ents[name]
+  if e and e.data then
+    for k in pairs(e.data) do
+      if k:sub(1, 1) ~= "_" then fields[#fields + 1] = k end
+    end
+    table.sort(fields)
+  end
+  if #fields == 0 then
+    fields = { "percent", "energy", "maxEnergy", "input", "output", "status", "temp", "fuel", "coolant", "waste", "amount" }
+  end
+  return fields
+end
+
 --------------------------------------------------------------------
 -- formatting helpers
 --------------------------------------------------------------------
@@ -567,11 +582,17 @@ local function renderScreen()
 
         term.setCursorPos(2, y)
         term.setTextColor(colors.lightGray)
-        local keyLabel = k:sub(1, 9)
-        term.write(keyLabel .. string.rep(" ", math.max(1, 10 - #keyLabel)))
+        local keyLabel = k:sub(1, 8)
+        term.write(keyLabel .. ": ")
 
         term.setTextColor(valColor)
-        term.write(formatted:sub(1, math.max(1, w - 12)))
+        term.write(formatted:sub(1, math.max(1, w - 17)))
+
+        term.setCursorPos(w - 5, y)
+        term.setBackgroundColor(colors.green)
+        term.setTextColor(colors.white)
+        term.write("[+Dash]")
+        term.setBackgroundColor(colors.black)
         y = y + 1
       end
 
@@ -738,21 +759,14 @@ local function renderScreen()
     term.setTextColor(colors.yellow)
     term.write(padLine(" SELECT FIELD FOR " .. tostring(wizardEntity) .. ":", w))
 
-    local fields = {}
-    local e = ents[wizardEntity]
-    if e and e.data then
-      for k in pairs(e.data) do
-        if k:sub(1, 1) ~= "_" then fields[#fields + 1] = k end
-      end
-      table.sort(fields)
-    end
+    local fields = getEntityFields(wizardEntity)
 
     local y = 3
     if #fields == 0 then
       term.setCursorPos(2, 4)
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.gray)
-      term.write("No fields received yet for entity.")
+      term.write("No fields available.")
     else
       for idx, fKey in ipairs(fields) do
         if y >= h - 2 then break end
@@ -929,6 +943,25 @@ local function handleTouch(x, y)
       return
     end
 
+    -- Pin to Dash or select field
+    local valStartY = inspectScroll > 1 and 5 or 4
+    local valRowIdx = y - valStartY + 1
+    if valRowIdx >= 1 and valRowIdx <= maxValLines then
+      local keyIdx = inspectScroll + valRowIdx - 1
+      if keys[keyIdx] then
+        local k = keys[keyIdx]
+        cfg.metrics[#cfg.metrics + 1] = {
+          entity = inspectEntity,
+          key = k,
+          label = inspectEntity .. "." .. k
+        }
+        saveConfig()
+        setBanner(("Pinned %s.%s to Dash!"):format(inspectEntity, k), false)
+        renderScreen()
+        return
+      end
+    end
+
     -- Actions touch handling
     local actList = getEntityActions(inspectEntity)
     if #actList > 0 then
@@ -1017,14 +1050,7 @@ local function handleTouch(x, y)
     end
 
   elseif activeTab == "WIZARD_FIELD" then
-    local fields = {}
-    local e = ents[wizardEntity]
-    if e and e.data then
-      for k in pairs(e.data) do
-        if k:sub(1, 1) ~= "_" then fields[#fields + 1] = k end
-      end
-      table.sort(fields)
-    end
+    local fields = getEntityFields(wizardEntity)
 
     local fIdx = y - 2
     if fIdx >= 1 and fIdx <= #fields then
