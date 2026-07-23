@@ -59,17 +59,45 @@ end
 
 local function checkAndApplyUpdate(scriptName)
   if not http then return false end
-  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH)
-  local res = http.get(apiUrl, { ["User-Agent"] = "CC-Tweaked" })
+  scriptName = scriptName or "broker.lua"
+  local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName)
+  local res = http.get(rawUrl)
   if not res then return false end
 
-  local raw = res.readAll()
+  local code = res.readAll()
+  local headers = res.getResponseHeaders()
   res.close()
 
-  local data = textutils.unserializeJSON(raw)
-  if type(data) ~= "table" or not data.sha then return false end
+  if not code or #code < 100 then return false end
 
-  local remoteSha = data.sha
+  -- Extract Git SHA from ETag header or compute hash fallback
+  local remoteSha = nil
+  local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
+  if etag then
+    remoteSha = etag:match("(%x%x%x%x%x%x%x+)")
+  end
+  if not remoteSha then
+    local hash = 0
+    for i = 1, #code do
+      hash = (hash * 31 + code:byte(i)) % 4294967296
+    end
+    remoteSha = string.format("%08x", hash)
+  end
+
+  local target = shell and shell.getRunningProgram() or "startup.lua"
+  if not target or target == "" then target = "startup.lua" end
+
+  -- Ensure startup.lua exists so rebooting always re-runs the script
+  if target ~= "startup.lua" and target ~= "startup" then
+    if not fs.exists("startup.lua") and not fs.exists("startup") then
+      local sf = fs.open("startup.lua", "w")
+      if sf then
+        sf.writeLine('shell.run("' .. target .. '")')
+        sf.close()
+      end
+    end
+  end
+
   if currentVersion == "dev" or currentVersion == "" then
     currentVersion = remoteSha
     local f = fs.open(VERSION_FILE, "w")
@@ -79,33 +107,22 @@ local function checkAndApplyUpdate(scriptName)
   end
 
   if remoteSha ~= currentVersion then
-    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName or "broker.lua")
-    local scriptRes = http.get(rawUrl)
-    if scriptRes then
-      local code = scriptRes.readAll()
-      scriptRes.close()
-      if code and #code > 100 then
-        local target = shell and shell.getRunningProgram() or "startup.lua"
-        if not target or target == "" then target = "startup.lua" end
+    print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+    print("[Updater] Updating " .. target .. " and rebooting...")
 
-        print(("[Updater] New commit detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
-        print("[Updater] Updating " .. target .. " and rebooting...")
+    local f = fs.open(target .. ".tmp", "w")
+    f.write(code)
+    f.close()
+    if fs.exists(target) then fs.delete(target) end
+    fs.move(target .. ".tmp", target)
 
-        local f = fs.open(target .. ".tmp", "w")
-        f.write(code)
-        f.close()
-        if fs.exists(target) then fs.delete(target) end
-        fs.move(target .. ".tmp", target)
+    local vf = fs.open(VERSION_FILE, "w")
+    vf.write(remoteSha)
+    vf.close()
 
-        local vf = fs.open(VERSION_FILE, "w")
-        vf.write(remoteSha)
-        vf.close()
-
-        sleep(1)
-        os.reboot()
-        return true
-      end
-    end
+    sleep(1)
+    os.reboot()
+    return true
   end
   return false
 end
