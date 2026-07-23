@@ -902,7 +902,14 @@ local function publish(dev)
   for k, v in pairs(data) do
     if k:sub(1, 1) ~= "_" then out[k] = v end
   end
-  send({ type = "publish", entity = dev.entity, topic = dev.topic, data = out, version = currentVersion })
+  send({
+    type = "publish",
+    entity = dev.entity,
+    topic = dev.topic,
+    data = out,
+    actions = actionNames,
+    version = currentVersion
+  })
 end
 
 local function handleCommand(msg)

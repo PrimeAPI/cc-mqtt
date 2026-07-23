@@ -228,19 +228,21 @@ local function handleNet(msg, senderId)
     e.lastSeen = os.clock()
     e.stale = false
     if msg.topic then e.kind = msg.topic:match("^([^/]+)/") or e.kind end
+    if msg.actions and #msg.actions > 0 then e.actions = msg.actions end
 
   elseif msg.type == "registry" and msg.entities then
     for name, info in pairs(msg.entities) do
+      local acts = info.actions or (info.meta and info.meta.actions) or {}
       registry[name] = {
         kind = info.kind,
         online = info.online,
-        actions = info.actions or (info.meta and info.meta.actions) or {},
+        actions = acts,
         meta = info.meta
       }
       ents[name] = ents[name] or {}
-      if info.meta then ents[name].meta = info.meta end
-      if info.actions then ents[name].actions = info.actions end
-      if info.meta and info.meta.actions then ents[name].actions = info.meta.actions end
+      ents[name].kind = info.kind or ents[name].kind
+      ents[name].meta = info.meta or ents[name].meta
+      if #acts > 0 then ents[name].actions = acts end
     end
 
   elseif msg.type == "cmdResult" then

@@ -702,26 +702,30 @@ local function handle(id, msg)
     send(id, { type = "ack", of = "announce" })
 
   elseif msg.type == "publish" then
-    if msg.entity and not entities[msg.entity] then
-      entities[msg.entity] = {
-        id = id,
-        kind = (msg.topic and msg.topic:match("^([^/]+)")) or "provider",
-        topics = { msg.topic },
-        actions = {},
-        version = msg.version or "dev",
-        lastSeen = now(),
-        online = true,
-      }
-      send(id, { type = "reannounce_req" })
-    else
-      touch(msg.entity)
-      if msg.version then entities[msg.entity].version = msg.version end
+    if msg.entity then
+      if not entities[msg.entity] then
+        entities[msg.entity] = {
+          id = id,
+          kind = (msg.topic and msg.topic:match("^([^/]+)")) or "provider",
+          topics = { msg.topic },
+          actions = msg.actions or {},
+          version = msg.version or "dev",
+          lastSeen = now(),
+          online = true,
+        }
+        send(id, { type = "reannounce_req" })
+      else
+        touch(msg.entity)
+        if msg.actions and #msg.actions > 0 then entities[msg.entity].actions = msg.actions end
+        if msg.version then entities[msg.entity].version = msg.version end
+      end
     end
     local out = {
       type = "data",
       topic = msg.topic,
       entity = msg.entity,
       data = msg.data,
+      actions = msg.actions or (entities[msg.entity] and entities[msg.entity].actions),
       ts = os.epoch("utc"),
     }
     retained[msg.topic] = out
@@ -739,6 +743,12 @@ local function handle(id, msg)
     end
 
   elseif msg.type == "registry" or msg.type == "req_registry" then
+    -- Trigger providers to re-announce so action state is fresh
+    for _, e in pairs(entities) do
+      if e.id and e.kind == "provider" then
+        send(e.id, { type = "reannounce_req" })
+      end
+    end
     local list = {}
     for name, e in pairs(entities) do
       list[name] = {
