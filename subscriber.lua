@@ -955,7 +955,12 @@ local function tLine(y, text, color)
 end
 
 local function prompt(label, default)
-  local _, h = term.getSize()
+  local w, h = term.getSize()
+  -- leave room for the typed input itself: a label that fills the
+  -- whole line pushes read()'s cursor off-screen, so the prompt
+  -- (and whatever the user types) becomes invisible
+  local maxLabel = math.max(1, w - 10)
+  if #label > maxLabel then label = label:sub(1, maxLabel) end
   term.setCursorPos(1, h)
   term.clearLine()
   term.setTextColor(colors.yellow)
@@ -1003,7 +1008,7 @@ local function pickList(title, items, allowCustom, colorFn)
         term.write(it:sub(1, w))
       end
     end
-    tLine(h, "up/down: select  enter: choose  esc: cancel", colors.lightGray)
+    tLine(h, "up/down:sel enter:pick esc:cancel", colors.lightGray)
   end
 
   draw()
@@ -1273,7 +1278,7 @@ local function fieldsScreen(item)
     end
     if #list == 0 then tLine(4, "no fields known yet - waiting for data...", colors.gray) end
     tLine(h - 2, ("mode: %s"):format(item.fields and "custom selection" or "showing all (default)"), colors.lightGray)
-    tLine(h - 1, "space: toggle  c: +calculated  x: delete calc  r: reset all", colors.lightGray)
+    tLine(h - 1, "space:toggle c:+calc x:delcalc r:reset", colors.lightGray)
     tLine(h, "enter/b: back", colors.lightGray)
   end
 
@@ -1359,7 +1364,7 @@ local function layoutScreen()
     tLine(1, ("cbus setup - layout (monitor %dx%d)"):format(W, H), colors.yellow)
     tLine(2, string.rep("-", w), colors.gray)
     if sel > #cfg.layout then sel = math.max(1, #cfg.layout) end
-    local listH = h - 4
+    local listH = h - 5
     if sel - offset > listH then offset = sel - listH end
     if sel - offset < 1 then offset = sel - 1 end
     for i = 1, listH do
@@ -1380,8 +1385,11 @@ local function layoutScreen()
         term.write(line:sub(1, w))
       end
     end
-    tLine(h - 1, "enter:edit t:+title l:+line k:+button f:fields x:del", colors.lightGray)
-    tLine(h, "g: auto-layout  b: back to entities  q: save & exit", colors.lightGray)
+    -- kept short & split across 3 rows so it still fits a 39-col
+    -- turtle terminal, not just the 51-col computer terminal
+    tLine(h - 2, "enter:edit  x:delete", colors.lightGray)
+    tLine(h - 1, "t:title l:line k:button f:fields", colors.lightGray)
+    tLine(h, "g:auto-layout b:back q:save&exit", colors.lightGray)
   end
 
   local function preview(withSel)
@@ -1466,7 +1474,7 @@ local function layoutScreen()
         draw()
         preview(true)
       elseif c == "g" then
-        local ans = prompt("regenerate auto-layout? this replaces panel positions (y/n): ", "n")
+        local ans = prompt("regenerate layout? (y/n): ", "n")
         if ans:lower():sub(1, 1) == "y" then
           autoLayout()
         end
