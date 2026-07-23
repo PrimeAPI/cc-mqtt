@@ -425,15 +425,18 @@ local function renderScreen()
         term.setCursorPos(1, y)
         term.setBackgroundColor(colors.black)
 
-        -- 1. Custom Label Column (6 chars + 1 space = 7 chars total)
+        -- Strict 25-char max line length to prevent CC terminal auto-wrap cursor shift
+        local maxLineW = math.min(25, w - 1)
+        local lblW = 6 -- 5 chars + 1 space = 6 chars
+        local availW = math.max(8, maxLineW - lblW)
+
+        -- 1. Custom Label Column (5 chars max)
         term.setTextColor(colors.cyan)
         local rawLabel = m.label or m.entity
-        local displayLabel = rawLabel:sub(1, 6)
-        term.write(displayLabel .. string.rep(" ", math.max(1, 7 - #displayLabel)))
+        local displayLabel = rawLabel:sub(1, 5)
+        term.write(displayLabel .. string.rep(" ", math.max(1, lblW - #displayLabel)))
 
-        -- 2. Value / Bar Area (w - 7 chars = 19 chars on w=26)
-        local availW = math.max(10, w - 7)
-
+        -- 2. Value / Smooth Color Block Bar Area
         if not ent or not ent.data then
           term.setTextColor(colors.gray)
           term.write("offline")
@@ -446,10 +449,11 @@ local function renderScreen()
             local fill = math.floor(val * barW + 0.5)
             local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
 
-            term.setTextColor(isDanger and colors.red or colors.lime)
-            term.write(string.rep("#", fill))
-            term.setTextColor(colors.gray)
-            term.write(string.rep(".", barW - fill))
+            term.setBackgroundColor(isDanger and colors.red or colors.lime)
+            term.write(string.rep(" ", fill))
+            term.setBackgroundColor(colors.gray)
+            term.write(string.rep(" ", barW - fill))
+            term.setBackgroundColor(colors.black)
             term.setTextColor(colors.white)
             term.write(" " .. pctStr)
           else
@@ -1027,9 +1031,29 @@ local function handleTouch(x, y)
       local actStartY = math.max(11, scrollDownY + 2)
       local actIdx = y - actStartY + 1
       if actIdx >= 1 and actIdx <= #actList then
-        selectedAction = actList[actIdx]
-        inputBuffer = ""
-        activeTab = "INPUT_ARG"
+        local actName = actList[actIdx]
+        term.setBackgroundColor(colors.black)
+        term.clear()
+        term.setCursorPos(1, 2)
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.yellow)
+        term.write(padLine(" TRIGGER ACTION: " .. actName, w))
+        term.setBackgroundColor(colors.black)
+        term.setCursorPos(1, 4)
+        term.setTextColor(colors.yellow)
+        term.write("Enter args (blank for none):")
+        term.setCursorPos(1, 6)
+        term.setTextColor(colors.white)
+        term.write("> ")
+        local input = read()
+        local parsed = input
+        if not input or input == "" then parsed = nil
+        elseif tonumber(input) then parsed = tonumber(input)
+        elseif input:lower() == "true" then parsed = true
+        elseif input:lower() == "false" then parsed = false end
+
+        sendCommand(inspectEntity, actName, parsed)
+        setBanner(("Sent '%s' to %s"):format(actName, inspectEntity), false)
         renderScreen()
       end
     end
@@ -1074,9 +1098,29 @@ local function handleTouch(x, y)
             renderScreen()
             return
           elseif x >= w - 8 then
-            editMetricIdx = idx
-            inputBuffer = cfg.metrics[idx].label or cfg.metrics[idx].entity
-            activeTab = "RENAME_METRIC"
+            local target = cfg.metrics[idx]
+            term.setBackgroundColor(colors.black)
+            term.clear()
+            term.setCursorPos(1, 2)
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.yellow)
+            term.write(padLine(" RENAME NICKNAME", w))
+            term.setBackgroundColor(colors.black)
+            term.setCursorPos(1, 4)
+            term.setTextColor(colors.cyan)
+            term.write("Metric: " .. (target.entity .. "." .. target.key):sub(1, w - 8))
+            term.setCursorPos(1, 6)
+            term.setTextColor(colors.yellow)
+            term.write("Type nickname (max 5 chars):")
+            term.setCursorPos(1, 8)
+            term.setTextColor(colors.white)
+            term.write("> ")
+            local input = read()
+            if input and input ~= "" then
+              target.label = input:sub(1, 5)
+              saveConfig()
+              setBanner("Updated nickname to '" .. target.label .. "'", false)
+            end
             renderScreen()
             return
           end
