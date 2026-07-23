@@ -505,29 +505,189 @@ local function renderScreen()
     term.setCursorPos(1, 2)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.yellow)
-    term.write(padLine(" TABLET SETTINGS", w))
+    term.write(padLine(" SETTINGS & MANAGEMENT", w))
+
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    term.write(padLine(" [+] Add Metric to Dash ", w))
 
     term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.gray)
+    term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    term.write(padLine(" [1] Add Dashboard Metric", w))
+    term.write(padLine(" [+] Add Quick Action    ", w))
 
-    term.setCursorPos(1, 6)
+    term.setCursorPos(1, 5)
     term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [2] Add Quick Action", w))
+    term.setTextColor(colors.yellow)
+    term.write(padLine(" [R] Re-Sync Broker | [C] Clear All", w))
 
-    term.setCursorPos(1, 8)
+    local y = 6
+    term.setCursorPos(1, y)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.cyan)
+    term.write(" DASHBOARD METRICS (Tap X to delete):")
+    y = y + 1
+
+    if #cfg.metrics == 0 then
+      term.setCursorPos(2, y)
+      term.setTextColor(colors.gray)
+      term.write("(no metrics configured)")
+      y = y + 1
+    else
+      for idx, m in ipairs(cfg.metrics) do
+        if y >= h - 5 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.white)
+        local mText = padLine(("%d. %s.%s"):format(idx, m.entity, m.key), w - 4)
+        term.write(mText)
+        term.setBackgroundColor(colors.red)
+        term.setTextColor(colors.white)
+        term.write(" [X]")
+        term.setBackgroundColor(colors.black)
+        y = y + 1
+      end
+    end
+
+    y = y + 1
+    if y < h - 2 then
+      term.setCursorPos(1, y)
+      term.setTextColor(colors.yellow)
+      term.write(" QUICK ACTIONS (Tap X to delete):")
+      y = y + 1
+
+      if #cfg.quickActions == 0 then
+        term.setCursorPos(2, y)
+        term.setTextColor(colors.gray)
+        term.write("(no quick actions configured)")
+        y = y + 1
+      else
+        for idx, qa in ipairs(cfg.quickActions) do
+          if y >= h - 2 then break end
+          term.setCursorPos(1, y)
+          term.setTextColor(colors.white)
+          local aText = padLine(("%d. %s -> %s"):format(idx, qa.label or qa.action, qa.entity), w - 4)
+          term.write(aText)
+          term.setBackgroundColor(colors.red)
+          term.setTextColor(colors.white)
+          term.write(" [X]")
+          term.setBackgroundColor(colors.black)
+          y = y + 1
+        end
+      end
+    end
+
+    for r = y, h - 2 do
+      term.setCursorPos(1, r)
+      term.setBackgroundColor(colors.black)
+      term.write(string.rep(" ", w))
+    end
+
+  elseif activeTab == "WIZARD_ENTITY" then
+    term.setCursorPos(1, 2)
     term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [3] Clear All Custom Config", w))
+    term.setTextColor(colors.yellow)
+    term.write(padLine(" SELECT ENTITY:", w))
 
-    term.setCursorPos(1, 10)
+    local sorted = {}
+    for n in pairs(registry) do sorted[#sorted + 1] = n end
+    for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
+    table.sort(sorted)
+
+    local y = 3
+    if #sorted == 0 then
+      term.setCursorPos(2, 4)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No entities discovered yet.")
+    else
+      for idx, name in ipairs(sorted) do
+        if y >= h - 2 then break end
+        term.setCursorPos(1, y)
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+        term.write(padLine((" [%d] %s"):format(idx, name), w))
+        term.setBackgroundColor(colors.black)
+        y = y + 1
+      end
+    end
+
+    for r = y, h - 2 do
+      term.setCursorPos(1, r)
+      term.setBackgroundColor(colors.black)
+      term.write(string.rep(" ", w))
+    end
+
+  elseif activeTab == "WIZARD_FIELD" then
+    term.setCursorPos(1, 2)
     term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [4] Force Re-Sync Broker", w))
+    term.setTextColor(colors.yellow)
+    term.write(padLine(" SELECT FIELD FOR " .. tostring(wizardEntity) .. ":", w))
 
-    for r = 11, h - 2 do
+    local fields = {}
+    local e = ents[wizardEntity]
+    if e and e.data then
+      for k in pairs(e.data) do
+        if k:sub(1, 1) ~= "_" then fields[#fields + 1] = k end
+      end
+      table.sort(fields)
+    end
+
+    local y = 3
+    if #fields == 0 then
+      term.setCursorPos(2, 4)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No fields received yet for entity.")
+    else
+      for idx, fKey in ipairs(fields) do
+        if y >= h - 2 then break end
+        term.setCursorPos(1, y)
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+        term.write(padLine((" [%d] %s"):format(idx, fKey), w))
+        term.setBackgroundColor(colors.black)
+        y = y + 1
+      end
+    end
+
+    for r = y, h - 2 do
+      term.setCursorPos(1, r)
+      term.setBackgroundColor(colors.black)
+      term.write(string.rep(" ", w))
+    end
+
+  elseif activeTab == "WIZARD_ACTION" then
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.yellow)
+    term.write(padLine(" SELECT ACTION FOR " .. tostring(wizardEntity) .. ":", w))
+
+    local actList = {}
+    local e = ents[wizardEntity]
+    if e and e.meta and e.meta.actions then
+      actList = e.meta.actions
+    end
+
+    local y = 3
+    if #actList == 0 then
+      term.setCursorPos(2, 4)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No actions defined for entity.")
+    else
+      for idx, act in ipairs(actList) do
+        if y >= h - 2 then break end
+        term.setCursorPos(1, y)
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+        term.write(padLine((" [%d] %s"):format(idx, act), w))
+        term.setBackgroundColor(colors.black)
+        y = y + 1
+      end
+    end
+
+    for r = y, h - 2 do
       term.setCursorPos(1, r)
       term.setBackgroundColor(colors.black)
       term.write(string.rep(" ", w))
@@ -646,41 +806,124 @@ local function handleTouch(x, y)
     end
 
   elseif activeTab == "SETTINGS" then
-    if y == 4 then
-      -- Add Metric default shortcut
-      local firstEnt = next(ents) or next(registry)
-      if firstEnt then
-        cfg.metrics[#cfg.metrics + 1] = { entity = firstEnt, key = "status", label = firstEnt }
-        saveConfig()
-        setBanner("Added metric for " .. firstEnt, false)
+    if y == 3 then
+      wizardTarget = "METRIC"
+      activeTab = "WIZARD_ENTITY"
+      renderScreen()
+
+    elseif y == 4 then
+      wizardTarget = "ACTION"
+      activeTab = "WIZARD_ENTITY"
+      renderScreen()
+
+    elseif y == 5 then
+      if x <= 16 then
+        subscribe()
+        requestRegistry()
+        setBanner("Broker re-sync requested", false)
       else
-        setBanner("No entities available to add", true)
+        cfg.metrics = {}
+        cfg.quickActions = {}
+        saveConfig()
+        setBanner("Config cleared", false)
       end
       renderScreen()
 
-    elseif y == 6 then
-      -- Add Quick Action default shortcut
-      local firstEnt = next(ents) or next(registry)
-      if firstEnt then
-        cfg.quickActions[#cfg.quickActions + 1] = { entity = firstEnt, action = "scram", label = "SCRAM " .. firstEnt }
-        saveConfig()
-        setBanner("Added Quick Action for " .. firstEnt, false)
+    elseif y >= 7 then
+      -- Delete buttons touch handling
+      if x >= w - 4 then
+        -- Check metric deletion vs action deletion
+        local metricCount = #cfg.metrics
+        local mStart = 7
+        local mEnd = mStart + (metricCount > 0 and metricCount or 1) - 1
+
+        if metricCount > 0 and y >= mStart and y <= mEnd then
+          local delIdx = y - mStart + 1
+          if cfg.metrics[delIdx] then
+            local removed = table.remove(cfg.metrics, delIdx)
+            saveConfig()
+            setBanner("Removed metric: " .. removed.entity .. "." .. removed.key, false)
+            renderScreen()
+            return
+          end
+        end
+
+        local aStart = mEnd + 2
+        local actionCount = #cfg.quickActions
+        local aEnd = aStart + (actionCount > 0 and actionCount or 1) - 1
+
+        if actionCount > 0 and y >= aStart and y <= aEnd then
+          local delIdx = y - aStart + 1
+          if cfg.quickActions[delIdx] then
+            local removed = table.remove(cfg.quickActions, delIdx)
+            saveConfig()
+            setBanner("Removed action: " .. (removed.label or removed.action), false)
+            renderScreen()
+            return
+          end
+        end
+      end
+    end
+
+  elseif activeTab == "WIZARD_ENTITY" then
+    local sorted = {}
+    for n in pairs(registry) do sorted[#sorted + 1] = n end
+    for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
+    table.sort(sorted)
+
+    local entIdx = y - 2
+    if entIdx >= 1 and entIdx <= #sorted then
+      wizardEntity = sorted[entIdx]
+      if wizardTarget == "METRIC" then
+        activeTab = "WIZARD_FIELD"
       else
-        setBanner("No entities available to add", true)
+        activeTab = "WIZARD_ACTION"
       end
       renderScreen()
+    end
 
-    elseif y == 8 then
-      cfg.metrics = {}
-      cfg.quickActions = {}
+  elseif activeTab == "WIZARD_FIELD" then
+    local fields = {}
+    local e = ents[wizardEntity]
+    if e and e.data then
+      for k in pairs(e.data) do
+        if k:sub(1, 1) ~= "_" then fields[#fields + 1] = k end
+      end
+      table.sort(fields)
+    end
+
+    local fIdx = y - 2
+    if fIdx >= 1 and fIdx <= #fields then
+      local selField = fields[fIdx]
+      cfg.metrics[#cfg.metrics + 1] = {
+        entity = wizardEntity,
+        key = selField,
+        label = wizardEntity .. "." .. selField
+      }
       saveConfig()
-      setBanner("Configuration cleared", false)
+      setBanner(("Added metric: %s.%s"):format(wizardEntity, selField), false)
+      activeTab = "SETTINGS"
       renderScreen()
+    end
 
-    elseif y == 10 then
-      subscribe()
-      requestRegistry()
-      setBanner("Broker re-sync requested", false)
+  elseif activeTab == "WIZARD_ACTION" then
+    local actList = {}
+    local e = ents[wizardEntity]
+    if e and e.meta and e.meta.actions then
+      actList = e.meta.actions
+    end
+
+    local aIdx = y - 2
+    if aIdx >= 1 and aIdx <= #actList then
+      local selAct = actList[aIdx]
+      cfg.quickActions[#cfg.quickActions + 1] = {
+        entity = wizardEntity,
+        action = selAct,
+        label = selAct:upper() .. " " .. wizardEntity:upper()
+      }
+      saveConfig()
+      setBanner(("Added action: %s on %s"):format(selAct, wizardEntity), false)
+      activeTab = "SETTINGS"
       renderScreen()
     end
   end
