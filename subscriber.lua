@@ -21,7 +21,8 @@
 
 local PROTOCOL     = "cbus"
 local CONFIG_FILE  = "display.cfg"
-local STALE_AFTER  = 10
+local STALE_AFTER  = 8    -- s without data -> panel shows an error
+local STATUS_ROWS  = 1    -- top row(s) reserved for the status bar
 local REG_INTERVAL = 10
 local SUB_INTERVAL = 15
 
@@ -304,6 +305,20 @@ local function renderPanel(win, name)
     win.setVisible(true)
     return
   end
+  -- data timeout: never show outdated values, show an error instead
+  if stale then
+    local age = ent.lastSeen and math.floor(os.clock() - ent.lastSeen) or nil
+    win.setCursorPos(2, math.min(3, h))
+    win.setTextColor(colors.red)
+    win.write("! no data received")
+    if age and h >= 4 then
+      win.setCursorPos(2, 4)
+      win.setTextColor(colors.gray)
+      win.write(("last update %ds ago"):format(age))
+    end
+    win.setVisible(true)
+    return
+  end
   if unformed then
     win.setVisible(true)
     return
@@ -370,8 +385,59 @@ local function itemVisible(item)
   return c and c.enabled
 end
 
+--------------------------------------------------------------------
+-- status bar (reserved top row): bouncing activity animation on the
+-- left, entity health count + clock on the right. The animation
+-- advancing is the visible proof that the display loop is alive.
+--------------------------------------------------------------------
+local animPos, animDir = 1, 1
+local ANIM_W = 8
+
+local function drawStatusBar()
+  local W = mon.getSize()
+  mon.setCursorPos(1, 1)
+  mon.setBackgroundColor(colors.black)
+  mon.write(string.rep(" ", W))
+
+  -- bouncing dot
+  mon.setCursorPos(1, 1)
+  for i = 1, ANIM_W do
+    mon.setBackgroundColor(i == animPos and colors.lime or TRACK_COLOR)
+    mon.write(" ")
+  end
+  mon.setBackgroundColor(colors.black)
+  animPos = animPos + animDir
+  if animPos >= ANIM_W then animDir = -1 end
+  if animPos <= 1 then animDir = 1 end
+
+  -- display name
+  mon.setTextColor(colors.gray)
+  mon.write(" " .. cfg.name)
+
+  -- right side: healthy entity count + clock
+  local total, ok = 0, 0
+  local t = os.clock()
+  for name, c in pairs(cfg.entities) do
+    if c.enabled then
+      total = total + 1
+      local e = ents[name]
+      if e and e.data and e.lastSeen and t - e.lastSeen <= STALE_AFTER then
+        ok = ok + 1
+      end
+    end
+  end
+  local clock = os.date("%H:%M")
+  local right = ("%d/%d ok  %s"):format(ok, total, clock)
+  if #right < W then
+    mon.setCursorPos(W - #right + 1, 1)
+    mon.setTextColor(ok < total and colors.red or colors.gray)
+    mon.write(right)
+  end
+end
+
 -- full render pass; sel = item to highlight (setup preview)
 local function renderAll(sel)
+  pcall(drawStatusBar)
   for _, item in ipairs(cfg.layout) do
     if itemVisible(item) then
       if item.type == "panel" then
@@ -427,20 +493,21 @@ end
 
 local function clampItem(item)
   local W, H = mon.getSize()
+  local top = 1 + STATUS_ROWS   -- row 1 is reserved for the status bar
   local minW = item.type == "panel" and 8 or item.type == "title" and 3 or 1
   local minH = item.type == "panel" and 3 or 1
   if item.type == "title" then item.h = 1 end
   item.w = math.max(minW, math.min(item.w, W))
-  item.h = math.max(minH, math.min(item.h, H))
+  item.h = math.max(minH, math.min(item.h, H - STATUS_ROWS))
   item.x = math.max(1, math.min(item.x, W - item.w + 1))
-  item.y = math.max(1, math.min(item.y, H - item.h + 1))
+  item.y = math.max(top, math.min(item.y, H - item.h + 1))
 end
 
 local function autoPlace(item)
   local W, H = mon.getSize()
   item.w = math.min(item.w, W)
-  item.h = math.min(item.h, H)
-  for y = 1, H - item.h + 1 do
+  item.h = math.min(item.h, H - STATUS_ROWS)
+  for y = 1 + STATUS_ROWS, H - item.h + 1 do
     for x = 1, W - item.w + 1 do
       local cand = { x = x, y = y, w = item.w, h = item.h }
       local free = true
@@ -458,6 +525,8 @@ end
 
 -- every enabled entity gets a panel (existing panels keep their spot)
 local function ensurePanels()
+  -- migrate any items sitting in the reserved status bar row
+  for _, item in ipairs(cfg.layout) do clampItem(item) end
   for name, c in pairs(cfg.entities) do
     if c.enabled then
       local found = false
@@ -819,7 +888,7 @@ local function runDisplay()
   print(("display '%s' -> broker #%d  |  run 'subscriber setup' to configure")
     :format(cfg.name, broker))
 
-  local drawTimer = os.startTimer(1)
+  local drawTimer = os.startTimer(0.5)
   local regTimer  = os.startTimer(REG_INTERVAL)
   local subTimer  = os.startTimer(SUB_INTERVAL)
 
@@ -837,7 +906,7 @@ local function runDisplay()
         if e.lastSeen and t - e.lastSeen > STALE_AFTER then e.stale = true end
       end
       renderAll()
-      drawTimer = os.startTimer(1)
+      drawTimer = os.startTimer(0.5)
 
     elseif ev[1] == "timer" and ev[2] == regTimer then
       requestRegistry()
