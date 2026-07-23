@@ -30,7 +30,7 @@ local args = { ... }
 
 peripheral.find("modem", function(n) rednet.open(n) end)
 local mon = peripheral.find("monitor")
-if not mon then error("No monitor found.", 0) end
+if not mon then error("No monitor found!", 0) end
 
 --------------------------------------------------------------------
 -- config
