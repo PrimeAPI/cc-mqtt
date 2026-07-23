@@ -363,14 +363,20 @@ local function gaugeRow(win, y, w, label, frac, invert)
   win.setBackgroundColor(colors.black)
   win.setTextColor(colors.lightGray)
   win.write(lab .. " ")
-    win.setBackgroundColor(TRACK_COLOR)
-    win.write(string.rep(" ", barW - fill))
-    win.setBackgroundColor(colors.black)
+  local fillW = math.floor(frac * trackW + 0.5)
+  local fillCol = colors.lime
+  if invert then
+    fillCol = (frac > 0.5) and colors.red or (frac > 0.25 and colors.yellow or colors.lime)
+  else
+    fillCol = (frac < 0.25) and colors.red or (frac < 0.5 and colors.yellow or colors.lime)
   end
-  win.setCursorPos(w - #pct + 1, y)
+  win.setBackgroundColor(fillCol)
+  win.write(string.rep(" ", fillW))
+  win.setBackgroundColor(TRACK_COLOR)
+  win.write(string.rep(" ", trackW - fillW))
+  win.setBackgroundColor(colors.black)
   win.setTextColor(colors.white)
-  win.write(pct)
-  return y + 1
+  win.write(" " .. pct)
 end
 
 local function renderPanel(win, name)
