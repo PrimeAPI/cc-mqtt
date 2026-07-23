@@ -192,14 +192,31 @@ local function handleNet(msg, senderId)
 
   elseif msg.type == "registry" and msg.entities then
     for name, info in pairs(msg.entities) do
-      registry[name] = { kind = info.kind, online = info.online }
+      registry[name] = {
+        kind = info.kind,
+        online = info.online,
+        actions = info.actions or (info.meta and info.meta.actions) or {},
+        meta = info.meta
+      }
       ents[name] = ents[name] or {}
       if info.meta then ents[name].meta = info.meta end
+      if info.actions then ents[name].actions = info.actions end
+      if info.meta and info.meta.actions then ents[name].actions = info.meta.actions end
     end
 
   elseif msg.type == "cmdResult" then
     return msg.entity, msg.action, msg.result, msg.error
   end
+end
+
+local function getEntityActions(name)
+  local e = ents[name]
+  local reg = registry[name]
+  if e and e.actions and #e.actions > 0 then return e.actions end
+  if e and e.meta and e.meta.actions and #e.meta.actions > 0 then return e.meta.actions end
+  if reg and reg.actions and #reg.actions > 0 then return reg.actions end
+  if reg and reg.meta and reg.meta.actions and #reg.meta.actions > 0 then return reg.meta.actions end
+  return {}
 end
 
 --------------------------------------------------------------------
@@ -299,16 +316,19 @@ local function renderScreen()
 
         term.setCursorPos(1, y)
         term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.white)
-        local label = (m.label or m.key):sub(1, 10)
-        term.write(label .. string.rep(" ", math.max(1, 11 - #label)))
+        term.setTextColor(colors.cyan)
+        local entName = m.entity:sub(1, 9)
+        term.write(entName .. " ")
+        term.setTextColor(colors.lightGray)
+        local keyName = m.key:sub(1, 8)
+        term.write(keyName .. string.rep(" ", math.max(1, 9 - #keyName)))
 
         if not ent or not ent.data then
           term.setTextColor(colors.gray)
           term.write("offline")
         elseif type(val) == "number" then
           if val >= 0 and val <= 1 and (m.key:find("Percent") or m.key == "fuel" or m.key == "damage" or m.key == "coolant" or m.key == "waste") then
-            local barW = math.max(4, w - 18)
+            local barW = math.max(3, w - 21)
             local fill = math.floor(val * barW + 0.5)
             term.setBackgroundColor(colors.lime)
             term.write(string.rep(" ", fill))
@@ -331,7 +351,7 @@ local function renderScreen()
           else
             term.setTextColor(colors.cyan)
           end
-          term.write(sVal:sub(1, w - 12))
+          term.write(sVal:sub(1, math.max(1, w - 20)))
         end
 
         local cx, _ = term.getCursorPos()
@@ -474,10 +494,7 @@ local function renderScreen()
       term.write(" ACTIONS (Tap to trigger):")
       y = y + 1
 
-      local actList = {}
-      if e.meta and e.meta.actions then
-        actList = e.meta.actions
-      end
+      local actList = getEntityActions(inspectEntity)
       if #actList == 0 then
         term.setCursorPos(2, y)
         term.setTextColor(colors.gray)
@@ -591,8 +608,18 @@ local function renderScreen()
     term.write(padLine(" SELECT ENTITY:", w))
 
     local sorted = {}
-    for n in pairs(registry) do sorted[#sorted + 1] = n end
-    for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
+    for n in pairs(registry) do
+      if wizardTarget == "METRIC" or #getEntityActions(n) > 0 then
+        sorted[#sorted + 1] = n
+      end
+    end
+    for n in pairs(ents) do
+      if not registry[n] and (wizardTarget == "METRIC" or #getEntityActions(n) > 0) then
+        local found = false
+        for _, x in ipairs(sorted) do if x == n then found = true break end end
+        if not found then sorted[#sorted + 1] = n end
+      end
+    end
     table.sort(sorted)
 
     local y = 3
@@ -600,7 +627,7 @@ local function renderScreen()
       term.setCursorPos(2, 4)
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.gray)
-      term.write("No entities discovered yet.")
+      term.write(wizardTarget == "ACTION" and "No entities with actions found." or "No entities discovered yet.")
     else
       for idx, name in ipairs(sorted) do
         if y >= h - 2 then break end
@@ -664,10 +691,24 @@ local function renderScreen()
     term.setTextColor(colors.yellow)
     term.write(padLine(" SELECT ACTION FOR " .. tostring(wizardEntity) .. ":", w))
 
-    local actList = {}
-    local e = ents[wizardEntity]
-    if e and e.meta and e.meta.actions then
-      actList = e.meta.actions
+    local actList = getEntityActions(wizardEntity)
+
+    local y = 3
+    if #actList == 0 then
+      term.setCursorPos(2, 4)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No actions defined for entity.")
+    else
+      for idx, act in ipairs(actList) do
+        if y >= h - 2 then break end
+        term.setCursorPos(1, y)
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+        term.write(padLine((" [%d] %s"):format(idx, act), w))
+        term.setBackgroundColor(colors.black)
+        y = y + 1
+      end
     end
 
     local y = 3
@@ -793,13 +834,14 @@ local function handleTouch(x, y)
     end
 
   elseif activeTab == "INSPECT" then
-    local e = ents[inspectEntity]
-    if e and e.meta and e.meta.actions then
-      local valCount = e.data and (function() local c = 0 for k in pairs(e.data) do if k:sub(1,1)~="_" then c=c+1 end end return c end)() or 0
+    local actList = getEntityActions(inspectEntity)
+    if #actList > 0 then
+      local e = ents[inspectEntity]
+      local valCount = e and e.data and (function() local c = 0 for k in pairs(e.data) do if k:sub(1,1)~="_" then c=c+1 end end return c end)() or 0
       local actStartY = 5 + math.min(valCount, 5) + 2
       local actIdx = y - actStartY + 1
-      if actIdx >= 1 and actIdx <= #e.meta.actions then
-        selectedAction = e.meta.actions[actIdx]
+      if actIdx >= 1 and actIdx <= #actList then
+        selectedAction = actList[actIdx]
         inputBuffer = ""
         activeTab = "INPUT_ARG"
         renderScreen()
@@ -868,8 +910,18 @@ local function handleTouch(x, y)
 
   elseif activeTab == "WIZARD_ENTITY" then
     local sorted = {}
-    for n in pairs(registry) do sorted[#sorted + 1] = n end
-    for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
+    for n in pairs(registry) do
+      if wizardTarget == "METRIC" or #getEntityActions(n) > 0 then
+        sorted[#sorted + 1] = n
+      end
+    end
+    for n in pairs(ents) do
+      if not registry[n] and (wizardTarget == "METRIC" or #getEntityActions(n) > 0) then
+        local found = false
+        for _, x in ipairs(sorted) do if x == n then found = true break end end
+        if not found then sorted[#sorted + 1] = n end
+      end
+    end
     table.sort(sorted)
 
     local entIdx = y - 2
@@ -908,12 +960,7 @@ local function handleTouch(x, y)
     end
 
   elseif activeTab == "WIZARD_ACTION" then
-    local actList = {}
-    local e = ents[wizardEntity]
-    if e and e.meta and e.meta.actions then
-      actList = e.meta.actions
-    end
-
+    local actList = getEntityActions(wizardEntity)
     local aIdx = y - 2
     if aIdx >= 1 and aIdx <= #actList then
       local selAct = actList[aIdx]
