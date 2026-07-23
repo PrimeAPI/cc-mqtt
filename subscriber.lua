@@ -274,6 +274,7 @@ end
 -- formatting
 --------------------------------------------------------------------
 local function si(n)
+  if type(n) ~= "number" then return tostring(n or "?") end
   local a = math.abs(n)
   if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
   if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
@@ -284,6 +285,7 @@ end
 
 -- prefix attached to the unit: "6.83 TFE", "3.87 MFE/t"
 local function fmtUnit(n, unit, forceSign)
+  if type(n) ~= "number" then return tostring(n or "?") end
   local a, prefix = math.abs(n), ""
   local v = n
   if a >= 1e12 then v, prefix = n / 1e12, "T"
@@ -311,10 +313,11 @@ local function autoFields(data)
 end
 
 local function entityTitle(name)
+  if not name then return "?" end
   local c = cfg.entities[name]
   if c and c.alias and c.alias ~= "" then return c.alias end
   local e = ents[name]
-  return (e and e.meta and e.meta.title) or name
+  return (e and e.meta and e.meta.title) or tostring(name)
 end
 
 --------------------------------------------------------------------
@@ -336,14 +339,15 @@ local TRACK_COLOR = colors.brown
 
 -- one row: label left (gray), value right-aligned (colored)
 local function row(win, y, w, label, value, valColor)
-  value = tostring(value)
+  value = tostring(value or "")
+  label = tostring(label or "")
   if #value > w - 2 then value = value:sub(1, w - 2) end
   local maxLab = w - #value - 1
   win.setCursorPos(1, y)
   win.setBackgroundColor(colors.black)
   win.setTextColor(colors.lightGray)
   win.write(label:sub(1, math.max(0, maxLab)))
-  win.setCursorPos(w - #value + 1, y)
+  win.setCursorPos(math.max(1, w - #value + 1), y)
   win.setTextColor(valColor or colors.white)
   win.write(value)
 end
@@ -351,9 +355,18 @@ end
 -- single-line gauge: "Label [#####     ] 62%"
 -- invert = true -> high is bad (damage, waste, storage fill, ...)
 local function gaugeRow(win, y, w, label, frac, invert)
+  if type(frac) ~= "number" then
+    if type(frac) == "string" then
+      local num = frac:match("([%d%.]+)")
+      frac = num and (tonumber(num) / (frac:find("%%") and 100 or 1)) or 0
+    else
+      frac = 0
+    end
+  end
   frac = math.max(0, math.min(1, frac or 0))
   local pct = string.format("%3d%%", math.floor(frac * 100 + 0.5))
-  local lab = label:sub(1, math.min(#label, math.max(3, w - #pct - 8)))
+  local labName = tostring(label or "")
+  local lab = labName:sub(1, math.min(#labName, math.max(3, w - #pct - 8)))
   local trackW = w - #lab - #pct - 3
   if trackW < 3 then
     row(win, y, w, label, pct, colors.white)
@@ -405,7 +418,7 @@ local function renderPanel(win, name)
   win.setCursorPos(2, 1)
   win.write(entityTitle(name):sub(1, math.max(0, w - #status - 3)))
   if #status > 0 then
-    win.setCursorPos(w - #status, 1)
+    win.setCursorPos(math.max(1, w - #status), 1)
     win.write(status)
   end
   win.setBackgroundColor(colors.black)
@@ -450,7 +463,7 @@ local function renderPanel(win, name)
         if f.type == "energy" then
           text = fmtUnit(v, "FE")
         elseif f.type == "rate" then
-          if f.signed then
+          if f.signed and type(v) == "number" then
             col = v >= 0 and colors.lime or colors.red
             text = fmtUnit(v, "FE/t", true)
           else
@@ -469,18 +482,15 @@ end
 
 local function drawDecor(item)
   if item.type == "title" then
-    local text = " " .. (item.text or "?") .. " "
-    if #text > item.w then text = text:sub(1, item.w) end
-    local fill = item.w - #text
-    local left = math.floor(fill / 2)
-    mon.setCursorPos(item.x, item.y)
-    mon.setBackgroundColor(colors.black)
-    mon.setTextColor(colors.gray)
-    mon.write(string.rep("=", left))
-    mon.setTextColor(colors.orange)
-    mon.write(text)
-    mon.setTextColor(colors.gray)
-    mon.write(string.rep("=", item.w - left - #text))
+    local win = item._win
+    if not win then return end
+    local w, h = win.getSize()
+    win.setBackgroundColor(colors.black)
+    win.clear()
+    win.setCursorPos(1, 1)
+    win.setTextColor(colors.white)
+    local txt = "-- " .. (item.text or "Group") .. " "
+    win.write(txt .. string.rep("-", math.max(0, w - #txt)))
   elseif item.type == "line" then
     mon.setBackgroundColor(colors.gray)
     for dy = 0, item.h - 1 do
@@ -555,7 +565,7 @@ local function renderAll(sel)
       if item.type == "panel" then
         item._win = item._win or window.create(mon, item.x, item.y, item.w, item.h, false)
         item._win.reposition(item.x, item.y, item.w, item.h)
-        local ok = pcall(renderPanel, item._win, item.entity)
+        local ok, err = pcall(renderPanel, item._win, item.entity)
         if not ok then
           pcall(function()
             item._win.setBackgroundColor(colors.black)
@@ -563,6 +573,12 @@ local function renderAll(sel)
             item._win.setCursorPos(1, 1)
             item._win.setTextColor(colors.red)
             item._win.write("render error")
+            if err and item._win.getSize() >= 2 then
+              item._win.setCursorPos(1, 2)
+              item._win.setTextColor(colors.gray)
+              local w, _ = item._win.getSize()
+              item._win.write(tostring(err):sub(1, w))
+            end
             item._win.setVisible(true)
           end)
         end
