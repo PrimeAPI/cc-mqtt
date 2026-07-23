@@ -1005,6 +1005,18 @@ end
 --------------------------------------------------------------------
 -- display mode
 --------------------------------------------------------------------
+--------------------------------------------------------------------
+-- display mode & interactive terminal management
+--------------------------------------------------------------------
+local subViewMode      = "LIST"
+local subSelectedIndex = 1
+local aliasBuffer      = ""
+local subStatusBanner  = nil
+
+local function setSubBanner(msg, isError)
+  subStatusBanner = { text = msg, error = isError or false, time = os.clock() }
+end
+
 local function runDisplay()
   ensurePanels()
   findBroker()
@@ -1022,16 +1034,222 @@ local function runDisplay()
     mon.write("no entities enabled - run: subscriber setup")
   end
 
-  print(("display '%s' -> broker #%d  |  run 'subscriber setup' to configure")
-    :format(cfg.name, broker))
-
-  -- Deadline-based scheduling instead of tracked one-shot timers.
-  -- Background: rednet.lookup() (inside subscribe) pulls events with
-  -- its own filter and DISCARDS pending timer events. With tracked
-  -- timer ids, a swallowed timer means its branch never runs again
-  -- and the whole display freezes. Deadlines don't care which timer
-  -- event woke us - any wake-up runs everything that is due.
   local nextDraw, nextReg, nextSub, nextUpdate = 0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + UPDATE_TICK
+
+  local function redrawSubscriberTerminal()
+    local w, h = term.getSize()
+    term.setBackgroundColor(colors.black)
+    term.clear()
+
+    if subStatusBanner and (os.clock() - subStatusBanner.time > 5) then
+      subStatusBanner = nil
+    end
+
+    local sortedNames = {}
+    for n in pairs(cfg.entities) do sortedNames[#sortedNames + 1] = n end
+    table.sort(sortedNames)
+
+    if subSelectedIndex > #sortedNames then subSelectedIndex = math.max(1, #sortedNames) end
+
+    local drawCd = math.max(0, math.floor((nextDraw - os.clock()) * 10) / 10)
+    local regCd  = math.max(0, math.floor(nextReg - os.clock()))
+    local subCd  = math.max(0, math.floor(nextSub - os.clock()))
+    local updCd  = math.max(0, math.floor(nextUpdate - os.clock()))
+
+    if subViewMode == "LIST" then
+      term.setCursorPos(1, 1)
+      term.setBackgroundColor(colors.blue)
+      term.setTextColor(colors.white)
+      local headerText = (" cbus subscriber: %s (v:%s)"):format(cfg.name, getShortVer(currentVersion))
+      local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
+      local space = math.max(1, w - #headerText - #brokerText)
+      term.write(headerText .. string.rep(" ", space) .. brokerText)
+
+      term.setCursorPos(1, 2)
+      term.setBackgroundColor(colors.gray)
+      term.setTextColor(colors.white)
+      local timerText = (" Draw: %.1fs | Reg: %ds | Sub: %ds | Update: %ds"):format(drawCd, regCd, subCd, updCd)
+      term.write(timerText .. string.rep(" ", math.max(0, w - #timerText)))
+
+      term.setCursorPos(1, 3)
+      term.setBackgroundColor(colors.gray)
+      term.setTextColor(colors.yellow)
+      term.write(" ENTITY         ALIAS            ENABLED   FRESHNESS")
+      if w > 52 then term.write(string.rep(" ", w - 52)) end
+
+      local listH = h - 4
+      if subStatusBanner then listH = listH - 1 end
+      local pageOffset = math.floor((subSelectedIndex - 1) / math.max(1, listH)) * listH
+
+      for i = 1, listH do
+        local idx = pageOffset + i
+        local rowY = 3 + i
+        if idx > #sortedNames then break end
+        local name = sortedNames[idx]
+        local c = cfg.entities[name]
+        local e = ents[name]
+
+        term.setCursorPos(1, rowY)
+        if idx == subSelectedIndex then
+          term.setBackgroundColor(colors.gray)
+          term.setTextColor(colors.white)
+        else
+          term.setBackgroundColor(colors.black)
+          term.setTextColor(colors.white)
+        end
+
+        local selChar = (idx == subSelectedIndex) and ">" or " "
+        term.write(selChar .. " ")
+        term.setTextColor(colors.white)
+        local padEnt = name .. string.rep(" ", math.max(1, 13 - #name))
+        term.write(padEnt:sub(1, 13))
+
+        term.setTextColor(colors.lightGray)
+        local aliasStr = (c and c.alias and c.alias ~= "") and c.alias or "-"
+        local padAlias = aliasStr .. string.rep(" ", math.max(1, 16 - #aliasStr))
+        term.write(padAlias:sub(1, 16))
+
+        local isEnabled = c and c.enabled
+        term.setTextColor(isEnabled and colors.lime or colors.red)
+        term.write(isEnabled and "[YES]    " or "[NO]     ")
+
+        local age = e and e.lastSeen and math.floor(os.clock() - e.lastSeen) or nil
+        local freshStr = (e and e.data and age) and (age .. "s ago") or "offline"
+        term.setTextColor(colors.gray)
+        term.write(freshStr)
+
+        local cx, _ = term.getCursorPos()
+        if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
+      end
+
+      if #sortedNames == 0 then
+        term.setCursorPos(2, 5)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.gray)
+        term.write("No entities registered yet.")
+      end
+
+      if subStatusBanner then
+        term.setCursorPos(1, h - 1)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(subStatusBanner.error and colors.red or colors.lime)
+        term.write((subStatusBanner.error and "[!] " or "[*] ") .. subStatusBanner.text)
+      end
+
+      term.setCursorPos(1, h)
+      term.setBackgroundColor(colors.blue)
+      term.setTextColor(colors.white)
+      local footerText = " [Space] Toggle  [A/Enter] Alias  [S] Monitor Setup"
+      term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+
+    elseif subViewMode == "ALIAS_INPUT" then
+      local name = sortedNames[subSelectedIndex]
+
+      term.setCursorPos(1, 1)
+      term.setBackgroundColor(colors.blue)
+      term.setTextColor(colors.white)
+      term.write((" Edit Display Alias for: %s"):format(tostring(name)))
+
+      term.setCursorPos(1, 3)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.yellow)
+      term.write("Enter new alias for '" .. tostring(name) .. "':")
+
+      term.setCursorPos(1, 4)
+      term.setTextColor(colors.gray)
+      term.write("(Leave blank to reset to default title)")
+
+      term.setCursorPos(1, 6)
+      term.setTextColor(colors.white)
+      term.write(" > " .. aliasBuffer .. "_")
+
+      term.setCursorPos(1, h)
+      term.setBackgroundColor(colors.blue)
+      term.setTextColor(colors.white)
+      local footerText = " [Enter] Save Alias    [Esc] Cancel"
+      term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+    end
+  end
+
+  local function handleTerminalKey(ev)
+    local key = ev[2]
+    local sortedNames = {}
+    for n in pairs(cfg.entities) do sortedNames[#sortedNames + 1] = n end
+    table.sort(sortedNames)
+
+    if subViewMode == "LIST" then
+      if key == keys.up or key == keys.w then
+        subSelectedIndex = math.max(1, subSelectedIndex - 1)
+        redrawSubscriberTerminal()
+
+      elseif key == keys.down or key == keys.s then
+        subSelectedIndex = math.min(#sortedNames, subSelectedIndex + 1)
+        redrawSubscriberTerminal()
+
+      elseif key == keys.space then
+        if #sortedNames > 0 and sortedNames[subSelectedIndex] then
+          local name = sortedNames[subSelectedIndex]
+          cfg.entities[name] = cfg.entities[name] or { enabled = false }
+          cfg.entities[name].enabled = not cfg.entities[name].enabled
+          saveConfig()
+          ensurePanels()
+          renderAll()
+          setSubBanner(("Toggled %s -> %s"):format(name, cfg.entities[name].enabled and "ENABLED" or "DISABLED"), false)
+          redrawSubscriberTerminal()
+        end
+
+      elseif key == keys.a or key == keys.enter then
+        if #sortedNames > 0 and sortedNames[subSelectedIndex] then
+          local name = sortedNames[subSelectedIndex]
+          aliasBuffer = (cfg.entities[name] and cfg.entities[name].alias) or ""
+          subViewMode = "ALIAS_INPUT"
+          redrawSubscriberTerminal()
+        end
+
+      elseif key == keys.s then
+        runSetup()
+        redrawSubscriberTerminal()
+
+      elseif key == keys.r then
+        subscribe()
+        requestRegistry()
+        setSubBanner("Forced re-subscribe & registry sync", false)
+        redrawSubscriberTerminal()
+      end
+
+    elseif subViewMode == "ALIAS_INPUT" then
+      if key == keys.escape then
+        subViewMode = "LIST"
+        redrawSubscriberTerminal()
+
+      elseif key == keys.backspace then
+        aliasBuffer = aliasBuffer:sub(1, -2)
+        redrawSubscriberTerminal()
+
+      elseif key == keys.enter then
+        if #sortedNames > 0 and sortedNames[subSelectedIndex] then
+          local name = sortedNames[subSelectedIndex]
+          cfg.entities[name] = cfg.entities[name] or { enabled = true }
+          cfg.entities[name].alias = aliasBuffer
+          saveConfig()
+          renderAll()
+          setSubBanner(("Alias for %s set to '%s'"):format(name, aliasBuffer ~= "" and aliasBuffer or name), false)
+        end
+        subViewMode = "LIST"
+        redrawSubscriberTerminal()
+      end
+    end
+  end
+
+  local function handleTerminalChar(ev)
+    if subViewMode == "ALIAS_INPUT" then
+      local ch = ev[2]
+      if ch and #ch == 1 then
+        aliasBuffer = aliasBuffer .. ch
+        redrawSubscriberTerminal()
+      end
+    end
+  end
 
   local function tick()
     local t = os.clock()
@@ -1057,26 +1275,30 @@ local function runDisplay()
       nextUpdate = t + UPDATE_TICK
       pcall(checkAndApplyUpdate, "subscriber.lua")
     end
+    redrawSubscriberTerminal()
   end
 
+  redrawSubscriberTerminal()
+
   while true do
-    -- always arm a fresh wake-up before blocking: even if something
-    -- swallows timer events, the next iteration arms a new one, so
-    -- the loop can never stall waiting for an event that was eaten
     os.startTimer(0.5)
     local ev = { os.pullEvent() }
 
     if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
       local ok, newFound = pcall(handleNet, ev[3], ev[2])
       if ok and newFound then
-        print("new entity discovered - run 'subscriber setup' to enable it")
+        setSubBanner("New entity discovered - enabled in config", false)
       end
+      redrawSubscriberTerminal()
 
-    elseif ev[1] == "key" and ev[2] == keys.q then
-      return
+    elseif ev[1] == "key" then
+      handleTerminalKey(ev)
+
+    elseif ev[1] == "char" then
+      handleTerminalChar(ev)
 
     elseif ev[1] == "monitor_touch" then
-      -- later: hit-test panels here and call sendCommand(entity, ...)
+      -- later: hit-test panels here
     end
 
     local ok, err = pcall(tick)

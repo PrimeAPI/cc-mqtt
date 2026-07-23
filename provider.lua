@@ -891,6 +891,358 @@ local function handleCommand(msg)
 end
 
 --------------------------------------------------------------------
+-- interactive provider TUI & simulation
+--------------------------------------------------------------------
+local viewMode            = "LIST" -- "LIST", "INSPECT", "INPUT"
+local selectedIndex       = 1
+local selectedActionIndex = 1
+local inputActionName     = nil
+local inputBuffer         = ""
+local statusBanner        = nil
+
+local function setBanner(msg, isError)
+  statusBanner = { text = msg, error = isError or false, time = os.clock() }
+end
+
+local function simulateAction(dev, actionName, rawArgs)
+  if not dev or not dev.actions then return false, "No actions available" end
+  local fn = dev.actions[actionName]
+  if not fn then return false, "Action not found: " .. tostring(actionName) end
+
+  local parsedArgs = rawArgs
+  if rawArgs and rawArgs ~= "" then
+    if tonumber(rawArgs) then parsedArgs = tonumber(rawArgs)
+    elseif rawArgs:lower() == "true" then parsedArgs = true
+    elseif rawArgs:lower() == "false" then parsedArgs = false
+    end
+  else
+    parsedArgs = nil
+  end
+
+  local ok, res, err = pcall(fn, parsedArgs)
+  if not ok then
+    return false, "Action error: " .. tostring(res)
+  end
+  local resultStr = err or tostring(res or "ok")
+
+  -- Force immediate publish to push updated state to broker & subscribers right away
+  pcall(publish, dev)
+
+  return true, ("Simulated '%s' -> %s"):format(actionName, resultStr)
+end
+
+local nextPub = 0
+local nextAnn = os.clock() + ANNOUNCE
+local nextUpdate = os.clock() + UPDATE_TICK
+
+local function redrawTerminal()
+  local w, h = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+
+  if statusBanner and (os.clock() - statusBanner.time > 5) then
+    statusBanner = nil
+  end
+
+  if selectedIndex > #devices then selectedIndex = math.max(1, #devices) end
+
+  local pushCd = math.max(0, math.floor((nextPub - os.clock()) * 10) / 10)
+  local annCd  = math.max(0, math.floor(nextAnn - os.clock()))
+  local updCd  = math.max(0, math.floor(nextUpdate - os.clock()))
+
+  if viewMode == "LIST" then
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = (" cbus provider #%d (v:%s)"):format(os.getComputerID(), getShortVer(currentVersion))
+    local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
+    local space = math.max(1, w - #headerText - #brokerText)
+    term.write(headerText .. string.rep(" ", space) .. brokerText)
+
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    local timerText = (" Push: %.1fs | Announce: %ds | Update: %ds"):format(pushCd, annCd, updCd)
+    term.write(timerText .. string.rep(" ", math.max(0, w - #timerText)))
+
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.yellow)
+    term.write(" ENTITY          TOPIC             TYPE")
+    if w > 42 then term.write(string.rep(" ", w - 42)) end
+
+    local listH = h - 4
+    if statusBanner then listH = listH - 1 end
+    local pageOffset = math.floor((selectedIndex - 1) / math.max(1, listH)) * listH
+
+    for i = 1, listH do
+      local idx = pageOffset + i
+      local rowY = 3 + i
+      if idx > #devices then break end
+      local dev = devices[idx]
+
+      term.setCursorPos(1, rowY)
+      if idx == selectedIndex then
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+      else
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+      end
+
+      local selChar = (idx == selectedIndex) and ">" or " "
+      term.write(selChar .. " ")
+      term.setTextColor(colors.white)
+      local padEnt = dev.entity .. string.rep(" ", math.max(1, 14 - #dev.entity))
+      term.write(padEnt:sub(1, 14))
+
+      term.setTextColor(colors.lightGray)
+      local padTop = dev.topic .. string.rep(" ", math.max(1, 17 - #dev.topic))
+      term.write(padTop:sub(1, 17))
+
+      term.setTextColor(colors.cyan)
+      term.write(dev.title or "?")
+
+      local cx, _ = term.getCursorPos()
+      if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
+    end
+
+    if #devices == 0 then
+      term.setCursorPos(2, 5)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No devices configured.")
+    end
+
+    if statusBanner then
+      term.setCursorPos(1, h - 1)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(statusBanner.error and colors.red or colors.lime)
+      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter/C] Inspect & Actions  [R] Force Push"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+
+  elseif viewMode == "INSPECT" then
+    local dev = devices[selectedIndex]
+
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = " Inspect Device: " .. (dev and dev.entity or "?")
+    term.write(headerText .. string.rep(" ", math.max(0, w - #headerText)))
+
+    if not dev then
+      term.setCursorPos(2, 3)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.red)
+      term.write("Device no longer available.")
+    else
+      term.setCursorPos(1, 2)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.lightGray)
+      term.write(("Title: %s | Topic: %s"):format(dev.title or "?", dev.topic or "?"))
+
+      term.setCursorPos(1, 4)
+      term.setTextColor(colors.cyan)
+      term.write("--- CURRENT SENSOR VALUES ---")
+
+      local dataY = 5
+      local ok, data = pcall(dev.handler.collect, dev.p, dev)
+      if not ok or type(data) ~= "table" then data = { formed = false } end
+
+      local dataKeys = {}
+      for k, v in pairs(data) do
+        if k:sub(1, 1) ~= "_" then dataKeys[#dataKeys + 1] = k end
+      end
+      table.sort(dataKeys)
+
+      if #dataKeys == 0 then
+        term.setCursorPos(2, dataY)
+        term.setTextColor(colors.gray)
+        term.write("(no values collected)")
+        dataY = dataY + 1
+      else
+        for i, k in ipairs(dataKeys) do
+          if dataY >= h - 6 then
+            term.setCursorPos(2, dataY)
+            term.setTextColor(colors.gray)
+            term.write("... (" .. (#dataKeys - i + 1) .. " more values)")
+            dataY = dataY + 1
+            break
+          end
+          term.setCursorPos(2, dataY)
+          term.setTextColor(colors.lightGray)
+          term.write(k .. ": ")
+          term.setTextColor(colors.white)
+          local v = data[k]
+          if type(v) == "number" then
+            term.write(string.format(v == math.floor(v) and "%.0f" or "%.2f", v))
+          else
+            term.write(tostring(v))
+          end
+          dataY = dataY + 1
+        end
+      end
+
+      dataY = dataY + 1
+      term.setCursorPos(1, dataY)
+      term.setTextColor(colors.yellow)
+      term.write("--- LOCAL ACTIONS ---")
+      dataY = dataY + 1
+
+      local actNames = getActionNames(dev)
+      if selectedActionIndex > #actNames then selectedActionIndex = math.max(1, #actNames) end
+
+      if #actNames == 0 then
+        term.setCursorPos(2, dataY)
+        term.setTextColor(colors.gray)
+        term.write("(no actions defined for this device)")
+      else
+        for j, act in ipairs(actNames) do
+          if dataY >= h - 2 then break end
+          term.setCursorPos(2, dataY)
+          if j == selectedActionIndex then
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.white)
+            term.write("> " .. j .. ". " .. act .. " ")
+          else
+            term.setBackgroundColor(colors.black)
+            term.setTextColor(colors.white)
+            term.write("  " .. j .. ". " .. act .. " ")
+          end
+          dataY = dataY + 1
+        end
+      end
+    end
+
+    if statusBanner then
+      term.setCursorPos(1, h - 1)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(statusBanner.error and colors.red or colors.lime)
+      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter] Simulate Action  [B/Esc] Back"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+
+  elseif viewMode == "INPUT" then
+    local dev = devices[selectedIndex]
+
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    term.write((" Simulate Action: %s on %s"):format(tostring(inputActionName), dev and dev.entity or "?"))
+
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.yellow)
+    term.write("Enter argument for action '" .. tostring(inputActionName) .. "':")
+
+    term.setCursorPos(1, 4)
+    term.setTextColor(colors.gray)
+    term.write("(Press Enter with empty text for no args, or e.g. 40, IDLE, etc.)")
+
+    term.setCursorPos(1, 6)
+    term.setTextColor(colors.white)
+    term.write(" > " .. inputBuffer .. "_")
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter] Execute Simulation    [Esc] Cancel"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+  end
+end
+
+local function handleTerminalKey(ev)
+  local key = ev[2]
+
+  if viewMode == "LIST" then
+    if key == keys.up or key == keys.w then
+      selectedIndex = math.max(1, selectedIndex - 1)
+      redrawTerminal()
+
+    elseif key == keys.down or key == keys.s then
+      selectedIndex = math.min(#devices, selectedIndex + 1)
+      redrawTerminal()
+
+    elseif key == keys.enter or key == keys.right or key == keys.c then
+      if #devices > 0 and devices[selectedIndex] then
+        selectedActionIndex = 1
+        viewMode = "INSPECT"
+        redrawTerminal()
+      end
+
+    elseif key == keys.r then
+      for _, dev in ipairs(devices) do publish(dev) end
+      announceAll()
+      setBanner("Forced immediate publish & re-announce", false)
+      redrawTerminal()
+    end
+
+  elseif viewMode == "INSPECT" then
+    local dev = devices[selectedIndex]
+    local actNames = dev and getActionNames(dev) or {}
+
+    if key == keys.up or key == keys.w then
+      selectedActionIndex = math.max(1, selectedActionIndex - 1)
+      redrawTerminal()
+
+    elseif key == keys.down or key == keys.s then
+      selectedActionIndex = math.min(#actNames, selectedActionIndex + 1)
+      redrawTerminal()
+
+    elseif key == keys.backspace or key == keys.b or key == keys.escape or key == keys.left then
+      viewMode = "LIST"
+      redrawTerminal()
+
+    elseif key == keys.enter then
+      if #actNames > 0 and actNames[selectedActionIndex] then
+        inputActionName = actNames[selectedActionIndex]
+        inputBuffer = ""
+        viewMode = "INPUT"
+        redrawTerminal()
+      end
+    end
+
+  elseif viewMode == "INPUT" then
+    if key == keys.escape then
+      viewMode = "INSPECT"
+      redrawTerminal()
+
+    elseif key == keys.backspace then
+      inputBuffer = inputBuffer:sub(1, -2)
+      redrawTerminal()
+
+    elseif key == keys.enter then
+      local dev = devices[selectedIndex]
+      local ok, msg = simulateAction(dev, inputActionName, inputBuffer)
+      setBanner(msg, not ok)
+      viewMode = "INSPECT"
+      redrawTerminal()
+    end
+  end
+end
+
+local function handleTerminalChar(ev)
+  if viewMode == "INPUT" then
+    local ch = ev[2]
+    if ch and #ch == 1 then
+      inputBuffer = inputBuffer .. ch
+      redrawTerminal()
+    end
+  end
+end
+
+--------------------------------------------------------------------
 -- main
 --------------------------------------------------------------------
 loadConfig()
@@ -901,12 +1253,6 @@ if #devices == 0 then
   return
 end
 
-print("")
-print("devices:")
-for _, dev in ipairs(devices) do
-  print(("  %s -> %s (%s)"):format(dev.entity, dev.topic, dev.title))
-end
-
 pcall(checkAndApplyUpdate, "provider.lua")
 
 while not findBroker(false) do
@@ -914,11 +1260,7 @@ while not findBroker(false) do
 end
 
 announceAll()
-print(("connected to broker #%d (v:%s), publishing every %ds"):format(broker, getShortVer(currentVersion), INTERVAL))
-
-local nextPub = 0
-local nextAnn = os.clock() + ANNOUNCE
-local nextUpdate = os.clock() + UPDATE_TICK
+redrawTerminal()
 
 while true do
   os.startTimer(0.5)
@@ -929,7 +1271,6 @@ while true do
     if type(msg) == "table" then
       if msg.type == "broker_online" or msg.type == "reannounce_req" then
         if ev[2] then broker = ev[2] end
-        print("broker connected (#" .. tostring(broker) .. ") -> re-announcing devices")
         announceAll()
 
       elseif msg.type == "command" then
@@ -938,23 +1279,34 @@ while true do
         nextAnn = os.clock() + ANNOUNCE
       end
     end
+    redrawTerminal()
+
+  elseif ev[1] == "key" then
+    handleTerminalKey(ev)
+
+  elseif ev[1] == "char" then
+    handleTerminalChar(ev)
 
   elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
-    print("peripheral change detected - reboot to rescan")
+    setBanner("Peripheral change detected - reboot to rescan", true)
+    redrawTerminal()
   end
 
   local t = os.clock()
   if t >= nextPub then
     for _, dev in ipairs(devices) do publish(dev) end
     nextPub = t + INTERVAL
+    redrawTerminal()
   end
   if t >= nextAnn then
     findBroker(true)
     announceAll()
     nextAnn = t + ANNOUNCE
+    redrawTerminal()
   end
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
     pcall(checkAndApplyUpdate, "provider.lua")
+    redrawTerminal()
   end
 end
