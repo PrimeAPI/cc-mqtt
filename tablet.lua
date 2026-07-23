@@ -296,7 +296,43 @@ local function fmtUnit(n, unit)
   elseif a >= 1e6 then v, prefix = n / 1e6, "M"
   elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
   local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
-  return num .. " " .. prefix .. unit
+  return num .. " " .. prefix .. (unit or "")
+end
+
+local function formatSmartValue(key, val)
+  if type(val) == "number" then
+    local kLower = key:lower()
+    if (val >= 0 and val <= 1) and (kLower:find("percent") or kLower:find("fill") or kLower == "fuel" or kLower == "coolant" or kLower == "waste" or kLower == "damage" or kLower == "steam" or kLower == "energy") then
+      local pct = math.floor(val * 100 + 0.5)
+      local fill = math.floor(val * 7 + 0.5)
+      local bar = "[" .. string.rep("#", fill) .. string.rep("-", 7 - fill) .. "]"
+      local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
+      return bar .. string.format(" %2d%%", pct), isDanger and colors.red or colors.lime
+    elseif kLower:find("energy") or kLower:find("maxenergy") then
+      return fmtUnit(val, "FE"), colors.lime
+    elseif kLower:find("input") or kLower:find("output") or kLower:find("net") or kLower:find("prod") then
+      local s = val >= 0 and "+" or ""
+      return s .. fmtUnit(val, "FE/t"), (val >= 0 and colors.lime or colors.red)
+    elseif kLower:find("flow") or kLower:find("burn") or kLower:find("rate") then
+      return fmtUnit(val, "mB/t"), colors.yellow
+    elseif kLower:find("fluid") or kLower:find("steam") or kLower:find("coolant") or kLower:find("waste") or kLower:find("amount") then
+      return fmtUnit(val, "mB"), colors.cyan
+    elseif kLower:find("temp") then
+      return string.format("%.1f K", val), (val > 1000 and colors.red or colors.yellow)
+    else
+      return si(val), colors.white
+    end
+  else
+    local sVal = tostring(val or "?")
+    local sUpper = sVal:upper()
+    if sUpper:find("RUNNING") or sUpper:find("ACTIVE") or sUpper:find("ONLINE") or sUpper == "TRUE" then
+      return sVal, colors.lime
+    elseif sUpper:find("SCRAM") or sUpper:find("OFFLINE") or sUpper:find("DISABLED") or sUpper == "FALSE" then
+      return sVal, colors.red
+    else
+      return sVal, colors.white
+    end
+  end
 end
 
 --------------------------------------------------------------------
@@ -304,6 +340,7 @@ end
 --------------------------------------------------------------------
 local activeTab       = "DASHBOARD" -- "DASHBOARD", "ACTIONS", "ENTITIES", "SETTINGS", "INSPECT", "ADD_METRIC", "ADD_ACTION", "INPUT_ARG"
 local inspectEntity   = nil
+local inspectScroll   = 1
 local selectedAction  = nil
 local inputBuffer     = ""
 local statusBanner    = nil
@@ -522,28 +559,52 @@ local function renderScreen()
       term.setTextColor(colors.red)
       term.write("No data available.")
     else
+      local keys = {}
+      if e.data then
+        for k in pairs(e.data) do if k:sub(1,1) ~= "_" then keys[#keys+1] = k end end
+        table.sort(keys)
+      end
+
       term.setCursorPos(1, y)
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.cyan)
-      term.write(" VALUES:")
+      term.write((" TELEMETRY (%d fields):"):format(#keys))
       y = y + 1
 
-      if e.data then
-        local keys = {}
-        for k in pairs(e.data) do if k:sub(1,1) ~= "_" then keys[#keys+1] = k end end
-        table.sort(keys)
-        for _, k in ipairs(keys) do
-          if y >= h - 7 then break end
-          term.setCursorPos(2, y)
-          term.setTextColor(colors.lightGray)
-          term.write(k:sub(1, 10) .. ": ")
-          term.setTextColor(colors.white)
-          term.write(tostring(e.data[k]):sub(1, w - 14))
-          y = y + 1
-        end
+      inspectScroll = math.max(1, math.min(inspectScroll, math.max(1, #keys - 4)))
+
+      if inspectScroll > 1 then
+        term.setCursorPos(2, y)
+        term.setTextColor(colors.yellow)
+        term.write("^ tap to scroll up ^")
+        y = y + 1
       end
 
-      y = y + 1
+      local maxValLines = inspectScroll > 1 and 4 or 5
+      local endIdx = math.min(#keys, inspectScroll + maxValLines - 1)
+      for i = inspectScroll, endIdx do
+        local k = keys[i]
+        local val = e.data[k]
+        local formatted, valColor = formatSmartValue(k, val)
+
+        term.setCursorPos(2, y)
+        term.setTextColor(colors.lightGray)
+        local keyLabel = k:sub(1, 9)
+        term.write(keyLabel .. string.rep(" ", math.max(1, 10 - #keyLabel)))
+
+        term.setTextColor(valColor)
+        term.write(formatted:sub(1, math.max(1, w - 12)))
+        y = y + 1
+      end
+
+      if endIdx < #keys then
+        term.setCursorPos(2, y)
+        term.setTextColor(colors.yellow)
+        term.write("v tap to scroll down (" .. (#keys - endIdx) .. " more) v")
+        y = y + 1
+      end
+
+      y = math.max(y, 11)
       term.setCursorPos(1, y)
       term.setTextColor(colors.yellow)
       term.write(" ACTIONS (Tap to trigger):")
@@ -858,24 +919,42 @@ local function handleTouch(x, y)
     end
 
   elseif activeTab == "ENTITIES" then
-    local sorted = {}
-    for n in pairs(registry) do sorted[#sorted + 1] = n end
-    for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
-    table.sort(sorted)
-
+    local sorted = getSortedEntities()
     local rowIdx = y - 2
     if rowIdx >= 1 and rowIdx <= #sorted then
       inspectEntity = sorted[rowIdx]
+      inspectScroll = 1
       activeTab = "INSPECT"
       renderScreen()
     end
 
   elseif activeTab == "INSPECT" then
+    local e = ents[inspectEntity]
+    local keys = {}
+    if e and e.data then
+      for k in pairs(e.data) do if k:sub(1,1) ~= "_" then keys[#keys+1] = k end end
+      table.sort(keys)
+    end
+
+    -- Scroll tap buttons
+    if y == 4 and inspectScroll > 1 then
+      inspectScroll = math.max(1, inspectScroll - 1)
+      renderScreen()
+      return
+    end
+
+    local maxValLines = inspectScroll > 1 and 4 or 5
+    local scrollDownY = 4 + maxValLines + (inspectScroll > 1 and 1 or 0)
+    if y == scrollDownY and (inspectScroll + maxValLines - 1 < #keys) then
+      inspectScroll = inspectScroll + 1
+      renderScreen()
+      return
+    end
+
+    -- Actions touch handling
     local actList = getEntityActions(inspectEntity)
     if #actList > 0 then
-      local e = ents[inspectEntity]
-      local valCount = e and e.data and (function() local c = 0 for k in pairs(e.data) do if k:sub(1,1)~="_" then c=c+1 end end return c end)() or 0
-      local actStartY = 5 + math.min(valCount, 5) + 2
+      local actStartY = math.max(11, scrollDownY + 2)
       local actIdx = y - actStartY + 1
       if actIdx >= 1 and actIdx <= #actList then
         selectedAction = actList[actIdx]
@@ -1054,13 +1133,30 @@ while true do
   elseif ev[1] == "mouse_click" or ev[1] == "touch" then
     handleTouch(ev[3], ev[4])
 
+  elseif ev[1] == "mouse_scroll" and activeTab == "INSPECT" then
+    local dir = ev[2]
+    if dir < 0 then
+      inspectScroll = math.max(1, inspectScroll - 1)
+    else
+      inspectScroll = inspectScroll + 1
+    end
+    renderScreen()
+
   elseif ev[1] == "char" and activeTab == "INPUT_ARG" then
     inputBuffer = inputBuffer .. ev[2]
     renderScreen()
 
   elseif ev[1] == "key" then
     local key = ev[2]
-    if activeTab == "INPUT_ARG" then
+    if activeTab == "INSPECT" then
+      if key == keys.up or key == keys.w then
+        inspectScroll = math.max(1, inspectScroll - 1)
+        renderScreen()
+      elseif key == keys.down or key == keys.s then
+        inspectScroll = inspectScroll + 1
+        renderScreen()
+      end
+    elseif activeTab == "INPUT_ARG" then
       if key == keys.backspace then
         inputBuffer = inputBuffer:sub(1, -2)
         renderScreen()
