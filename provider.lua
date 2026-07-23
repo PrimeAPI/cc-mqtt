@@ -545,6 +545,280 @@ local HANDLERS = {
       }
     end,
   },
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Energy Detector
+  ------------------------------------------------------------------
+  { id = "energy_detector", kind = "energy", title = "Energy Detector",
+    match = function(t) return t:lower():find("energydetector") ~= nil
+                        or t:lower():find("energy_detector") ~= nil end,
+    fields = {
+      { key = "transferRate", label = "Transfer Rate", type = "rate" },
+      { key = "rateLimit",    label = "Rate Limit",    type = "rate" },
+      { key = "peakRate",     label = "Peak Rate",     type = "rate" },
+    },
+    collect = function(p, dev)
+      local rate = toFE(tryCall(p, { "getTransferRate", "getEnergyRate" })) or 0
+      local limit = dev._limit or toFE(tryCall(p, { "getTransferRateLimit", "getRateLimit", "getLimit" })) or 0
+      local peak = toFE(tryCall(p, { "getTransferRatePeak", "getPeakRate" })) or rate
+      return {
+        transferRate = rate,
+        rateLimit = limit,
+        peakRate = peak
+      }
+    end,
+    actions = function(p, dev)
+      return {
+        setTransferRateLimit = function(args)
+          local lim = tonumber(type(args) == "table" and (args.limit or args.rate or args[1]) or args)
+          if not lim then return nil, "usage: setTransferRateLimit {limit=<FE/t>}" end
+          dev._limit = lim
+          tryCall(p, { "setTransferRateLimit", "setRateLimit", "setLimit" }, lim)
+          return "transfer rate limit set to " .. lim .. " FE/t"
+        end,
+        setLimit = function(args)
+          local lim = tonumber(type(args) == "table" and (args.limit or args.rate or args[1]) or args)
+          if not lim then return nil, "usage: setLimit {limit=<FE/t>}" end
+          dev._limit = lim
+          tryCall(p, { "setTransferRateLimit", "setRateLimit", "setLimit" }, lim)
+          return "transfer rate limit set to " .. lim .. " FE/t"
+        end,
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Chat Box
+  ------------------------------------------------------------------
+  { id = "chat_box", kind = "chat", title = "Chat Box",
+    match = function(t) return t:lower():find("chatbox") ~= nil
+                        or t:lower():find("chat_box") ~= nil end,
+    fields = {
+      { key = "status",      label = "Status",       type = "text" },
+      { key = "lastMessage", label = "Last Message", type = "text" },
+    },
+    collect = function(p, dev)
+      return {
+        status = "ONLINE",
+        lastMessage = dev._lastMsg or "none"
+      }
+    end,
+    actions = function(p, dev)
+      return {
+        say = function(args)
+          local msg = type(args) == "table" and (args.message or args.text or args[1]) or tostring(args)
+          local prefix = type(args) == "table" and args.prefix or "MQTT"
+          if not msg or msg == "" then return nil, "usage: say {message='...'}" end
+          pcall(p.sendMessage, msg, prefix)
+          dev._lastMsg = msg
+          return "sent: " .. msg
+        end,
+        tell = function(args)
+          local target = type(args) == "table" and (args.player or args.target) or nil
+          local msg = type(args) == "table" and (args.message or args.text) or nil
+          if not target or not msg then return nil, "usage: tell {player='...', message='...'}" end
+          pcall(p.sendMessageToPlayer, msg, target)
+          dev._lastMsg = "->" .. target .. ": " .. msg
+          return "told " .. target .. ": " .. msg
+        end,
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Player Detector
+  ------------------------------------------------------------------
+  { id = "player_detector", kind = "sensor", title = "Player Detector",
+    match = function(t) return t:lower():find("playerdetector") ~= nil
+                        or t:lower():find("player_detector") ~= nil end,
+    fields = {
+      { key = "count",   label = "Players In Range", type = "number" },
+      { key = "players", label = "Player List",      type = "text" },
+      { key = "nearest", label = "Nearest Player",   type = "text" },
+    },
+    collect = function(p, dev)
+      local range = (dev.options and dev.options.range) or 32
+      local list = tryCall(p, { "getPlayersInRange", "getOnlinePlayers" }, range) or {}
+      local names = {}
+      if type(list) == "table" then
+        for _, n in ipairs(list) do
+          if type(n) == "string" then names[#names + 1] = n
+          elseif type(n) == "table" and n.name then names[#names + 1] = n.name end
+        end
+      end
+      return {
+        count = #names,
+        players = #names > 0 and table.concat(names, ", ") or "none",
+        nearest = names[1] or "none"
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Environment Detector
+  ------------------------------------------------------------------
+  { id = "environment_detector", kind = "sensor", title = "Environment Detector",
+    match = function(t) return t:lower():find("environmentdetector") ~= nil
+                        or t:lower():find("environment_detector") ~= nil end,
+    fields = {
+      { key = "biome",      label = "Biome",       type = "text" },
+      { key = "dimension",  label = "Dimension",   type = "text" },
+      { key = "time",       label = "Time",        type = "text" },
+      { key = "weather",    label = "Weather",     type = "text" },
+      { key = "light",      label = "Light Level", type = "number" },
+      { key = "slimeChunk", label = "Slime Chunk", type = "text" },
+    },
+    collect = function(p)
+      local isRaining = tryCall(p, "isRaining") == true
+      local isThunder = tryCall(p, "isThundering") == true
+      local weather = isThunder and "THUNDER" or (isRaining and "RAIN" or "CLEAR")
+      return {
+        biome = tostring(tryCall(p, "getBiome") or "?"),
+        dimension = tostring(tryCall(p, "getDimension") or "?"),
+        time = tostring(tryCall(p, "getTime") or "?"),
+        weather = weather,
+        light = tryCall(p, { "getBlockLight", "getDayLight", "getSkyLight" }) or 0,
+        slimeChunk = tostring(tryCall(p, "isSlimeChunk") or "false")
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: ME Bridge / RS Bridge
+  ------------------------------------------------------------------
+  { id = "me_bridge", kind = "storage", title = "Digital Storage Bridge",
+    match = function(t) return t:lower():find("mebridge") ~= nil
+                        or t:lower():find("rsbridge") ~= nil
+                        or t:lower():find("me_bridge") ~= nil
+                        or t:lower():find("rs_bridge") ~= nil end,
+    fields = {
+      { key = "energy",     label = "Energy",      type = "energy" },
+      { key = "maxEnergy",  label = "Capacity",    type = "energy" },
+      { key = "itemTypes",  label = "Item Types",  type = "number" },
+      { key = "fluidTypes", label = "Fluid Types", type = "number" },
+      { key = "crafting",   label = "Crafting",    type = "text" },
+    },
+    collect = function(p)
+      local items = tryCall(p, { "listItems", "listCraftableItems" }) or {}
+      local fluids = tryCall(p, "listFluids") or {}
+      return {
+        energy = toFE(tryCall(p, { "getEnergyStorage", "getEnergy" })),
+        maxEnergy = toFE(tryCall(p, { "getMaxEnergyStorage", "getMaxEnergy" })),
+        itemTypes = type(items) == "table" and #items or 0,
+        fluidTypes = type(fluids) == "table" and #fluids or 0,
+        crafting = tostring(tryCall(p, "isCrafting") or "false")
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Geo Scanner
+  ------------------------------------------------------------------
+  { id = "geo_scanner", kind = "scanner", title = "Geo Scanner",
+    match = function(t) return t:lower():find("geoscanner") ~= nil
+                        or t:lower():find("geo_scanner") ~= nil end,
+    fields = {
+      { key = "status",   label = "Status",         type = "text" },
+      { key = "lastScan", label = "Last Scan Count",type = "number" },
+    },
+    collect = function(p, dev)
+      return {
+        status = "READY",
+        lastScan = dev._lastScan or 0
+      }
+    end,
+    actions = function(p, dev)
+      return {
+        scan = function(args)
+          local r = tonumber(type(args) == "table" and (args.radius or args[1]) or args) or 8
+          local res = tryCall(p, "scan", r)
+          local count = type(res) == "table" and #res or 0
+          dev._lastScan = count
+          return ("scanned radius %d: %d blocks found"):format(r, count)
+        end,
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Redstone Integrator
+  ------------------------------------------------------------------
+  { id = "redstone_integrator", kind = "redstone", title = "Redstone Integrator",
+    match = function(t) return t:lower():find("redstoneintegrator") ~= nil
+                        or t:lower():find("redstone_integrator") ~= nil end,
+    collect = function(p)
+      local data = {}
+      for _, s in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
+        data["in_" .. s] = tryCall(p, { "getAnalogInput", "getInput" }, s) or 0
+        data["out_" .. s] = tryCall(p, { "getAnalogOutput", "getOutput" }, s) or 0
+      end
+      return data
+    end,
+    actions = function(p)
+      return {
+        setOutput = function(args)
+          local s = type(args) == "table" and (args.side or args[1]) or "top"
+          local lvl = tonumber(type(args) == "table" and (args.level or args[2]) or args) or 15
+          if not pcall(p.setAnalogOutput, s, lvl) then
+            pcall(p.setOutput, s, lvl > 0)
+          end
+          return ("side %s = %d"):format(s, lvl)
+        end,
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Inventory Manager
+  ------------------------------------------------------------------
+  { id = "inventory_manager", kind = "storage", title = "Inventory Manager",
+    match = function(t) return t:lower():find("inventorymanager") ~= nil
+                        or t:lower():find("inventory_manager") ~= nil end,
+    fields = {
+      { key = "owner",     label = "Owner",      type = "text" },
+      { key = "slotsUsed", label = "Slots Used", type = "number" },
+    },
+    collect = function(p)
+      local owner = tryCall(p, "getOwner") or "unknown"
+      local inv = tryCall(p, "getInventory") or {}
+      return { owner = owner, slotsUsed = type(inv) == "table" and #inv or 0 }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: AR Controller
+  ------------------------------------------------------------------
+  { id = "ar_controller", kind = "display", title = "AR Controller",
+    match = function(t) return t:lower():find("arcontroller") ~= nil
+                        or t:lower():find("ar_controller") ~= nil end,
+    fields = {
+      { key = "status", label = "Status", type = "text" },
+    },
+    collect = function()
+      return { status = "ONLINE" }
+    end,
+    actions = function(p)
+      return {
+        clear = function()
+          pcall(p.clear)
+          return "AR display cleared"
+        end,
+      }
+    end,
+  },
+
+  ------------------------------------------------------------------
+  -- Advanced Peripherals: Chunk Loader
+  ------------------------------------------------------------------
+  { id = "chunk_loader", kind = "misc", title = "Chunk Loader",
+    match = function(t) return t:lower():find("chunkloader") ~= nil
+                        or t:lower():find("chunk_loader") ~= nil end,
+    fields = {
+      { key = "isLoaded", label = "Chunk Loaded", type = "text" },
+    },
+    collect = function(p)
+      return { isLoaded = tostring(tryCall(p, "isLoaded") or "true") }
+    end,
+  },
 }
 
 --------------------------------------------------------------------
