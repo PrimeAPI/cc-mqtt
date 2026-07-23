@@ -20,12 +20,30 @@ local TICK          = 2    -- monitor refresh / prune interval
 peripheral.find("modem", function(n) rednet.open(n) end)
 rednet.host(PROTOCOL, HOSTNAME)
 
--- first monitor found = entity list, second (if present) = action log
-local monitors = { peripheral.find("monitor") }
-local mon    = monitors[1]
-local logMon = monitors[2]
+-- discover every attached monitor by name (no assumptions about
+-- peripheral.find's return order), sort so the assignment is stable
+-- across reboots, then take the first for the entity list and the
+-- second (if any) for the action log
+local monitorNames = {}
+for _, name in ipairs(peripheral.getNames()) do
+  if peripheral.getType(name) == "monitor" then
+    monitorNames[#monitorNames + 1] = name
+  end
+end
+table.sort(monitorNames)
+
+local mon    = monitorNames[1] and peripheral.wrap(monitorNames[1])
+local logMon = monitorNames[2] and peripheral.wrap(monitorNames[2])
 if mon then mon.setTextScale(0.5) end
 if logMon then logMon.setTextScale(0.5) end
+
+print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
+if mon then print("  " .. monitorNames[1] .. " -> entity list") end
+if logMon then
+  print("  " .. monitorNames[2] .. " -> action log")
+elseif mon then
+  print("  (only one monitor found - action log disabled)")
+end
 
 local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
 local subs      = {}   -- computerId -> {patterns, name}
