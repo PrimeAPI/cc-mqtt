@@ -97,6 +97,14 @@ reboot
 
 *On first run, the provider will prompt you in the terminal to assign friendly names to any newly detected peripherals. Configuration is automatically saved to `devices.cfg`.*
 
+### 📱 Advanced Pocket Computer Tablet Setup (`tablet.lua`)
+On an **Advanced Pocket Computer** (Tablet):
+
+```bash
+wget https://raw.githubusercontent.com/PrimeAPI/cc-mqtt/refs/heads/main/tablet.lua startup.lua
+reboot
+```
+
 ---
 
 ## 🖥️ Interactive Terminal TUIs & Features
@@ -118,6 +126,15 @@ reboot
   * `[Space]`: Toggle entities **ENABLED** / **DISABLED** directly from the terminal without quitting!
   * `[A]` / `[Enter]`: Edit display aliases for entities on the fly.
   * `[S]`: Launch the visual monitor setup editor.
+
+### 📱 Pocket Computer Controller & Dashboard (`tablet.lua`)
+* **Touch-Optimized UI**: Designed specifically for the 26x20 resolution of Pocket Computers with a bottom touch tab bar:
+  * `[Dash]`: Live metric cards and percentage gauges.
+  * `[Act]`: One-touch quick action buttons (e.g. `[!] SCRAM REACTOR`).
+  * `[Ent]`: All-entities browser with live values and action trigger prompts.
+  * `[Cfg]`: In-app configuration manager.
+* **Startup-Only Auto Update**: Checks GitHub commit version hash strictly on startup.
+* **Flicker-Free Heartbeat Animation**: Header contains a smooth pulsing heartbeat indicator (`[O]`) that proves the loop is alive without screen flicker.
 * **Dual Monitor & Terminal Rendering**: Runs full interactive management TUI on the computer terminal while driving high-performance visual dashboards on attached Monitors.
 
 ---
