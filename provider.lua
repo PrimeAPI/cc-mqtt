@@ -53,12 +53,15 @@ end
 
 local function fmtSI(n, unit)
   if type(n) ~= "number" then return "?" end
-  local a, s = math.abs(n), ""
-  if a >= 1e12 then n, s = n / 1e12, "T"
-  elseif a >= 1e9 then n, s = n / 1e9, "G"
-  elseif a >= 1e6 then n, s = n / 1e6, "M"
-  elseif a >= 1e3 then n, s = n / 1e3, "k" end
-  return string.format(s == "" and "%.0f%s%s" or "%.2f%s%s", n, s, unit and (" " .. unit) or "")
+  local a, prefix = math.abs(n), ""
+  if a >= 1e12 then n, prefix = n / 1e12, "T"
+  elseif a >= 1e9 then n, prefix = n / 1e9, "G"
+  elseif a >= 1e6 then n, prefix = n / 1e6, "M"
+  elseif a >= 1e3 then n, prefix = n / 1e3, "k" end
+  local num = string.format(prefix == "" and "%.0f" or "%.2f", n)
+  -- prefix belongs to the unit: "5.04 GmB", not "5.04G mB"
+  if unit then return num .. " " .. prefix .. unit end
+  return num .. prefix
 end
 
 -- "mekanism:sulfuric_acid" -> "Sulfuric Acid"
@@ -439,7 +442,11 @@ local HANDLERS = {
       local used  = tryCall(p, { "getUsedItemStorage", "getUsedStorage" })
       local total = tryCall(p, { "getTotalItemStorage", "getTotalStorage" })
       local data = {
-        power = fmtSI(tryCall(p, { "getEnergyUsage", "getAvgPowerUsage" }), "AE/t"),
+        power = (function()
+          local ae = tryCall(p, { "getEnergyUsage", "getAvgPowerUsage" })
+          -- AE2 reports AE; 1 AE = 2 FE by default
+          return ae and fmtSI(ae * 2, "FE/t") or "?"
+        end)(),
         storage = (used and total and total > 0) and used / total or 0,
         bytes = (used and total) and (fmtSI(used) .. " / " .. fmtSI(total)) or "?",
         crafting = "-",

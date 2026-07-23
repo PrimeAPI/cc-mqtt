@@ -175,6 +175,19 @@ local function si(n)
   return string.format("%.0f", n)
 end
 
+-- prefix attached to the unit: "6.83 TFE", "3.87 MFE/t"
+local function fmtUnit(n, unit, forceSign)
+  local a, prefix = math.abs(n), ""
+  local v = n
+  if a >= 1e12 then v, prefix = n / 1e12, "T"
+  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
+  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
+  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
+  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
+  local sign = (forceSign and n > 0) and "+" or ""
+  return sign .. num .. " " .. prefix .. unit
+end
+
 local function autoFields(data)
   local keys = {}
   for k, v in pairs(data) do
@@ -308,13 +321,13 @@ local function renderPanel(win, name)
       else
         local text, col = nil, colors.white
         if f.type == "energy" then
-          text = si(v) .. " FE"
+          text = fmtUnit(v, "FE")
         elseif f.type == "rate" then
           if f.signed then
             col = v >= 0 and colors.lime or colors.red
-            text = (v > 0 and "+" or "") .. si(v) .. " FE/t"
+            text = fmtUnit(v, "FE/t", true)
           else
-            text = si(v) .. " FE/t"
+            text = fmtUnit(v, "FE/t")
           end
         else
           text = type(v) == "number" and si(v) or tostring(v)
