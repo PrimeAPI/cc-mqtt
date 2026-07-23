@@ -702,7 +702,14 @@ local function handle(id, msg)
   elseif msg.type == "registry" then
     local list = {}
     for name, e in pairs(entities) do
-      list[name] = { kind = e.kind, topics = e.topics, meta = e.meta, version = e.version, online = e.online }
+      list[name] = {
+        kind = e.kind,
+        topics = e.topics,
+        meta = e.meta,
+        actions = e.actions or (e.meta and e.meta.actions) or {},
+        version = e.version,
+        online = e.online
+      }
     end
     send(id, { type = "registry", entities = list })
 

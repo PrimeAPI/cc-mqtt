@@ -608,13 +608,9 @@ local function renderScreen()
     term.write(padLine(" SELECT ENTITY:", w))
 
     local sorted = {}
-    for n in pairs(registry) do
-      if wizardTarget == "METRIC" or #getEntityActions(n) > 0 then
-        sorted[#sorted + 1] = n
-      end
-    end
+    for n in pairs(registry) do sorted[#sorted + 1] = n end
     for n in pairs(ents) do
-      if not registry[n] and (wizardTarget == "METRIC" or #getEntityActions(n) > 0) then
+      if not registry[n] then
         local found = false
         for _, x in ipairs(sorted) do if x == n then found = true break end end
         if not found then sorted[#sorted + 1] = n end
@@ -627,14 +623,19 @@ local function renderScreen()
       term.setCursorPos(2, 4)
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.gray)
-      term.write(wizardTarget == "ACTION" and "No entities with actions found." or "No entities discovered yet.")
+      term.write("No entities discovered yet.")
     else
       for idx, name in ipairs(sorted) do
         if y >= h - 2 then break end
+        local actCount = #getEntityActions(name)
         term.setCursorPos(1, y)
         term.setBackgroundColor(colors.gray)
         term.setTextColor(colors.white)
-        term.write(padLine((" [%d] %s"):format(idx, name), w))
+        local itemText = (" [%d] %s"):format(idx, name)
+        if wizardTarget == "ACTION" then
+          itemText = itemText .. (" (%d acts)"):format(actCount)
+        end
+        term.write(padLine(itemText, w))
         term.setBackgroundColor(colors.black)
         y = y + 1
       end
@@ -692,16 +693,16 @@ local function renderScreen()
     term.write(padLine(" SELECT ACTION FOR " .. tostring(wizardEntity) .. ":", w))
 
     local actList = getEntityActions(wizardEntity)
-
     local y = 3
     if #actList == 0 then
       term.setCursorPos(2, 4)
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.gray)
       term.write("No actions defined for entity.")
+      y = y + 2
     else
       for idx, act in ipairs(actList) do
-        if y >= h - 2 then break end
+        if y >= h - 3 then break end
         term.setCursorPos(1, y)
         term.setBackgroundColor(colors.gray)
         term.setTextColor(colors.white)
@@ -711,23 +712,13 @@ local function renderScreen()
       end
     end
 
-    local y = 3
-    if #actList == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No actions defined for entity.")
-    else
-      for idx, act in ipairs(actList) do
-        if y >= h - 2 then break end
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-        term.write(padLine((" [%d] %s"):format(idx, act), w))
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
-    end
+    -- Custom action option at bottom
+    term.setCursorPos(1, y)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    term.write(padLine(" [*] Enter Custom Action...", w))
+    term.setBackgroundColor(colors.black)
+    y = y + 1
 
     for r = y, h - 2 do
       term.setCursorPos(1, r)
