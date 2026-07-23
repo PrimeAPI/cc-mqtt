@@ -279,13 +279,18 @@ local function renderPanel(win, name)
   win.clear()
   local w, h = win.getSize()
   local ent = ents[name]
-  local stale = ent and ent.stale
+  -- compute freshness here from lastSeen, independent of the loop's
+  -- stale-marking, so panels can never show outdated data as fresh
+  local age = ent and ent.lastSeen and (os.clock() - ent.lastSeen) or nil
+  local stale = (ent and ent.stale) or (age ~= nil and age > STALE_AFTER)
   local unformed = ent and ent.data and ent.data.formed == false
 
-  -- header bar: colored by kind, red when something is wrong
+  -- header bar: colored by kind, red when something is wrong;
+  -- right side shows the age of the displayed data
   local accent = (stale or unformed) and colors.red
     or (ent and KIND_COLORS[ent.kind]) or colors.blue
-  local status = stale and "OFFLINE" or unformed and "NOT FORMED" or ""
+  local status = stale and "OFFLINE" or unformed and "NOT FORMED"
+    or (age and math.floor(age + 0.5) .. "s" or "")
   win.setCursorPos(1, 1)
   win.setBackgroundColor(accent)
   win.setTextColor(colors.black)
@@ -584,7 +589,7 @@ end
 
 local function entityScreen()
   local sel, offset = 1, 0
-  local regTimer = os.startTimer(0.1)
+  local nextReg = 0   -- deadline-based, immune to swallowed timer events
 
   local function draw()
     local w, h = term.getSize()
@@ -625,6 +630,7 @@ local function entityScreen()
 
   draw()
   while true do
+    os.startTimer(1)   -- guaranteed wake-up, see runDisplay
     local ev = { os.pullEvent() }
     local names = sortedEntityNames()
 
@@ -650,10 +656,13 @@ local function entityScreen()
         return "exit"
       end
     elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
-      if handleNet(ev[3]) then draw() end
-    elseif ev[1] == "timer" and ev[2] == regTimer then
+      pcall(handleNet, ev[3])
+      draw()
+    end
+
+    if os.clock() >= nextReg then
       requestRegistry()
-      regTimer = os.startTimer(5)
+      nextReg = os.clock() + 5
       draw()
     end
   end
@@ -675,7 +684,6 @@ end
 
 -- interactive move/resize of one item, live on the monitor
 local function editItem(item)
-  local dataTimer = os.startTimer(1)
   local function drawTerm()
     local w, h = term.getSize()
     tClear()
@@ -692,7 +700,9 @@ local function editItem(item)
   end
   drawTerm()
   drawMon()
+  local nextMon = os.clock() + 1
   while true do
+    os.startTimer(1)   -- guaranteed wake-up, see runDisplay
     local ev = { os.pullEvent() }
     local changed = false
     if ev[1] == "key" then
@@ -711,15 +721,16 @@ local function editItem(item)
       elseif c == "s" then item.h = item.h + 1 changed = true
       end
     elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
-      handleNet(ev[3])
-    elseif ev[1] == "timer" and ev[2] == dataTimer then
-      drawMon()
-      dataTimer = os.startTimer(1)
+      pcall(handleNet, ev[3])
     end
     if changed then
       clampItem(item)
       drawTerm()
       drawMon()
+      nextMon = os.clock() + 1
+    elseif os.clock() >= nextMon then
+      drawMon()
+      nextMon = os.clock() + 1
     end
   end
 end
@@ -727,7 +738,6 @@ end
 local function layoutScreen()
   ensurePanels()
   local sel, offset = 1, 0
-  local dataTimer = os.startTimer(1)
 
   local function draw()
     local w, h = term.getSize()
@@ -768,7 +778,9 @@ local function layoutScreen()
 
   draw()
   preview(true)
+  local nextPrev = os.clock() + 1
   while true do
+    os.startTimer(1)   -- guaranteed wake-up, see runDisplay
     local ev = { os.pullEvent() }
 
     if ev[1] == "key" then
@@ -821,10 +833,12 @@ local function layoutScreen()
         return "exit"
       end
     elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
-      handleNet(ev[3])
-    elseif ev[1] == "timer" and ev[2] == dataTimer then
+      pcall(handleNet, ev[3])
+    end
+
+    if os.clock() >= nextPrev then
       preview(true)
-      dataTimer = os.startTimer(1)
+      nextPrev = os.clock() + 1
     end
   end
 end
@@ -888,33 +902,45 @@ local function runDisplay()
   print(("display '%s' -> broker #%d  |  run 'subscriber setup' to configure")
     :format(cfg.name, broker))
 
-  local drawTimer = os.startTimer(0.5)
-  local regTimer  = os.startTimer(REG_INTERVAL)
-  local subTimer  = os.startTimer(SUB_INTERVAL)
+  -- Deadline-based scheduling instead of tracked one-shot timers.
+  -- Background: rednet.lookup() (inside subscribe) pulls events with
+  -- its own filter and DISCARDS pending timer events. With tracked
+  -- timer ids, a swallowed timer means its branch never runs again
+  -- and the whole display freezes. Deadlines don't care which timer
+  -- event woke us - any wake-up runs everything that is due.
+  local nextDraw, nextReg, nextSub = 0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL
 
-  while true do
-    local ev = { os.pullEvent() }
-
-    if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
-      if handleNet(ev[3]) then
-        print("new entity discovered - run 'subscriber setup' to enable it")
-      end
-
-    elseif ev[1] == "timer" and ev[2] == drawTimer then
-      local t = os.clock()
+  local function tick()
+    local t = os.clock()
+    if t >= nextDraw then
       for _, e in pairs(ents) do
         if e.lastSeen and t - e.lastSeen > STALE_AFTER then e.stale = true end
       end
       renderAll()
-      drawTimer = os.startTimer(0.5)
-
-    elseif ev[1] == "timer" and ev[2] == regTimer then
+      nextDraw = t + 0.5
+    end
+    if t >= nextReg then
       requestRegistry()
-      regTimer = os.startTimer(REG_INTERVAL)
-
-    elseif ev[1] == "timer" and ev[2] == subTimer then
+      nextReg = t + REG_INTERVAL
+    end
+    if t >= nextSub then
       subscribe()
-      subTimer = os.startTimer(SUB_INTERVAL)
+      nextSub = t + SUB_INTERVAL
+    end
+  end
+
+  while true do
+    -- always arm a fresh wake-up before blocking: even if something
+    -- swallows timer events, the next iteration arms a new one, so
+    -- the loop can never stall waiting for an event that was eaten
+    os.startTimer(0.5)
+    local ev = { os.pullEvent() }
+
+    if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
+      local ok, newFound = pcall(handleNet, ev[3])
+      if ok and newFound then
+        print("new entity discovered - run 'subscriber setup' to enable it")
+      end
 
     elseif ev[1] == "key" and ev[2] == keys.q then
       return
@@ -922,6 +948,9 @@ local function runDisplay()
     elseif ev[1] == "monitor_touch" then
       -- later: hit-test panels here and call sendCommand(entity, ...)
     end
+
+    local ok, err = pcall(tick)
+    if not ok then printError("tick error: " .. tostring(err)) end
   end
 end
 
