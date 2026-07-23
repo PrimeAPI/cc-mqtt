@@ -60,29 +60,52 @@ end
 local function checkAndApplyUpdate(scriptName)
   if not http then return false end
   scriptName = scriptName or "broker.lua"
-  local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName)
-  local res = http.get(rawUrl)
-  if not res then return false end
 
-  local code = res.readAll()
-  local headers = res.getResponseHeaders()
-  res.close()
-
-  if not code or #code < 100 then return false end
-
-  -- Extract Git SHA from ETag header or compute hash fallback
   local remoteSha = nil
-  local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
-  if etag then
-    remoteSha = etag:match("(%x%x%x%x%x%x%x+)")
-  end
-  if not remoteSha then
-    local hash = 0
-    for i = 1, #code do
-      hash = (hash * 31 + code:byte(i)) % 4294967296
+  local code = nil
+  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+
+  -- Primary: Query GitHub API for the latest commit SHA (bypasses CDN cache)
+  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, cb)
+  local apiRes = http.get(apiUrl, {
+    ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+    ["Pragma"]        = "no-cache",
+    ["User-Agent"]    = "CC-Tweaked",
+  })
+
+  if apiRes then
+    local raw = apiRes.readAll()
+    apiRes.close()
+    local data = textutils.unserializeJSON(raw)
+    if type(data) == "table" and data.sha then
+      remoteSha = data.sha
     end
-    remoteSha = string.format("%08x", hash)
   end
+
+  -- Fallback: If GitHub API is unavailable, fetch raw head with cache-busting headers
+  if not remoteSha then
+    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName, cb)
+    local res = http.get(rawUrl, {
+      ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+      ["Pragma"]        = "no-cache",
+      ["User-Agent"]    = "CC-Tweaked",
+    })
+    if res then
+      code = res.readAll()
+      local headers = res.getResponseHeaders()
+      res.close()
+
+      local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
+      if etag then remoteSha = etag:match("(%x%x%x%x%x%x%x+)") end
+      if not remoteSha and code then
+        local hash = 0
+        for i = 1, #code do hash = (hash * 31 + code:byte(i)) % 4294967296 end
+        remoteSha = string.format("%08x", hash)
+      end
+    end
+  end
+
+  if not remoteSha then return false end
 
   local target = shell and shell.getRunningProgram() or "startup.lua"
   if not target or target == "" then target = "startup.lua" end
@@ -101,28 +124,44 @@ local function checkAndApplyUpdate(scriptName)
   if currentVersion == "dev" or currentVersion == "" then
     currentVersion = remoteSha
     local f = fs.open(VERSION_FILE, "w")
-    f.write(remoteSha)
-    f.close()
+    if f then f.write(remoteSha) f.close() end
     return false
   end
 
   if remoteSha ~= currentVersion then
     print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
-    print("[Updater] Updating " .. target .. " and rebooting...")
 
-    local f = fs.open(target .. ".tmp", "w")
-    f.write(code)
-    f.close()
-    if fs.exists(target) then fs.delete(target) end
-    fs.move(target .. ".tmp", target)
+    -- Fetch exact code using the commit SHA path (bypasses CDN branch cache)
+    if not code then
+      local commitUrl = ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(REPO_OWNER, REPO_NAME, remoteSha, scriptName)
+      local cRes = http.get(commitUrl, {
+        ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+        ["Pragma"]        = "no-cache",
+        ["User-Agent"]    = "CC-Tweaked",
+      })
+      if cRes then
+        code = cRes.readAll()
+        cRes.close()
+      end
+    end
 
-    local vf = fs.open(VERSION_FILE, "w")
-    vf.write(remoteSha)
-    vf.close()
+    if code and #code > 100 then
+      print("[Updater] Updating " .. target .. " and rebooting...")
 
-    sleep(1)
-    os.reboot()
-    return true
+      local f = fs.open(target .. ".tmp", "w")
+      f.write(code)
+      f.close()
+      if fs.exists(target) then fs.delete(target) end
+      fs.move(target .. ".tmp", target)
+
+      local vf = fs.open(VERSION_FILE, "w")
+      vf.write(remoteSha)
+      vf.close()
+
+      sleep(1)
+      os.reboot()
+      return true
+    end
   end
   return false
 end
