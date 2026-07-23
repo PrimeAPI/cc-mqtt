@@ -260,6 +260,20 @@ local function getEntityActions(name)
   return {}
 end
 
+local function getSortedEntities()
+  local sorted = {}
+  for n in pairs(registry) do sorted[#sorted + 1] = n end
+  for n in pairs(ents) do
+    if not registry[n] then
+      local found = false
+      for _, x in ipairs(sorted) do if x == n then found = true break end end
+      if not found then sorted[#sorted + 1] = n end
+    end
+  end
+  table.sort(sorted)
+  return sorted
+end
+
 --------------------------------------------------------------------
 -- formatting helpers
 --------------------------------------------------------------------
@@ -648,16 +662,7 @@ local function renderScreen()
     term.setTextColor(colors.yellow)
     term.write(padLine(" SELECT ENTITY:", w))
 
-    local sorted = {}
-    for n in pairs(registry) do sorted[#sorted + 1] = n end
-    for n in pairs(ents) do
-      if not registry[n] then
-        local found = false
-        for _, x in ipairs(sorted) do if x == n then found = true break end end
-        if not found then sorted[#sorted + 1] = n end
-      end
-    end
-    table.sort(sorted)
+    local sorted = getSortedEntities()
 
     local y = 3
     if #sorted == 0 then
@@ -941,20 +946,7 @@ local function handleTouch(x, y)
     end
 
   elseif activeTab == "WIZARD_ENTITY" then
-    local sorted = {}
-    for n in pairs(registry) do
-      if wizardTarget == "METRIC" or #getEntityActions(n) > 0 then
-        sorted[#sorted + 1] = n
-      end
-    end
-    for n in pairs(ents) do
-      if not registry[n] and (wizardTarget == "METRIC" or #getEntityActions(n) > 0) then
-        local found = false
-        for _, x in ipairs(sorted) do if x == n then found = true break end end
-        if not found then sorted[#sorted + 1] = n end
-      end
-    end
-    table.sort(sorted)
+    local sorted = getSortedEntities()
 
     local entIdx = y - 2
     if entIdx >= 1 and entIdx <= #sorted then
@@ -1004,6 +996,12 @@ local function handleTouch(x, y)
       saveConfig()
       setBanner(("Added action: %s on %s"):format(selAct, wizardEntity), false)
       activeTab = "SETTINGS"
+      renderScreen()
+    elseif aIdx == #actList + 1 or (#actList == 0 and y >= 4) then
+      inspectEntity = wizardEntity
+      selectedAction = "custom"
+      inputBuffer = ""
+      activeTab = "INPUT_ARG"
       renderScreen()
     end
   end
