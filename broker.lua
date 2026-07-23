@@ -5,7 +5,9 @@
 -- * Subscribers SUBSCRIBE with topic patterns (MQTT style: +, #)
 -- * Commands are routed broker -> provider ("command" messages)
 -- * Terminal runs interactive Entity Browser (inspect telemetry, purge offline, trigger actions)
--- * Connected monitor (if present) lists all known entities
+-- * First connected monitor (if present) lists all known entities;
+--   a second monitor (if present) shows a timestamped rolling log of
+--   every action triggered, newest at the bottom
 --
 -- Save as startup.lua on the broker computer. Needs a modem.
 --------------------------------------------------------------------
@@ -18,12 +20,19 @@ local TICK          = 2    -- monitor refresh / prune interval
 peripheral.find("modem", function(n) rednet.open(n) end)
 rednet.host(PROTOCOL, HOSTNAME)
 
-local mon = peripheral.find("monitor")
+-- first monitor found = entity list, second (if present) = action log
+local monitors = { peripheral.find("monitor") }
+local mon    = monitors[1]
+local logMon = monitors[2]
 if mon then mon.setTextScale(0.5) end
+if logMon then logMon.setTextScale(0.5) end
 
 local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
 local subs      = {}   -- computerId -> {patterns, name}
 local retained  = {}   -- topic -> last data message (sent to new subscribers)
+
+local actionLog = {}   -- { {time=os.date string, text=...}, ... }, oldest first
+local LOG_MAX   = 200  -- hard cap so a long-running broker doesn't grow forever
 
 local viewMode            = "LIST" -- "LIST", "INSPECT", "INPUT"
 local selectedIndex       = 1
@@ -172,6 +181,11 @@ local function setBanner(msg, isError)
   statusBanner = { text = msg, error = isError or false, time = now() }
 end
 
+local function logAction(text, isError)
+  actionLog[#actionLog + 1] = { time = os.date("%H:%M:%S"), text = text, error = isError or false }
+  if #actionLog > LOG_MAX then table.remove(actionLog, 1) end
+end
+
 local function split(s)
   local out = {}
   for part in s:gmatch("[^/]+") do out[#out + 1] = part end
@@ -270,6 +284,7 @@ local function sendCommand(entName, actionName, rawArgs)
     args = parsedArgs,
     from = os.getComputerID(),
   })
+  logAction(("[local] %s -> %s(%s)"):format(entName, actionName, tostring(parsedArgs or "")))
   return true, ("Sent '%s' to %s"):format(actionName, entName)
 end
 
@@ -333,6 +348,43 @@ local function redrawMonitor()
     mon.setCursorPos(1, 3)
     mon.setTextColor(colors.gray)
     mon.write("no entities connected")
+  end
+end
+
+-- second monitor (if present): rolling action log, newest at the
+-- bottom - as new entries arrive the oldest ones simply scroll off
+-- the top since we only ever draw the tail that fits
+local function redrawLogMonitor()
+  if not logMon then return end
+  local w, h = logMon.getSize()
+  logMon.setBackgroundColor(colors.black)
+  logMon.clear()
+  logMon.setCursorPos(1, 1)
+  logMon.setTextColor(colors.yellow)
+  logMon.write("cbus action log")
+  logMon.setCursorPos(1, 2)
+  logMon.setTextColor(colors.gray)
+  logMon.write(string.rep("-", w))
+
+  if #actionLog == 0 then
+    logMon.setCursorPos(1, 3)
+    logMon.setTextColor(colors.gray)
+    logMon.write("no actions triggered yet")
+    return
+  end
+
+  local rows = h - 2
+  local startIdx = math.max(1, #actionLog - rows + 1)
+  local y = 3
+  for i = startIdx, #actionLog do
+    local entry = actionLog[i]
+    logMon.setCursorPos(1, y)
+    logMon.setTextColor(colors.lightGray)
+    local stamp = "[" .. entry.time .. "] "
+    logMon.write(stamp)
+    logMon.setTextColor(entry.error and colors.red or colors.white)
+    logMon.write(entry.text:sub(1, math.max(0, w - #stamp)))
+    y = y + 1
   end
 end
 
@@ -764,17 +816,23 @@ local function handle(id, msg)
 
   elseif msg.type == "command" then
     local e = entities[msg.entity or ""]
+    local requester = (subs[id] and subs[id].name) or ("#" .. tostring(id))
     if e and e.kind == "provider" and e.online then
       send(e.id, { type = "command", entity = msg.entity,
                    action = msg.action, args = msg.args, from = id })
       send(id, { type = "ack", of = "command" })
+      logAction(("[%s] %s -> %s(%s)"):format(
+        requester, msg.entity, msg.action, tostring(msg.args ~= nil and msg.args or "")))
     else
       send(id, { type = "error", of = "command",
                  reason = "unknown or offline entity: " .. tostring(msg.entity) })
+      logAction(("[%s] %s -> %s FAILED (unknown/offline)"):format(
+        requester, tostring(msg.entity), tostring(msg.action)), true)
     end
 
   elseif msg.type == "cmdResult" then
     setBanner(("Result [%s]: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
+    logAction(("%s result: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
 
   elseif msg.type == "heartbeat" then
     touch(msg.entity)
@@ -790,6 +848,7 @@ end
 pcall(checkAndApplyUpdate, "broker.lua")
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
+redrawLogMonitor()
 redrawTerminal()
 
 local nextTick = now() + TICK
@@ -802,6 +861,7 @@ while true do
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     handle(ev[2], ev[3])
     redrawMonitor()
+    redrawLogMonitor()
     redrawTerminal()
 
   elseif ev[1] == "key" then
@@ -817,6 +877,7 @@ while true do
       if t - e.lastSeen > OFFLINE_AFTER then e.online = false end
     end
     redrawMonitor()
+    redrawLogMonitor()
     redrawTerminal()
     nextTick = t + TICK
   end
