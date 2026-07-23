@@ -15,6 +15,7 @@ If you are familiar with the **MQTT** protocol (ISO/IEC 20922), `cc:mqtt` implem
 | **MQTT Broker** | `broker.lua` | Central host running rednet protocol `"cbus"`. Manages entity registrations, message routing, topic matching, retained message storage, and subscriber lists. |
 | **Publisher** | `provider.lua` | Connects to peripherals, collects telemetry, and periodically publishes data to topic endpoints (`publish` messages). |
 | **Subscriber** | `subscriber.lua` | Listens to topic streams and renders live graphical dashboards on attached ComputerCraft monitors. |
+| **Automation Server** | `controller.lua` | Listens to all network telemetry, evaluates user automations/triggers, executes remote actions, and renders status & audit logs on attached monitors. |
 | **Topics** | `kind/entity_name`<br>*(e.g., `energy/matrix1`, `reactor/fission1`)* | Hierarchical string identifiers used to categorize telemetry data streams. |
 | **Topic Wildcards** | `+` (single-level)<br>`#` (multi-level) | Subscribers can filter topics using standard MQTT wildcards (`+` matches a single topic level, `#` matches all sub-topics). |
 | **Retained Messages** | `retained[topic]` | The broker stores the latest payload for each topic and immediately delivers it to newly connected subscribers. |
@@ -27,11 +28,11 @@ If you are familiar with the **MQTT** protocol (ISO/IEC 20922), `cc:mqtt` implem
 
 `cc:mqtt` includes a built-in background **Auto-Updater** that continuously keeps all your in-game computers updated without manual intervention:
 
-* **Automatic GitHub Sync**: Every 60 seconds (and on boot), each running script (`broker`, `provider`, `subscriber`) queries the GitHub Commit API (`https://api.github.com/repos/PrimeAPI/cc-mqtt/commits/main`).
+* **Automatic GitHub Sync**: Every 60 seconds (and on boot), each running script (`broker`, `provider`, `subscriber`, `controller`) queries the GitHub Commit API (`https://api.github.com/repos/PrimeAPI/cc-mqtt/commits/main`).
 * **Zero-Touch Upgrades**: When a new commit is detected on `main`, the script automatically downloads the latest code from GitHub, replaces `startup.lua`, updates `.version`, and reboots the ComputerCraft computer.
 * **Commit Hash Version Metric**:
   * Every entity reports its running Git commit hash (`v:a1b2c3d`) to the network.
-  * The **Broker Terminal Browser**, **Broker Inspector**, and **Monitor Overview** display the short 7-character commit hash (`VER`) for every connected provider and subscriber.
+  * The **Broker Terminal Browser**, **Broker Inspector**, **Controller**, and **Monitor Overview** display the short 7-character commit hash (`VER`) for every connected provider and subscriber.
 
 ---
 
@@ -69,6 +70,18 @@ If you are familiar with the **MQTT** protocol (ISO/IEC 20922), `cc:mqtt` implem
     2. **Visual Layout Editor**: Reposition and resize panels directly on the monitor using WASD/arrow keys, add group headers, and insert separator lines.
   * **Live Display**: Formats energy (FE, J), flow rates (mB/t), fluid contents, percentages, and status alerts with color coding and auto-stale warnings.
 
+### 4. `controller.lua` — Automation & Control Server
+* **Role**: Evaluates triggers and automations across all connected network entities, executing remote actions automatically and displaying live rule status & audit logs on attached monitors.
+* **Features**:
+  * **Flexible Expression Engine**: Evaluates conditions and dynamic action arguments with built-in unit constants (`MFE/t`, `kFE/t`, `GFE/t`) and property proxies.
+  * **Multiple Execution Modes**: Supports `edge` (trigger once on state change), `continuous` (dynamic proportional scaling), and `state` (then/else state transitions).
+  * **Monitor Status & Audit Log**: Renders rule health badges (`[OK]`, `[TRIG]`, `[ACT]`, `[OFF]`, `[ERR]`) and a real-time scrolling audit log of invoked actions.
+  * **Interactive Terminal TUI**:
+    * `[Space]`: Toggle individual automation rules on/off.
+    * `[T]`: Force test/trigger selected rule manually.
+    * `[E]` / `[Enter]`: Inspect detailed rule conditions, actions, and evaluation errors.
+    * `[Tab]`: Switch between Rules view and Monitored Entities telemetry state.
+
 ---
 
 ## 📥 Installation
@@ -96,6 +109,18 @@ reboot
 ```
 
 *On first run, the provider will prompt you in the terminal to assign friendly names to any newly detected peripherals. Configuration is automatically saved to `devices.cfg`.*
+
+---
+
+### 3. Automation Control Server Setup (`controller.lua`)
+On a ComputerCraft computer equipped with a Wireless/Wired Modem and an attached Monitor:
+
+```bash
+wget https://raw.githubusercontent.com/PrimeAPI/cc-mqtt/refs/heads/main/controller.lua startup.lua
+reboot
+```
+
+---
 
 ### 📱 Advanced Pocket Computer Tablet Setup (`tablet.lua`)
 On an **Advanced Pocket Computer** (Tablet):
@@ -127,6 +152,16 @@ reboot
   * `[A]` / `[Enter]`: Edit display aliases for entities on the fly.
   * `[S]`: Launch the visual monitor setup editor.
 
+### 🤖 Automation Control Server (`controller.lua`)
+* **Live Rule Management**:
+  * `[Space]`: Toggle rules `[ON]` / `[OFF]`.
+  * `[T]`: Instantly test/trigger a rule manually.
+  * `[E]`: Inspect rule parameters, condition string, action lists, and last error trace.
+  * `[Tab]`: View real-time monitored entity telemetry cache.
+* **Monitor Display**:
+  * Displays color-coded rule status badges (`[OK]`, `[TRIG]`, `[ACT]`, `[ERR]`, `[OFF]`) and execution counters (`x142`).
+  * Live bottom section renders real-time action audit log entries (e.g. `[14:22:05] EnergyController-SPS->setMaxFlow(8540000000)`).
+
 ### 📱 Pocket Computer Controller & Dashboard (`tablet.lua`)
 * **Touch-Optimized UI**: Designed specifically for the 26x20 resolution of Pocket Computers with a bottom touch tab bar:
   * `[Dash]`: Live metric cards and percentage gauges.
@@ -136,6 +171,57 @@ reboot
 * **Startup-Only Auto Update**: Checks GitHub commit version hash strictly on startup.
 * **Flicker-Free Heartbeat Animation**: Header contains a smooth pulsing heartbeat indicator (`[O]`) that proves the loop is alive without screen flicker.
 * **Dual Monitor & Terminal Rendering**: Runs full interactive management TUI on the computer terminal while driving high-performance visual dashboards on attached Monitors.
+
+---
+
+## ⚡ Automation Use Cases (`automations.cfg`)
+
+`controller.lua` automatically generates an `automations.cfg` configuration file on boot. Below are example rules implemented out-of-the-box:
+
+```lua
+-- 1. Fission Reactor Emergency Safety Scram & Chat Alert
+{
+  id = "fission_scram_waste",
+  name = "Fission Reactor Waste Emergency Scram",
+  enabled = true,
+  mode = "edge",
+  condition = "fisionReactor.waste > 20 and fisionReactor.isActive()",
+  actions = {
+    { entity = "fisionReactor", action = "scram" },
+    { entity = "chatbox", action = "chat", args = "REACTOR EMERGENCY-SHUTDOWN: Waste > 20%" }
+  }
+}
+
+-- 2. Induction Matrix -> SPS Proportional Energy Flow Scaling
+{
+  id = "sps_energy_scaling",
+  name = "Induction Matrix -> SPS Dynamic Energy Scaling",
+  enabled = true,
+  mode = "continuous",
+  condition = "inductionmatrix.fillPercent > 10",
+  actions = {
+    { entity = "EnergyController-SPS", action = "setMaxFlow", args = "inductionmatrix.fillPercent * 100MFE/t" }
+  },
+  elseActions = {
+    { entity = "EnergyController-SPS", action = "setMaxFlow", args = 0 }
+  }
+}
+
+-- 3. Fissile Fuel Tank Level -> Energy Controller Flow Regulation
+{
+  id = "fuel_gen_flow_control",
+  name = "Fissile Fuel Level -> Energy Controller Flow",
+  enabled = true,
+  mode = "continuous",
+  condition = "tank-fissile-fuele.fillPercent < 25",
+  actions = {
+    { entity = "EnergyController-Fuel-Generation", action = "setMaxFlow", args = "5MFE/t" }
+  },
+  elseActions = {
+    { entity = "EnergyController-Fuel-Generation", action = "setMaxFlow", args = "500kFE/t" }
+  }
+}
+```
 
 ---
 
@@ -152,3 +238,4 @@ reboot
 ### Topic Wildcards
 * `+` — Single-level wildcard (e.g. `energy/+` subscribes to all energy devices)
 * `#` — Multi-level wildcard (e.g. `#` subscribes to all topics across the entire network)
+
