@@ -735,10 +735,12 @@ pcall(checkAndApplyUpdate, "broker.lua")
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawTerminal()
-local timer = os.startTimer(TICK)
-local updateTimer = os.startTimer(UPDATE_TICK)
+
+local nextTick = now() + TICK
+local nextUpdate = now() + UPDATE_TICK
 
 while true do
+  os.startTimer(0.5)
   local ev = { os.pullEvent() }
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
@@ -746,23 +748,25 @@ while true do
     redrawMonitor()
     redrawTerminal()
 
-  elseif ev[1] == "timer" and ev[2] == timer then
-    local t = now()
-    for _, e in pairs(entities) do
-      if t - e.lastSeen > OFFLINE_AFTER then e.online = false end
-    end
-    redrawMonitor()
-    redrawTerminal()
-    timer = os.startTimer(TICK)
-
-  elseif ev[1] == "timer" and ev[2] == updateTimer then
-    pcall(checkAndApplyUpdate, "broker.lua")
-    updateTimer = os.startTimer(UPDATE_TICK)
-
   elseif ev[1] == "key" then
     handleTerminalKey(ev)
 
   elseif ev[1] == "char" then
     handleTerminalChar(ev)
+  end
+
+  local t = now()
+  if t >= nextTick then
+    for _, e in pairs(entities) do
+      if t - e.lastSeen > OFFLINE_AFTER then e.online = false end
+    end
+    redrawMonitor()
+    redrawTerminal()
+    nextTick = t + TICK
+  end
+
+  if t >= nextUpdate then
+    nextUpdate = t + UPDATE_TICK
+    pcall(checkAndApplyUpdate, "broker.lua")
   end
 end

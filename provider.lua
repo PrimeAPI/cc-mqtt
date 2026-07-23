@@ -916,27 +916,15 @@ end
 announceAll()
 print(("connected to broker #%d (v:%s), publishing every %ds"):format(broker, getShortVer(currentVersion), INTERVAL))
 
-local pubTimer = os.startTimer(1)
-local annTimer = os.startTimer(ANNOUNCE)
-local updateTimer = os.startTimer(UPDATE_TICK)
+local nextPub = 0
+local nextAnn = os.clock() + ANNOUNCE
+local nextUpdate = os.clock() + UPDATE_TICK
 
 while true do
+  os.startTimer(0.5)
   local ev = { os.pullEvent() }
 
-  if ev[1] == "timer" and ev[2] == pubTimer then
-    for _, dev in ipairs(devices) do publish(dev) end
-    pubTimer = os.startTimer(INTERVAL)
-
-  elseif ev[1] == "timer" and ev[2] == annTimer then
-    findBroker(true)
-    announceAll()
-    annTimer = os.startTimer(ANNOUNCE)
-
-  elseif ev[1] == "timer" and ev[2] == updateTimer then
-    pcall(checkAndApplyUpdate, "provider.lua")
-    updateTimer = os.startTimer(UPDATE_TICK)
-
-  elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
+  if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     local msg = ev[3]
     if type(msg) == "table" then
       if msg.type == "broker_online" or msg.type == "reannounce_req" then
@@ -946,12 +934,27 @@ while true do
 
       elseif msg.type == "command" then
         handleCommand(msg)
-        pubTimer = os.startTimer(0.5)
-        annTimer = os.startTimer(ANNOUNCE)
+        nextPub = os.clock() + 0.5
+        nextAnn = os.clock() + ANNOUNCE
       end
     end
 
   elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
     print("peripheral change detected - reboot to rescan")
+  end
+
+  local t = os.clock()
+  if t >= nextPub then
+    for _, dev in ipairs(devices) do publish(dev) end
+    nextPub = t + INTERVAL
+  end
+  if t >= nextAnn then
+    findBroker(true)
+    announceAll()
+    nextAnn = t + ANNOUNCE
+  end
+  if t >= nextUpdate then
+    nextUpdate = t + UPDATE_TICK
+    pcall(checkAndApplyUpdate, "provider.lua")
   end
 end

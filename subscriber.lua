@@ -1031,7 +1031,7 @@ local function runDisplay()
   -- timer ids, a swallowed timer means its branch never runs again
   -- and the whole display freezes. Deadlines don't care which timer
   -- event woke us - any wake-up runs everything that is due.
-  local nextDraw, nextReg, nextSub = 0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL
+  local nextDraw, nextReg, nextSub, nextUpdate = 0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + UPDATE_TICK
 
   local function tick()
     local t = os.clock()
@@ -1047,8 +1047,15 @@ local function runDisplay()
       nextReg = t + REG_INTERVAL
     end
     if t >= nextSub then
+      if not broker or not findBroker(true) then
+        findBroker(true)
+      end
       subscribe()
       nextSub = t + SUB_INTERVAL
+    end
+    if t >= nextUpdate then
+      nextUpdate = t + UPDATE_TICK
+      pcall(checkAndApplyUpdate, "subscriber.lua")
     end
   end
 
