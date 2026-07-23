@@ -1,10 +1,11 @@
 --------------------------------------------------------------------
--- cbus broker  --  MQTT-like broker for CC:Tweaked
+-- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
 --
 -- * Providers ANNOUNCE themselves and PUBLISH data on topics
 -- * Subscribers SUBSCRIBE with topic patterns (MQTT style: +, #)
 -- * Commands are routed broker -> provider ("command" messages)
--- * A connected monitor (e.g. 2x2 advanced) lists all known entities
+-- * Terminal runs interactive Entity Browser (inspect telemetry, purge offline, trigger actions)
+-- * Connected monitor (if present) lists all known entities
 --
 -- Save as startup.lua on the broker computer. Needs a modem.
 --------------------------------------------------------------------
@@ -20,11 +21,23 @@ rednet.host(PROTOCOL, HOSTNAME)
 local mon = peripheral.find("monitor")
 if mon then mon.setTextScale(0.5) end
 
-local entities  = {}   -- name -> {id, kind, topics, meta, lastSeen, online}
+local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
 local subs      = {}   -- computerId -> {patterns, name}
 local retained  = {}   -- topic -> last data message (sent to new subscribers)
 
+local viewMode            = "LIST" -- "LIST", "INSPECT", "INPUT"
+local selectedIndex       = 1
+local selectedActionIndex = 1
+local inspectEntityName   = nil
+local inputActionName     = nil
+local inputBuffer         = ""
+local statusBanner        = nil
+
 local function now() return os.clock() end
+
+local function setBanner(msg, isError)
+  statusBanner = { text = msg, error = isError or false, time = now() }
+end
 
 local function split(s)
   local out = {}
@@ -58,10 +71,100 @@ local function touch(name)
   if e then e.lastSeen = now(); e.online = true end
 end
 
+local function getActionsForEntity(e)
+  if not e then return {} end
+  local acts = {}
+  local seen = {}
+  local rawList = e.actions or (e.meta and e.meta.actions) or {}
+  for _, a in ipairs(rawList) do
+    if not seen[a] then
+      acts[#acts + 1] = a
+      seen[a] = true
+    end
+  end
+  if #acts == 0 then
+    local k = (e.kind or ""):lower()
+    local name = (inspectEntityName or ""):lower()
+    if k:find("reactor") or k:find("fission") or name:find("fission") then
+      acts = { "activate", "scram", "setBurnRate" }
+    elseif k:find("fusion") or name:find("fusion") then
+      acts = { "setInjectionRate" }
+    elseif k:find("turbine") or name:find("turbine") then
+      acts = { "setDumpingMode", "nextDumpingMode" }
+    end
+  end
+  return acts
+end
+
+local function getRetainedForEntity(name)
+  local out = {}
+  for topic, m in pairs(retained) do
+    if m.entity == name then
+      if type(m.data) == "table" then
+        for k, v in pairs(m.data) do
+          if k:sub(1, 1) ~= "_" then
+            out[k] = v
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function sendCommand(entName, actionName, rawArgs)
+  local e = entities[entName]
+  if not e then
+    return false, "Unknown entity: " .. tostring(entName)
+  end
+  if not e.online then
+    return false, "Entity '" .. tostring(entName) .. "' is offline"
+  end
+  local parsedArgs = rawArgs
+  if rawArgs and rawArgs ~= "" then
+    if tonumber(rawArgs) then parsedArgs = tonumber(rawArgs)
+    elseif rawArgs:lower() == "true" then parsedArgs = true
+    elseif rawArgs:lower() == "false" then parsedArgs = false
+    end
+  else
+    parsedArgs = nil
+  end
+
+  send(e.id, {
+    type = "command",
+    entity = entName,
+    action = actionName,
+    args = parsedArgs,
+    from = os.getComputerID(),
+  })
+  return true, ("Sent '%s' to %s"):format(actionName, entName)
+end
+
+local function removeOfflineEntity(name)
+  local e = entities[name]
+  if not e then return false, "Entity not found" end
+  if e.online then
+    return false, "Cannot remove online entity '" .. name .. "'"
+  end
+  entities[name] = nil
+  return true, "Removed offline entity '" .. name .. "'"
+end
+
+local function purgeAllOffline()
+  local count = 0
+  for name, e in pairs(entities) do
+    if not e.online then
+      entities[name] = nil
+      count = count + 1
+    end
+  end
+  return count
+end
+
 --------------------------------------------------------------------
--- monitor
+-- monitor display
 --------------------------------------------------------------------
-local function redraw()
+local function redrawMonitor()
   if not mon then return end
   local w, h = mon.getSize()
   mon.setBackgroundColor(colors.black)
@@ -101,6 +204,347 @@ local function redraw()
 end
 
 --------------------------------------------------------------------
+-- terminal interactive browser
+--------------------------------------------------------------------
+local function redrawTerminal()
+  local w, h = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+
+  if statusBanner and (now() - statusBanner.time > 5) then
+    statusBanner = nil
+  end
+
+  local sortedNames = {}
+  for n in pairs(entities) do sortedNames[#sortedNames + 1] = n end
+  table.sort(sortedNames)
+
+  if selectedIndex > #sortedNames then selectedIndex = math.max(1, #sortedNames) end
+
+  if viewMode == "LIST" then
+    -- Header
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = (" cbus broker #%d"):format(os.getComputerID())
+    local countText = ("[%d Entities] "):format(#sortedNames)
+    local space = math.max(1, w - #headerText - #countText)
+    term.write(headerText .. string.rep(" ", space) .. countText)
+
+    -- Column headers
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.yellow)
+    term.write(" NAME           KIND        STATUS     LAST SEEN")
+    if w > 48 then term.write(string.rep(" ", w - 48)) end
+
+    -- List body
+    local listH = h - 3
+    if statusBanner then listH = listH - 1 end
+
+    local pageOffset = math.floor((selectedIndex - 1) / math.max(1, listH)) * listH
+
+    for i = 1, listH do
+      local idx = pageOffset + i
+      local rowY = 2 + i
+      if idx > #sortedNames then break end
+      local name = sortedNames[idx]
+      local e = entities[name]
+
+      term.setCursorPos(1, rowY)
+      if idx == selectedIndex then
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+      else
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+      end
+
+      local selChar = (idx == selectedIndex) and ">" or " "
+      local statStr = e.online and "ONLINE " or "OFFLINE"
+      local statColor = e.online and colors.lime or colors.red
+      local seenSec = math.floor(now() - e.lastSeen)
+      local seenStr = e.online and (seenSec .. "s ago") or "offline"
+
+      term.write(selChar .. " ")
+      term.setTextColor(colors.white)
+      local padName = name .. string.rep(" ", math.max(1, 14 - #name))
+      term.write(padName:sub(1, 14))
+
+      term.setTextColor(colors.lightGray)
+      local padKind = (e.kind or "?") .. string.rep(" ", math.max(1, 11 - #(e.kind or "?")))
+      term.write(padKind:sub(1, 11))
+
+      term.setTextColor(statColor)
+      term.write(statStr .. "    ")
+
+      term.setTextColor(colors.gray)
+      term.write(seenStr)
+
+      local cx, _ = term.getCursorPos()
+      if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
+    end
+
+    if #sortedNames == 0 then
+      term.setCursorPos(2, 4)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No entities connected yet.")
+    end
+
+    if statusBanner then
+      term.setCursorPos(1, h - 1)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(statusBanner.error and colors.red or colors.lime)
+      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter/C] Inspect  [D] Del Off  [P] Purge All"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+
+  elseif viewMode == "INSPECT" then
+    local name = inspectEntityName
+    local e = entities[name]
+
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = " Inspect: " .. (name or "?")
+    local statusText = e and (e.online and "[ONLINE] " or "[OFFLINE] ") or "[UNKNOWN] "
+    local space = math.max(1, w - #headerText - #statusText)
+    term.write(headerText .. string.rep(" ", space) .. statusText)
+
+    if not e then
+      term.setCursorPos(2, 3)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.red)
+      term.write("Entity '" .. tostring(name) .. "' no longer exists.")
+    else
+      term.setCursorPos(1, 2)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.lightGray)
+      term.write(("Kind: %s | Computer ID: #%s | Last seen: %ds ago"):format(
+        e.kind or "?", tostring(e.id or "?"), math.floor(now() - e.lastSeen)))
+
+      term.setCursorPos(1, 3)
+      term.setTextColor(colors.gray)
+      local topStr = table.concat(e.topics or {}, ", ")
+      term.write("Topics: " .. (topStr ~= "" and topStr or "(none)"))
+
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("--- LATEST TELEMETRY VALUES ---")
+
+      local retData = getRetainedForEntity(name)
+      local dataKeys = {}
+      for k in pairs(retData) do dataKeys[#dataKeys + 1] = k end
+      table.sort(dataKeys)
+
+      local dataY = 6
+      if #dataKeys == 0 then
+        term.setCursorPos(2, dataY)
+        term.setTextColor(colors.gray)
+        term.write("(no telemetry data received yet)")
+        dataY = dataY + 1
+      else
+        for i, k in ipairs(dataKeys) do
+          if dataY >= h - 7 then
+            term.setCursorPos(2, dataY)
+            term.setTextColor(colors.gray)
+            term.write("... (" .. (#dataKeys - i + 1) .. " more values)")
+            dataY = dataY + 1
+            break
+          end
+          term.setCursorPos(2, dataY)
+          term.setTextColor(colors.lightGray)
+          term.write(k .. ": ")
+          term.setTextColor(colors.white)
+          local v = retData[k]
+          if type(v) == "number" then
+            term.write(string.format(v == math.floor(v) and "%.0f" or "%.2f", v))
+          else
+            term.write(tostring(v))
+          end
+          dataY = dataY + 1
+        end
+      end
+
+      dataY = dataY + 1
+      term.setCursorPos(1, dataY)
+      term.setTextColor(colors.yellow)
+      term.write("--- ACTIONS ---")
+      dataY = dataY + 1
+
+      local actions = getActionsForEntity(e)
+      if selectedActionIndex > #actions then selectedActionIndex = math.max(1, #actions) end
+
+      if #actions == 0 then
+        term.setCursorPos(2, dataY)
+        term.setTextColor(colors.gray)
+        term.write("(no actions available for this entity)")
+      else
+        for j, act in ipairs(actions) do
+          if dataY >= h - 2 then break end
+          term.setCursorPos(2, dataY)
+          if j == selectedActionIndex then
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.white)
+            term.write("> " .. j .. ". " .. act .. " ")
+          else
+            term.setBackgroundColor(colors.black)
+            term.setTextColor(colors.white)
+            term.write("  " .. j .. ". " .. act .. " ")
+          end
+          dataY = dataY + 1
+        end
+      end
+    end
+
+    if statusBanner then
+      term.setCursorPos(1, h - 1)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(statusBanner.error and colors.red or colors.lime)
+      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter] Trigger Action  [D] Del Off  [B/Esc] Back"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+
+  elseif viewMode == "INPUT" then
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    term.write((" Trigger Action: %s on %s"):format(tostring(inputActionName), tostring(inspectEntityName)))
+
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.yellow)
+    term.write("Enter arguments for action '" .. tostring(inputActionName) .. "':")
+
+    term.setCursorPos(1, 4)
+    term.setTextColor(colors.gray)
+    term.write("(Press Enter with empty text for no args, or e.g. 40, IDLE, etc.)")
+
+    term.setCursorPos(1, 6)
+    term.setTextColor(colors.white)
+    term.write(" > " .. inputBuffer .. "_")
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter] Send Command    [Esc] Cancel"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+  end
+end
+
+--------------------------------------------------------------------
+-- user interaction handlers
+--------------------------------------------------------------------
+local function handleTerminalKey(ev)
+  local key = ev[2]
+  local sortedNames = {}
+  for n in pairs(entities) do sortedNames[#sortedNames + 1] = n end
+  table.sort(sortedNames)
+
+  if viewMode == "LIST" then
+    if key == keys.up or key == keys.w then
+      selectedIndex = math.max(1, selectedIndex - 1)
+      redrawTerminal()
+
+    elseif key == keys.down or key == keys.s then
+      selectedIndex = math.min(#sortedNames, selectedIndex + 1)
+      redrawTerminal()
+
+    elseif key == keys.enter or key == keys.right or key == keys.i or key == keys.c then
+      if #sortedNames > 0 and sortedNames[selectedIndex] then
+        inspectEntityName = sortedNames[selectedIndex]
+        selectedActionIndex = 1
+        viewMode = "INSPECT"
+        redrawTerminal()
+      end
+
+    elseif key == keys.d or key == keys.delete then
+      if #sortedNames > 0 and sortedNames[selectedIndex] then
+        local name = sortedNames[selectedIndex]
+        local ok, msg = removeOfflineEntity(name)
+        setBanner(msg, not ok)
+        redrawTerminal()
+      end
+
+    elseif key == keys.p then
+      local n = purgeAllOffline()
+      setBanner(("Purged %d offline entities"):format(n), false)
+      redrawTerminal()
+    end
+
+  elseif viewMode == "INSPECT" then
+    local e = entities[inspectEntityName]
+    local actions = e and getActionsForEntity(e) or {}
+
+    if key == keys.up or key == keys.w then
+      selectedActionIndex = math.max(1, selectedActionIndex - 1)
+      redrawTerminal()
+
+    elseif key == keys.down or key == keys.s then
+      selectedActionIndex = math.min(#actions, selectedActionIndex + 1)
+      redrawTerminal()
+
+    elseif key == keys.backspace or key == keys.b or key == keys.escape or key == keys.left then
+      viewMode = "LIST"
+      redrawTerminal()
+
+    elseif key == keys.d or key == keys.delete then
+      if inspectEntityName then
+        local ok, msg = removeOfflineEntity(inspectEntityName)
+        setBanner(msg, not ok)
+        if ok then viewMode = "LIST" end
+        redrawTerminal()
+      end
+
+    elseif key == keys.enter then
+      if #actions > 0 and actions[selectedActionIndex] then
+        inputActionName = actions[selectedActionIndex]
+        inputBuffer = ""
+        viewMode = "INPUT"
+        redrawTerminal()
+      end
+    end
+
+  elseif viewMode == "INPUT" then
+    if key == keys.escape then
+      viewMode = "INSPECT"
+      redrawTerminal()
+
+    elseif key == keys.backspace then
+      inputBuffer = inputBuffer:sub(1, -2)
+      redrawTerminal()
+
+    elseif key == keys.enter then
+      local ok, msg = sendCommand(inspectEntityName, inputActionName, inputBuffer)
+      setBanner(msg, not ok)
+      viewMode = "INSPECT"
+      redrawTerminal()
+    end
+  end
+end
+
+local function handleTerminalChar(ev)
+  if viewMode == "INPUT" then
+    local ch = ev[2]
+    if ch and #ch == 1 then
+      inputBuffer = inputBuffer .. ch
+      redrawTerminal()
+    end
+  end
+end
+
+--------------------------------------------------------------------
 -- message handling
 --------------------------------------------------------------------
 local function handle(id, msg)
@@ -112,6 +556,7 @@ local function handle(id, msg)
       kind = msg.kind or "provider",
       topics = msg.topics or {},
       meta = msg.meta,
+      actions = msg.actions or (msg.meta and msg.meta.actions) or {},
       lastSeen = now(),
       online = true,
     }
@@ -158,6 +603,9 @@ local function handle(id, msg)
                  reason = "unknown or offline entity: " .. tostring(msg.entity) })
     end
 
+  elseif msg.type == "cmdResult" then
+    setBanner(("Result [%s]: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
+
   elseif msg.type == "heartbeat" then
     touch(msg.entity)
   end
@@ -166,21 +614,31 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
-print("cbus broker running as #" .. os.getComputerID())
-redraw()
+redrawMonitor()
+redrawTerminal()
 local timer = os.startTimer(TICK)
 
 while true do
   local ev = { os.pullEvent() }
+
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     handle(ev[2], ev[3])
-    redraw()
+    redrawMonitor()
+    redrawTerminal()
+
   elseif ev[1] == "timer" and ev[2] == timer then
     local t = now()
     for _, e in pairs(entities) do
       if t - e.lastSeen > OFFLINE_AFTER then e.online = false end
     end
-    redraw()
+    redrawMonitor()
+    redrawTerminal()
     timer = os.startTimer(TICK)
+
+  elseif ev[1] == "key" then
+    handleTerminalKey(ev)
+
+  elseif ev[1] == "char" then
+    handleTerminalChar(ev)
   end
 end

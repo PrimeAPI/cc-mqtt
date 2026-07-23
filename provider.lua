@@ -712,12 +712,23 @@ end
 
 local function send(msg) rednet.send(broker, msg, PROTOCOL) end
 
+local function getActionNames(dev)
+  local names = {}
+  if dev.actions then
+    for k in pairs(dev.actions) do names[#names + 1] = k end
+    table.sort(names)
+  end
+  return names
+end
+
 local function announceAll()
   for _, dev in ipairs(devices) do
+    local actionNames = getActionNames(dev)
     send({
       type = "announce", entity = dev.entity, kind = "provider",
       topics = { dev.topic },
-      meta = { title = dev.title, fields = dev.fields },
+      meta = { title = dev.title, fields = dev.fields, actions = actionNames },
+      actions = actionNames,
     })
   end
 end
@@ -729,9 +740,11 @@ local function publish(dev)
   -- generic handler: build meta from first successful sample
   if not dev.fields and next(data) then
     dev.fields = deriveFields(data)
+    local actionNames = getActionNames(dev)
     send({ type = "announce", entity = dev.entity, kind = "provider",
            topics = { dev.topic },
-           meta = { title = dev.title, fields = dev.fields } })
+           meta = { title = dev.title, fields = dev.fields, actions = actionNames },
+           actions = actionNames })
   end
 
   -- safety watchdog (fission auto-scram etc.)
