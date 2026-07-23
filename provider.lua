@@ -697,20 +697,103 @@ end
 --------------------------------------------------------------------
 -- broker communication
 --------------------------------------------------------------------
+--------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+local VERSION_FILE  = ".version"
+local REPO_OWNER    = "PrimeAPI"
+local REPO_NAME     = "cc-mqtt"
+local REPO_BRANCH   = "main"
+local UPDATE_TICK   = 60
+
+local currentVersion = "dev"
+if fs.exists(VERSION_FILE) then
+  local f = fs.open(VERSION_FILE, "r")
+  if f then
+    currentVersion = f.readAll():gsub("%s+", "")
+    f.close()
+  end
+end
+
+local function getShortVer(v)
+  if not v or v == "" then return "?" end
+  if #v >= 7 then return v:sub(1, 7) end
+  return v
+end
+
+local function checkAndApplyUpdate(scriptName)
+  if not http then return false end
+  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH)
+  local res = http.get(apiUrl, { ["User-Agent"] = "CC-Tweaked" })
+  if not res then return false end
+
+  local raw = res.readAll()
+  res.close()
+
+  local data = textutils.unserializeJSON(raw)
+  if type(data) ~= "table" or not data.sha then return false end
+
+  local remoteSha = data.sha
+  if currentVersion == "dev" or currentVersion == "" then
+    currentVersion = remoteSha
+    local f = fs.open(VERSION_FILE, "w")
+    f.write(remoteSha)
+    f.close()
+    return false
+  end
+
+  if remoteSha ~= currentVersion then
+    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName or "provider.lua")
+    local scriptRes = http.get(rawUrl)
+    if scriptRes then
+      local code = scriptRes.readAll()
+      scriptRes.close()
+      if code and #code > 100 then
+        local target = shell and shell.getRunningProgram() or "startup.lua"
+        if not target or target == "" then target = "startup.lua" end
+
+        print(("[Updater] New commit detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+        print("[Updater] Updating " .. target .. " and rebooting...")
+
+        local f = fs.open(target .. ".tmp", "w")
+        f.write(code)
+        f.close()
+        if fs.exists(target) then fs.delete(target) end
+        fs.move(target .. ".tmp", target)
+
+        local vf = fs.open(VERSION_FILE, "w")
+        vf.write(remoteSha)
+        vf.close()
+
+        sleep(1)
+        os.reboot()
+        return true
+      end
+    end
+  end
+  return false
+end
+
 peripheral.find("modem", function(n) rednet.open(n) end)
 
 local broker
 
-local function findBroker()
-  broker = rednet.lookup(PROTOCOL, "broker")
-  while not broker do
-    print("waiting for broker...")
-    sleep(3)
-    broker = rednet.lookup(PROTOCOL, "broker")
+local function findBroker(silent)
+  local b = rednet.lookup(PROTOCOL, "broker")
+  if b then
+    broker = b
+    return true
   end
+  if not silent then print("waiting for broker...") end
+  return false
 end
 
-local function send(msg) rednet.send(broker, msg, PROTOCOL) end
+local function send(msg)
+  if not broker then findBroker(true) end
+  if broker then
+    rednet.send(broker, msg, PROTOCOL)
+  end
+end
 
 local function getActionNames(dev)
   local names = {}
@@ -727,8 +810,9 @@ local function announceAll()
     send({
       type = "announce", entity = dev.entity, kind = "provider",
       topics = { dev.topic },
-      meta = { title = dev.title, fields = dev.fields, actions = actionNames },
+      meta = { title = dev.title, fields = dev.fields, actions = actionNames, version = currentVersion },
       actions = actionNames,
+      version = currentVersion,
     })
   end
 end
@@ -743,8 +827,8 @@ local function publish(dev)
     local actionNames = getActionNames(dev)
     send({ type = "announce", entity = dev.entity, kind = "provider",
            topics = { dev.topic },
-           meta = { title = dev.title, fields = dev.fields, actions = actionNames },
-           actions = actionNames })
+           meta = { title = dev.title, fields = dev.fields, actions = actionNames, version = currentVersion },
+           actions = actionNames, version = currentVersion })
   end
 
   -- safety watchdog (fission auto-scram etc.)
@@ -762,7 +846,7 @@ local function publish(dev)
   for k, v in pairs(data) do
     if k:sub(1, 1) ~= "_" then out[k] = v end
   end
-  send({ type = "publish", entity = dev.entity, topic = dev.topic, data = out })
+  send({ type = "publish", entity = dev.entity, topic = dev.topic, data = out, version = currentVersion })
 end
 
 local function handleCommand(msg)
@@ -806,12 +890,16 @@ for _, dev in ipairs(devices) do
   print(("  %s -> %s (%s)"):format(dev.entity, dev.topic, dev.title))
 end
 
-findBroker()
+while not findBroker(false) do
+  sleep(2)
+end
+
 announceAll()
-print(("connected to broker #%d, publishing every %ds"):format(broker, INTERVAL))
+print(("connected to broker #%d (v:%s), publishing every %ds"):format(broker, getShortVer(currentVersion), INTERVAL))
 
 local pubTimer = os.startTimer(1)
 local annTimer = os.startTimer(ANNOUNCE)
+local updateTimer = os.startTimer(UPDATE_TICK)
 
 while true do
   local ev = { os.pullEvent() }
@@ -821,19 +909,27 @@ while true do
     pubTimer = os.startTimer(INTERVAL)
 
   elseif ev[1] == "timer" and ev[2] == annTimer then
-    local b = rednet.lookup(PROTOCOL, "broker")
-    if b then broker = b end
+    findBroker(true)
     announceAll()
     annTimer = os.startTimer(ANNOUNCE)
 
+  elseif ev[1] == "timer" and ev[2] == updateTimer then
+    pcall(checkAndApplyUpdate, "provider.lua")
+    updateTimer = os.startTimer(UPDATE_TICK)
+
   elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     local msg = ev[3]
-    if type(msg) == "table" and msg.type == "command" then
-      handleCommand(msg)
-      -- actions may sleep() (e.g. pulse), which can swallow pending
-      -- timer events -> restart both timers to keep publishing alive
-      pubTimer = os.startTimer(0.5)
-      annTimer = os.startTimer(ANNOUNCE)
+    if type(msg) == "table" then
+      if msg.type == "broker_online" or msg.type == "reannounce_req" then
+        if ev[2] then broker = ev[2] end
+        print("broker connected (#" .. tostring(broker) .. ") -> re-announcing devices")
+        announceAll()
+
+      elseif msg.type == "command" then
+        handleCommand(msg)
+        pubTimer = os.startTimer(0.5)
+        annTimer = os.startTimer(ANNOUNCE)
+      end
     end
 
   elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then

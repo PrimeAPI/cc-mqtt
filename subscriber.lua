@@ -102,27 +102,110 @@ local function loadConfig()
 end
 
 --------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+local VERSION_FILE  = ".version"
+local REPO_OWNER    = "PrimeAPI"
+local REPO_NAME     = "cc-mqtt"
+local REPO_BRANCH   = "main"
+local UPDATE_TICK   = 60
+
+local currentVersion = "dev"
+if fs.exists(VERSION_FILE) then
+  local f = fs.open(VERSION_FILE, "r")
+  if f then
+    currentVersion = f.readAll():gsub("%s+", "")
+    f.close()
+  end
+end
+
+local function getShortVer(v)
+  if not v or v == "" then return "?" end
+  if #v >= 7 then return v:sub(1, 7) end
+  return v
+end
+
+local function checkAndApplyUpdate(scriptName)
+  if not http then return false end
+  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH)
+  local res = http.get(apiUrl, { ["User-Agent"] = "CC-Tweaked" })
+  if not res then return false end
+
+  local raw = res.readAll()
+  res.close()
+
+  local data = textutils.unserializeJSON(raw)
+  if type(data) ~= "table" or not data.sha then return false end
+
+  local remoteSha = data.sha
+  if currentVersion == "dev" or currentVersion == "" then
+    currentVersion = remoteSha
+    local f = fs.open(VERSION_FILE, "w")
+    f.write(remoteSha)
+    f.close()
+    return false
+  end
+
+  if remoteSha ~= currentVersion then
+    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName or "subscriber.lua")
+    local scriptRes = http.get(rawUrl)
+    if scriptRes then
+      local code = scriptRes.readAll()
+      scriptRes.close()
+      if code and #code > 100 then
+        local target = shell and shell.getRunningProgram() or "startup.lua"
+        if not target or target == "" then target = "startup.lua" end
+
+        print(("[Updater] New commit detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+        print("[Updater] Updating " .. target .. " and rebooting...")
+
+        local f = fs.open(target .. ".tmp", "w")
+        f.write(code)
+        f.close()
+        if fs.exists(target) then fs.delete(target) end
+        fs.move(target .. ".tmp", target)
+
+        local vf = fs.open(VERSION_FILE, "w")
+        vf.write(remoteSha)
+        vf.close()
+
+        sleep(1)
+        os.reboot()
+        return true
+      end
+    end
+  end
+  return false
+end
+
+--------------------------------------------------------------------
 -- broker communication + state
 --------------------------------------------------------------------
 local broker
 local ents = {}       -- name -> {data, meta, lastSeen, stale}
 local registry = {}   -- name -> {kind, online}
 
-local function findBroker()
-  broker = rednet.lookup(PROTOCOL, "broker")
-  while not broker do
-    print("waiting for broker...")
-    sleep(3)
-    broker = rednet.lookup(PROTOCOL, "broker")
+local function findBroker(silent)
+  local b = rednet.lookup(PROTOCOL, "broker")
+  if b then
+    broker = b
+    return true
   end
+  if not silent then print("waiting for broker...") end
+  return false
 end
 
-local function send(msg) rednet.send(broker, msg, PROTOCOL) end
+local function send(msg)
+  if not broker then findBroker(true) end
+  if broker then
+    rednet.send(broker, msg, PROTOCOL)
+  end
+end
 
 local function subscribe()
   local b = rednet.lookup(PROTOCOL, "broker")
   if b then broker = b end
-  send({ type = "subscribe", name = cfg.name, patterns = { "#" } })
+  send({ type = "subscribe", name = cfg.name, patterns = { "#" }, version = currentVersion })
 end
 
 local function requestRegistry() send({ type = "registry" }) end
@@ -133,11 +216,17 @@ local function sendCommand(entity, action, cmdArgs)
 end
 
 -- returns true if a NEW provider entity was added to the config
-local function handleNet(msg)
+local function handleNet(msg, senderId)
   if type(msg) ~= "table" then return false end
   local newFound = false
 
-  if msg.type == "data" and msg.entity then
+  if msg.type == "broker_online" or msg.type == "reannounce_req" then
+    if senderId then broker = senderId end
+    print("broker connected (#" .. tostring(broker) .. ") -> re-subscribing")
+    subscribe()
+    requestRegistry()
+
+  elseif msg.type == "data" and msg.entity then
     ents[msg.entity] = ents[msg.entity] or {}
     local e = ents[msg.entity]
     e.data, e.lastSeen, e.stale = msg.data, os.clock(), false
@@ -248,21 +337,15 @@ local function gaugeRow(win, y, w, label, frac, invert)
   frac = math.max(0, math.min(1, frac or 0))
   local pct = string.format("%3d%%", math.floor(frac * 100 + 0.5))
   local lab = label:sub(1, math.min(#label, math.max(3, w - #pct - 8)))
-  local barW = w - #lab - #pct - 2
+  local trackW = w - #lab - #pct - 3
+  if trackW < 3 then
+    row(win, y, w, label, pct, colors.white)
+    return
+  end
   win.setCursorPos(1, y)
   win.setBackgroundColor(colors.black)
   win.setTextColor(colors.lightGray)
   win.write(lab .. " ")
-  if barW >= 4 then
-    local fill = math.floor(frac * barW + 0.5)
-    local col
-    if invert then
-      col = frac > 0.8 and colors.red or frac > 0.5 and colors.orange or colors.lime
-    else
-      col = frac < 0.2 and colors.red or frac < 0.5 and colors.orange or colors.lime
-    end
-    win.setBackgroundColor(col)
-    win.write(string.rep(" ", fill))
     win.setBackgroundColor(TRACK_COLOR)
     win.write(string.rep(" ", barW - fill))
     win.setBackgroundColor(colors.black)
@@ -937,7 +1020,7 @@ local function runDisplay()
     local ev = { os.pullEvent() }
 
     if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
-      local ok, newFound = pcall(handleNet, ev[3])
+      local ok, newFound = pcall(handleNet, ev[3], ev[2])
       if ok and newFound then
         print("new entity discovered - run 'subscriber setup' to enable it")
       end

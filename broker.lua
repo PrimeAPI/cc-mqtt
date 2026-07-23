@@ -33,6 +33,83 @@ local inputActionName     = nil
 local inputBuffer         = ""
 local statusBanner        = nil
 
+--------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+local VERSION_FILE  = ".version"
+local REPO_OWNER    = "PrimeAPI"
+local REPO_NAME     = "cc-mqtt"
+local REPO_BRANCH   = "main"
+local UPDATE_TICK   = 60
+
+local currentVersion = "dev"
+if fs.exists(VERSION_FILE) then
+  local f = fs.open(VERSION_FILE, "r")
+  if f then
+    currentVersion = f.readAll():gsub("%s+", "")
+    f.close()
+  end
+end
+
+local function getShortVer(v)
+  if not v or v == "" then return "?" end
+  if #v >= 7 then return v:sub(1, 7) end
+  return v
+end
+
+local function checkAndApplyUpdate(scriptName)
+  if not http then return false end
+  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH)
+  local res = http.get(apiUrl, { ["User-Agent"] = "CC-Tweaked" })
+  if not res then return false end
+
+  local raw = res.readAll()
+  res.close()
+
+  local data = textutils.unserializeJSON(raw)
+  if type(data) ~= "table" or not data.sha then return false end
+
+  local remoteSha = data.sha
+  if currentVersion == "dev" or currentVersion == "" then
+    currentVersion = remoteSha
+    local f = fs.open(VERSION_FILE, "w")
+    f.write(remoteSha)
+    f.close()
+    return false
+  end
+
+  if remoteSha ~= currentVersion then
+    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName or "broker.lua")
+    local scriptRes = http.get(rawUrl)
+    if scriptRes then
+      local code = scriptRes.readAll()
+      scriptRes.close()
+      if code and #code > 100 then
+        local target = shell and shell.getRunningProgram() or "startup.lua"
+        if not target or target == "" then target = "startup.lua" end
+
+        print(("[Updater] New commit detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+        print("[Updater] Updating " .. target .. " and rebooting...")
+
+        local f = fs.open(target .. ".tmp", "w")
+        f.write(code)
+        f.close()
+        if fs.exists(target) then fs.delete(target) end
+        fs.move(target .. ".tmp", target)
+
+        local vf = fs.open(VERSION_FILE, "w")
+        vf.write(remoteSha)
+        vf.close()
+
+        sleep(1)
+        os.reboot()
+        return true
+      end
+    end
+  end
+  return false
+end
+
 local function now() return os.clock() end
 
 local function setBanner(msg, isError)
@@ -189,7 +266,7 @@ local function redrawMonitor()
     mon.write(e.online and "\7 " or "x ")
     mon.setTextColor(colors.white)
     mon.write(n)
-    local tag = " [" .. (e.kind or "?") .. "]"
+    local tag = " [" .. (e.kind or "?") .. "] v:" .. getShortVer(e.version)
     if #n + 2 + #tag <= w then
       mon.setTextColor(colors.lightGray)
       mon.write(tag)
@@ -226,7 +303,7 @@ local function redrawTerminal()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local headerText = (" cbus broker #%d"):format(os.getComputerID())
+    local headerText = (" cbus broker #%d (v:%s)"):format(os.getComputerID(), getShortVer(currentVersion))
     local countText = ("[%d Entities] "):format(#sortedNames)
     local space = math.max(1, w - #headerText - #countText)
     term.write(headerText .. string.rep(" ", space) .. countText)
@@ -235,8 +312,8 @@ local function redrawTerminal()
     term.setCursorPos(1, 2)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.yellow)
-    term.write(" NAME           KIND        STATUS     LAST SEEN")
-    if w > 48 then term.write(string.rep(" ", w - 48)) end
+    term.write(" NAME         KIND       VER     STATUS   LAST SEEN")
+    if w > 51 then term.write(string.rep(" ", w - 51)) end
 
     -- List body
     local listH = h - 3
@@ -265,18 +342,23 @@ local function redrawTerminal()
       local statColor = e.online and colors.lime or colors.red
       local seenSec = math.floor(now() - e.lastSeen)
       local seenStr = e.online and (seenSec .. "s ago") or "offline"
+      local verStr = getShortVer(e.version)
 
       term.write(selChar .. " ")
       term.setTextColor(colors.white)
-      local padName = name .. string.rep(" ", math.max(1, 14 - #name))
-      term.write(padName:sub(1, 14))
+      local padName = name .. string.rep(" ", math.max(1, 12 - #name))
+      term.write(padName:sub(1, 12))
 
       term.setTextColor(colors.lightGray)
-      local padKind = (e.kind or "?") .. string.rep(" ", math.max(1, 11 - #(e.kind or "?")))
-      term.write(padKind:sub(1, 11))
+      local padKind = (e.kind or "?") .. string.rep(" ", math.max(1, 10 - #(e.kind or "?")))
+      term.write(padKind:sub(1, 10))
+
+      term.setTextColor(colors.cyan)
+      local padVer = verStr .. string.rep(" ", math.max(1, 8 - #verStr))
+      term.write(padVer:sub(1, 8))
 
       term.setTextColor(statColor)
-      term.write(statStr .. "    ")
+      term.write(statStr .. " ")
 
       term.setTextColor(colors.gray)
       term.write(seenStr)
@@ -326,8 +408,8 @@ local function redrawTerminal()
       term.setCursorPos(1, 2)
       term.setBackgroundColor(colors.black)
       term.setTextColor(colors.lightGray)
-      term.write(("Kind: %s | Computer ID: #%s | Last seen: %ds ago"):format(
-        e.kind or "?", tostring(e.id or "?"), math.floor(now() - e.lastSeen)))
+      term.write(("Kind: %s | ID: #%s | Ver: %s | Last: %ds ago"):format(
+        e.kind or "?", tostring(e.id or "?"), getShortVer(e.version), math.floor(now() - e.lastSeen)))
 
       term.setCursorPos(1, 3)
       term.setTextColor(colors.gray)
@@ -557,13 +639,28 @@ local function handle(id, msg)
       topics = msg.topics or {},
       meta = msg.meta,
       actions = msg.actions or (msg.meta and msg.meta.actions) or {},
+      version = msg.version or (msg.meta and msg.meta.version) or "dev",
       lastSeen = now(),
       online = true,
     }
     send(id, { type = "ack", of = "announce" })
 
   elseif msg.type == "publish" then
-    touch(msg.entity)
+    if msg.entity and not entities[msg.entity] then
+      entities[msg.entity] = {
+        id = id,
+        kind = (msg.topic and msg.topic:match("^([^/]+)")) or "provider",
+        topics = { msg.topic },
+        actions = {},
+        version = msg.version or "dev",
+        lastSeen = now(),
+        online = true,
+      }
+      send(id, { type = "reannounce_req" })
+    else
+      touch(msg.entity)
+      if msg.version then entities[msg.entity].version = msg.version end
+    end
     local out = {
       type = "data",
       topic = msg.topic,
@@ -577,7 +674,7 @@ local function handle(id, msg)
   elseif msg.type == "subscribe" then
     local name = msg.name or ("sub-" .. id)
     subs[id] = { patterns = msg.patterns or { "#" }, name = name }
-    entities[name] = { id = id, kind = "subscriber", lastSeen = now(), online = true }
+    entities[name] = { id = id, kind = "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
     send(id, { type = "ack", of = "subscribe" })
     for topic, m in pairs(retained) do
       for _, pat in ipairs(subs[id].patterns) do
@@ -588,7 +685,7 @@ local function handle(id, msg)
   elseif msg.type == "registry" then
     local list = {}
     for name, e in pairs(entities) do
-      list[name] = { kind = e.kind, topics = e.topics, meta = e.meta, online = e.online }
+      list[name] = { kind = e.kind, topics = e.topics, meta = e.meta, version = e.version, online = e.online }
     end
     send(id, { type = "registry", entities = list })
 
@@ -608,15 +705,20 @@ local function handle(id, msg)
 
   elseif msg.type == "heartbeat" then
     touch(msg.entity)
+
+  elseif msg.type == "ping_broker" then
+    send(id, { type = "broker_online", id = os.getComputerID() })
   end
 end
 
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
+rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawTerminal()
 local timer = os.startTimer(TICK)
+local updateTimer = os.startTimer(UPDATE_TICK)
 
 while true do
   local ev = { os.pullEvent() }
@@ -634,6 +736,10 @@ while true do
     redrawMonitor()
     redrawTerminal()
     timer = os.startTimer(TICK)
+
+  elseif ev[1] == "timer" and ev[2] == updateTimer then
+    pcall(checkAndApplyUpdate, "broker.lua")
+    updateTimer = os.startTimer(UPDATE_TICK)
 
   elseif ev[1] == "key" then
     handleTerminalKey(ev)
