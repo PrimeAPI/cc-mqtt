@@ -1041,6 +1041,7 @@ end
 -- main
 --------------------------------------------------------------------
 loadConfig()
+pcall(checkAndApplyUpdate, "subscriber.lua")
 if args[1] == "setup" then
   runSetup()
 else

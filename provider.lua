@@ -890,6 +890,8 @@ for _, dev in ipairs(devices) do
   print(("  %s -> %s (%s)"):format(dev.entity, dev.topic, dev.title))
 end
 
+pcall(checkAndApplyUpdate, "provider.lua")
+
 while not findBroker(false) do
   sleep(2)
 end

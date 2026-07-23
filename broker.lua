@@ -714,6 +714,7 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
+pcall(checkAndApplyUpdate, "broker.lua")
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawTerminal()
