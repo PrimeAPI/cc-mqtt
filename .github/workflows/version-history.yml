@@ -1,0 +1,42 @@
+name: Track deployed version hashes
+
+# Every push to main is a version the broker/provider/subscriber/controller/
+# tablet computers can end up running - they auto-update from main (see
+# checkForUpdate() in each script) and each reports its running version as a
+# short hash on its terminal/monitor. Normally that's the first 7 characters
+# of this commit's real SHA, but if a computer's GitHub API check failed
+# when it last updated, it falls back to an 8-character checksum of the raw
+# file content instead, which is not a git SHA and can't be looked up on
+# GitHub directly. This workflow records both forms for every commit, in
+# VERSION.md (latest only) and VERSION_HISTORY.md (append-only), so any
+# hash a computer shows can be traced back to the commit it came from.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - VERSION.md
+      - VERSION_HISTORY.md
+
+permissions:
+  contents: write
+
+jobs:
+  record-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate VERSION.md and append to VERSION_HISTORY.md
+        run: python3 scripts/update_version_files.py
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION.md VERSION_HISTORY.md
+          if git diff --cached --quiet; then
+            echo "no version changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: record version hashes for ${GITHUB_SHA:0:7} [skip ci]"
+          git push
