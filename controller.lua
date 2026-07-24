@@ -320,6 +320,12 @@ local function preprocessExpression(expr)
   s = s:gsub("%f[%w]OR%f[%W]", " or "):gsub("%f[%w]Or%f[%W]", " or ")
   s = s:gsub("%f[%w]NOT%f[%W]", " not "):gsub("%f[%w]Not%f[%W]", " not ")
 
+  -- the "!= (Not Equal)" wizard option (and anyone typing "!=" by hand)
+  -- produces a "!=" token, but Lua's inequality operator is "~=" - "!="
+  -- has never been valid Lua, so every not-equal condition was a
+  -- guaranteed syntax error ([ERR]) until this rewrite.
+  s = s:gsub("!=", "~=")
+
   -- telemetry "percent"/"fillPercent" style fields are always published as
   -- a 0-1 fraction (Mekanism's *FilledPercentage() calls, and damage/100
   -- in provider.lua), never 0-100 - so "30%" must become 0.3, not 30.
@@ -773,6 +779,26 @@ local function newCondClause()
   return { ent = "", prop = "", op = ">", threshold = "" }
 end
 
+-- A threshold typed in the wizard is plain text; most of the time it's a
+-- number, "true"/"false", or a "30%"/"5MFE/t" literal that
+-- preprocessExpression() knows how to expand later. Anything else is
+-- assumed to be a string comparison (e.g. a status field like RUNNING) and
+-- gets quoted here so the user never has to type quote characters
+-- themselves - "status == RUNNING" just works the same as typing
+-- "status == \"RUNNING\"" by hand.
+local function coerceThresholdLiteral(v)
+  v = v:gsub("^%s+", ""):gsub("%s+$", "")
+  if v == "" then return v end
+  local first = v:sub(1, 1)
+  if first == '"' or first == "'" then return v end -- already quoted
+  local lower = v:lower()
+  if lower == "true" or lower == "false" then return lower end
+  if tonumber(v) then return v end
+  if v:match("^[%d%.]+%%$") then return v end -- e.g. "30%"
+  if v:match("^[%d%.]+%s*[GkM]?FE/?t?$") then return v end -- e.g. "5MFE/t", "20kFE"
+  return ("%q"):format(v)
+end
+
 local function condClauseToString(c)
   if c.raw then return c.raw end
   return ("%s.%s %s %s"):format(c.ent, c.prop, c.op, c.threshold)
@@ -1136,7 +1162,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 11)
       term.setTextColor(colors.yellow)
-      term.write(("Enter operator+value for %s.%s (e.g. >20 or ==true):"):format(wizardData.curCond.ent, wizardData.curCond.prop))
+      term.write(("For %s.%s, e.g. >20, ==true, ==RUNNING:"):format(wizardData.curCond.ent, wizardData.curCond.prop))
       term.setCursorPos(1, 12)
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
@@ -1557,7 +1583,7 @@ local function handleWizardInput(val)
     threshVal = threshVal:gsub("^%s+", "")
 
     wizardData.curCond.op = opChar
-    wizardData.curCond.threshold = threshVal
+    wizardData.curCond.threshold = coerceThresholdLiteral(threshVal)
     table.insert(wizardData.conditions, wizardData.curCond)
     wizardData.curCond = newCondClause()
     wizardData.phase = "cond_more"
