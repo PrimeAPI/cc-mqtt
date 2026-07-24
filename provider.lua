@@ -1,3 +1,5 @@
+-- BUILD 1 -- bump this by 1 every time this file is edited, so you can
+-- eyeball it against a running computer's copy without touching GitHub.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
 --
