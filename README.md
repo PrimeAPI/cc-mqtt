@@ -24,15 +24,33 @@ If you are familiar with the **MQTT** protocol (ISO/IEC 20922), `cc:mqtt` implem
 
 ---
 
-## 🔄 Automatic OTA Updates & Commit Hash Versioning
+## 🔄 Automatic OTA Updates & Release Versioning
 
-`cc:mqtt` includes a built-in background **Auto-Updater** that continuously keeps all your in-game computers updated without manual intervention:
+`cc:mqtt` includes a built-in background **Auto-Updater** that continuously keeps all your in-game computers updated without manual intervention.
 
-* **Automatic GitHub Sync**: Every 60 seconds (and on boot), each running script (`broker`, `provider`, `subscriber`, `controller`) queries the GitHub Commit API (`https://api.github.com/repos/PrimeAPI/cc-mqtt/commits/main`).
-* **Zero-Touch Upgrades**: When a new commit is detected on `main`, the script automatically downloads the latest code from GitHub, replaces `startup.lua`, updates `.version`, and reboots the ComputerCraft computer.
-* **Commit Hash Version Metric**:
-  * Every entity reports its running Git commit hash (`v:a1b2c3d`) to the network.
-  * The **Broker Terminal Browser**, **Broker Inspector**, **Controller**, and **Monitor Overview** display the short 7-character commit hash (`VER`) for every connected provider and subscriber.
+Source lives as multiple files under `src/` (`src/targets/*.lua` per script, plus
+shared modules like the updater itself in `src/lib/`). A GitHub Actions workflow
+(`.github/workflows/release.yml`) compiles these into the flat `broker.lua`,
+`provider.lua`, `subscriber.lua`, `controller.lua`, `tablet.lua` scripts on every
+push to `main` - both committing them back to the repo root (so the `wget`
+instructions below keep working) and publishing them as a numbered
+[GitHub Release](../../releases) (`v42`, `v43`, ...), with each file's checksum
+listed in the release notes.
+
+* **Automatic GitHub Sync**: On boot (and periodically after, per script) each
+  running computer queries `https://api.github.com/repos/PrimeAPI/cc-mqtt/releases/latest`.
+* **Zero-Touch Upgrades**: When the latest release tag differs from the computer's
+  own `.version`, it downloads that release's matching asset, verifies it against
+  the checksum published in the release notes, replaces `startup.lua`, updates
+  `.version`, and reboots.
+* **Release Version Metric**:
+  * Every entity reports its running release tag (`v:42`) to the network.
+  * The **Broker Terminal Browser**, **Broker Inspector**, **Controller**, and
+    **Monitor Overview** display this tag (`VER`) for every connected provider
+    and subscriber.
+  * The compiled script running on a computer also has this stamped as a
+    comment on its first two lines (release tag, commit, build time) - open it
+    directly to check what's actually deployed.
 
 ---
 
@@ -139,7 +157,7 @@ reboot
 ## 🖥️ Interactive Terminal TUIs & Features
 
 ### 📡 Broker Interactive TUI (`broker.lua`)
-* **Live Network Overview**: Displays all registered providers, subscribers, and topics with short commit hashes (`VER`).
+* **Live Network Overview**: Displays all registered providers, subscribers, and topics with their release version (`VER`).
 * **Entity Inspector**: Browse retained telemetry, view actions, and trigger entity commands.
 * **Offline Entity Management**: Remove individual offline entities (`[D]`) or purge all offline entities (`[P]`).
 
