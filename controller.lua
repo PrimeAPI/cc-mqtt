@@ -298,7 +298,12 @@ local function preprocessExpression(expr)
   s = s:gsub("%f[%w]OR%f[%W]", " or "):gsub("%f[%w]Or%f[%W]", " or ")
   s = s:gsub("%f[%w]NOT%f[%W]", " not "):gsub("%f[%w]Not%f[%W]", " not ")
 
-  s = s:gsub("([0-9%.]+)%%", "%1")
+  -- telemetry "percent"/"fillPercent" style fields are always published as
+  -- a 0-1 fraction (Mekanism's *FilledPercentage() calls, and damage/100
+  -- in provider.lua), never 0-100 - so "30%" must become 0.3, not 30.
+  -- Previously this just deleted the "%" sign and left the number
+  -- unchanged, silently comparing against the wrong scale.
+  s = s:gsub("([0-9%.]+)%%", "(%1/100)")
 
   s = s:gsub("([0-9%.]+)%s*GFE/t", "(%1 * 1000000000)")
   s = s:gsub("([0-9%.]+)%s*GFE",   "(%1 * 1000000000)")
