@@ -290,6 +290,28 @@ end
 --------------------------------------------------------------------
 -- expression preprocessor & evaluator
 --------------------------------------------------------------------
+-- escapes a literal string for safe use inside a Lua pattern (gsub's
+-- first argument is always a pattern, never plain text)
+local function escapeLuaPattern(s)
+  return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1"))
+end
+
+-- every entity name we currently know about, over both the telemetry
+-- cache and the broker registry - used to safely recognize "entity.prop"
+-- references even when the entity name itself isn't a valid Lua
+-- identifier (e.g. contains hyphens, like "fission-reactor")
+local function getKnownEntityNamesForEval()
+  local seen = {}
+  local list = {}
+  for n in pairs(state) do
+    if not seen[n] then list[#list + 1] = n; seen[n] = true end
+  end
+  for n in pairs(entities) do
+    if not seen[n] then list[#list + 1] = n; seen[n] = true end
+  end
+  return list
+end
+
 local function preprocessExpression(expr)
   if type(expr) ~= "string" then return tostring(expr or "") end
 
@@ -318,7 +340,50 @@ local function preprocessExpression(expr)
   s = s:gsub("([%w%-_]+)%.isOperational%(%s*%)", "%1.operational")
   s = s:gsub("([%w%-_]+)%.isFormed%(%s*%)", "%1.formed")
 
+  -- Entity names often contain characters (hyphens, most commonly - e.g.
+  -- "fission-reactor", "tank-fissile-fuele") that are not legal inside a
+  -- bare Lua identifier. "fission-reactor.waste > 20" would otherwise be
+  -- parsed by Lua as "fission - reactor.waste > 20" (subtraction of two
+  -- unrelated globals named "fission" and "reactor"), which fails at
+  -- runtime, not as a single "fission-reactor" entity lookup. Rewrite any
+  -- occurrence of a *known* entity name followed by "." into an explicit
+  -- __ent("name") call, which sidesteps Lua's identifier syntax entirely
+  -- and works for any entity name regardless of what characters it has.
+  for _, ent in ipairs(getKnownEntityNamesForEval()) do
+    local pat = escapeLuaPattern(ent) .. "%."
+    if s:find(pat) then
+      s = s:gsub(pat, ("__ent(%q)."):format(ent))
+    end
+  end
+
   return s
+end
+
+local function makeEntityProxy(entName, refTracker)
+  if refTracker then refTracker[entName] = true end
+
+  local proxy = {}
+  setmetatable(proxy, {
+    __index = function(_, propName)
+      local val = getEntityProp(entName, propName)
+      if val == nil then
+        if propName == "isActive" or propName == "isOperational" or propName == "isFormed" then
+          return function()
+            local b = getEntityProp(entName, propName)
+            if b == nil then b = getEntityProp(entName, "active") end
+            return not not b
+          end
+        end
+        return 0
+      end
+      return val
+    end,
+    __call = function()
+      local b = getEntityProp(entName, "active")
+      return not not b
+    end
+  })
+  return proxy
 end
 
 local function createEvalEnv(refTracker)
@@ -336,33 +401,18 @@ local function createEvalEnv(refTracker)
     t = 1,
   }
 
+  -- preprocessExpression() rewrites every "<entity>.prop" it recognizes
+  -- into __ent("<entity>").prop, since entity names may contain
+  -- characters (hyphens, etc.) that aren't legal in a bare identifier.
+  env.__ent = function(entName) return makeEntityProxy(entName, refTracker) end
+
+  -- kept as a fallback for entity names that happen to already be valid
+  -- Lua identifiers and weren't rewritten (e.g. an entity not yet known
+  -- to this controller at preprocessing time)
   setmetatable(env, {
     __index = function(t, entName)
       if rawget(t, entName) ~= nil then return rawget(t, entName) end
-      if refTracker then refTracker[entName] = true end
-
-      local proxy = {}
-      setmetatable(proxy, {
-        __index = function(_, propName)
-          local val = getEntityProp(entName, propName)
-          if val == nil then
-            if propName == "isActive" or propName == "isOperational" or propName == "isFormed" then
-              return function()
-                local b = getEntityProp(entName, propName)
-                if b == nil then b = getEntityProp(entName, "active") end
-                return not not b
-              end
-            end
-            return 0
-          end
-          return val
-        end,
-        __call = function()
-          local b = getEntityProp(entName, "active")
-          return not not b
-        end
-      })
-      return proxy
+      return makeEntityProxy(entName, refTracker)
     end
   })
 
