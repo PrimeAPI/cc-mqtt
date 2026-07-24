@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v2 | commit acd5580 | built 2026-07-24T23:49:05Z
+-- cc-mqtt provider.lua | release dev | commit 64e4fdf | built 2026-07-24T23:59:51Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
@@ -1090,6 +1090,15 @@ function Updater.new(opts)
 
   -- { stage = "release"|"asset"|"fallback", url, tagName, checksum }
   local state = nil
+  local stateStartedAt = nil
+  -- http_success/http_failure normally resolve a request in well under a
+  -- second, but if one never fires at all - a connection silently dropped
+  -- rather than actively refused, for instance - state would otherwise
+  -- stay non-nil forever, and checkNow()'s own "already checking" guard
+  -- below would then silently no-op on every future call, including every
+  -- later periodic tick. This bounds how long an in-flight check is
+  -- trusted before checkNow() treats it as abandoned and starts fresh.
+  local STATE_TIMEOUT = 20
 
   local function applyUpdate(version, code)
     local target = shell and shell.getRunningProgram() or "startup.lua"
@@ -1133,6 +1142,7 @@ function Updater.new(opts)
 
   local function startFallback()
     state = { stage = "fallback", url = fallbackUrl() }
+    stateStartedAt = os.clock()
     http.request(state.url, nil, HTTP_HEADERS)
   end
 
@@ -1149,9 +1159,14 @@ function Updater.new(opts)
       end
       return
     end
+    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
+      print(("[Updater] previous %s check never resolved - abandoning it and starting over"):format(state.stage))
+      state = nil
+    end
     if state then return end -- already checking
     self.status = "checking"
     state = { stage = "release", url = releaseUrl() }
+    stateStartedAt = os.clock()
     http.request(state.url, nil, HTTP_HEADERS)
   end
 
@@ -1163,7 +1178,14 @@ function Updater.new(opts)
     if not state or url ~= state.url then return end
 
     if eventType == "http_failure" then
-      if state.stage == "release" then
+      -- "release" or "asset" failing (e.g. the release asset's
+      -- browser_download_url redirects through a host - typically
+      -- objects.githubusercontent.com - that isn't api.github.com or
+      -- raw.githubusercontent.com, and may not be on this Minecraft
+      -- server's http allowlist even when those two are) still has a way
+      -- forward: the raw-content fallback. Only a "fallback" failure is
+      -- truly terminal - there's nowhere else left to try.
+      if state.stage == "release" or state.stage == "asset" then
         startFallback()
       else
         self.status = "check failed"
@@ -1189,6 +1211,7 @@ function Updater.new(opts)
       self.status = "updating"
       print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(self.currentVersion), getShortVer(tagName)))
       state = { stage = "asset", url = assetUrl, tagName = tagName, checksum = checksum }
+      stateStartedAt = os.clock()
       http.request(state.url, nil, HTTP_HEADERS)
 
     elseif state.stage == "asset" then
