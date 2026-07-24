@@ -1696,7 +1696,14 @@ while true do
     redrawTerminal()
   end
   if t >= nextAnn then
-    findBroker(true)
+    -- only look the broker up if we don't already have one - rednet.lookup()
+    -- blocks and internally pumps a plain os.pullEvent() loop while waiting
+    -- for a reply, silently DISCARDING any other rednet_message (i.e. real
+    -- telemetry) that arrives during that window. Once broker is known there
+    -- is nothing to gain from repeating the lookup every ANNOUNCE seconds -
+    -- a broker restart is already picked up instantly via the
+    -- "broker_online" broadcast handled above.
+    if not broker then findBroker(true) end
     announceAll()
     nextAnn = t + ANNOUNCE
     redrawTerminal()

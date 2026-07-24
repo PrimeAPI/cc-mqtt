@@ -1812,9 +1812,14 @@ local function runDisplay()
       nextReg = t + REG_INTERVAL
     end
     if t >= nextSub then
-      if not broker or not findBroker(true) then
-        findBroker(true)
-      end
+      -- only look the broker up if we don't already have one - rednet.lookup()
+      -- blocks and internally pumps a plain os.pullEvent() loop while waiting
+      -- for a reply, silently DISCARDING any other rednet_message (i.e. real
+      -- telemetry) that arrives during that window. Once broker is known
+      -- there is nothing to gain from repeating the lookup every SUB_INTERVAL
+      -- seconds - a broker restart is already picked up instantly via the
+      -- "broker_online" broadcast handled in handleNet().
+      if not broker then findBroker(true) end
       subscribe()
       nextSub = t + SUB_INTERVAL
     end

@@ -1976,7 +1976,14 @@ while true do
   end
 
   if t >= nextSync then
-    findBroker(true)
+    -- only look the broker up if we don't already have one - rednet.lookup()
+    -- blocks and internally pumps a plain os.pullEvent() loop while waiting
+    -- for a reply, silently DISCARDING any other rednet_message (i.e. real
+    -- telemetry) that arrives during that window. Once broker is known
+    -- there is nothing to gain from repeating the lookup every SYNC_TICK
+    -- seconds - a broker restart is already picked up instantly via the
+    -- "broker_online" broadcast handled in handleMessage().
+    if not broker then findBroker(true) end
     if broker then
       rednet.send(broker, { type = "req_registry" }, PROTOCOL)
     end
