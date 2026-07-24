@@ -7,3 +7,4 @@ Look up a hash a computer shows you: it's either the first 7 characters of the *
 | Date (UTC) | Commit | broker.lua | provider.lua | subscriber.lua | controller.lua | tablet.lua |
 |---|---|---|---|---|---|---|
 | 2026-07-24 19:13:03 UTC | [`4256fb9`](https://github.com/PrimeAPI/cc-mqtt/commit/4256fb915920202650e141d24d7958a2190fcb8d) | `9f8e457f` | `7a6a72d9` | `4fed6846` | `08f86e88` | `00a7f9f5` |
+| 2026-07-24 19:15:21 UTC | [`13c4fa1`](https://github.com/PrimeAPI/cc-mqtt/commit/13c4fa1b73bdbdd05a1d9846f2e85870293ae6a2) | `9f8e457f` | `7a6a72d9` | `4fed6846` | `08f86e88` | `00a7f9f5` |
