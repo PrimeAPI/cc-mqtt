@@ -160,7 +160,8 @@ reboot
 * **Live Rule Management**:
   * `[Space]`: Toggle rules `[ON]` / `[OFF]`.
   * `[T]`: Instantly test/trigger a rule manually.
-  * `[E]`: Inspect rule parameters, condition string, action lists, and last error trace.
+  * `[I]`: Inspect rule parameters, condition string, action lists, and last error trace.
+  * `[E]` / `[Enter]`: Launch the Rule Editor Wizard for the selected rule.
   * `[Tab]`: View real-time monitored entity telemetry cache.
 * **Monitor Display**:
   * Displays color-coded rule status badges (`[OK]`, `[TRIG]`, `[ACT]`, `[ERR]`, `[OFF]`, `[STALE]`) and execution counters (`x142`).

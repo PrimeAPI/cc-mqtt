@@ -1864,6 +1864,12 @@ local function handleTerminalKey(ev)
         redrawTerminal()
       end
 
+    elseif key == keys.i then
+      if #rules > 0 and rules[selectedIndex] then
+        viewMode = "INSPECT"
+        redrawTerminal()
+      end
+
     elseif key == keys.d or key == keys.delete then
       if #rules > 0 and rules[selectedIndex] then
         pendingDelete = true
