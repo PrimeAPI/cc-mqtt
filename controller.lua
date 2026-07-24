@@ -633,6 +633,21 @@ local function evaluateAllRules()
   end
 end
 
+-- "edge"/"state" rules fire on a condition transition, not on a clock, so
+-- there is no schedule to count down - only "continuous" rules re-fire on
+-- a fixed minInterval cadence and can meaningfully show a "next run" timer.
+local function ruleNextRunLabel(r)
+  if not r.enabled then return "off" end
+  if r._status == "STALE" then return "blocked" end
+  if r._status == "ERR" then return "error" end
+  if (r.mode or "edge") ~= "continuous" then return "on trigger" end
+
+  local minInt = r.minInterval or 1.0
+  local remaining = minInt - (now() - (r._lastRun or 0))
+  if remaining <= 0 then return "now" end
+  return string.format("%ds", math.ceil(remaining))
+end
+
 --------------------------------------------------------------------
 -- monitor renderer
 --------------------------------------------------------------------
@@ -702,9 +717,15 @@ local function redrawMonitor()
     y = y + 1
     mon.setCursorPos(8, y)
     mon.setTextColor(colors.lightGray)
+    local nextStr = " | Next: " .. ruleNextRunLabel(r)
+    local avail = w - 8
     local condStr = "Cond: " .. (r.condition or "")
-    if #condStr > w - 8 then condStr = condStr:sub(1, w - 11) .. "..." end
+    if #condStr + #nextStr > avail then
+      condStr = condStr:sub(1, math.max(0, avail - #nextStr - 3)) .. "..."
+    end
     mon.write(condStr)
+    mon.setTextColor(colors.yellow)
+    mon.write(nextStr)
 
     y = y + 1
   end
@@ -1056,8 +1077,9 @@ local function redrawTerminal()
     term.setCursorPos(1, 3)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.yellow)
-    term.write(" ST  RULE NAME                     EXEC  MODE")
-    if w > 45 then term.write(string.rep(" ", w - 45)) end
+    local rulesHeader = " ST  RULE NAME                     EXEC  MODE       NEXT"
+    term.write(rulesHeader)
+    if w > #rulesHeader then term.write(string.rep(" ", w - #rulesHeader)) end
 
     local listH = h - 4
     if statusBanner then listH = listH - 1 end
@@ -1097,7 +1119,11 @@ local function redrawTerminal()
       term.write(cntStr)
 
       term.setTextColor(colors.lightGray)
-      term.write((r.mode or "edge"):sub(1, 10))
+      local modeStr = (r.mode or "edge"):sub(1, 10)
+      term.write(modeStr .. string.rep(" ", 11 - #modeStr))
+
+      term.setTextColor(colors.white)
+      term.write(ruleNextRunLabel(r))
 
       local cx, _ = term.getCursorPos()
       if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
