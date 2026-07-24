@@ -985,7 +985,17 @@ local VERSION_FILE  = ".version"
 local REPO_OWNER    = "PrimeAPI"
 local REPO_NAME     = "cc-mqtt"
 local REPO_BRANCH   = "main"
-local UPDATE_TICK   = 60
+-- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
+-- every CC:Tweaked computer on this Minecraft server shares the server's
+-- one outbound IP. At the old 60s tick, just 2 always-running scripts
+-- checking in parallel already exceeds that budget, so most checks were
+-- silently rate-limited and falling back to fetching main's raw file by
+-- BRANCH name - which, unlike the SHA-pinned URL used once an update is
+-- actually found, sits behind GitHub's raw-content CDN and can lag several
+-- minutes behind a real push. 300s cuts total request volume 5x; the
+-- computer-ID-based stagger below spreads checks across that window
+-- instead of every computer bursting at once.
+local UPDATE_TICK   = 300
 
 local currentVersion = "dev"
 if fs.exists(VERSION_FILE) then
@@ -1339,7 +1349,9 @@ end
 
 local nextPub = 0
 local nextAnn = os.clock() + ANNOUNCE
-local nextUpdate = os.clock() + UPDATE_TICK
+-- staggered by computer ID so a whole fleet of computers doesn't burst
+-- its GitHub requests in the same second and blow the shared rate limit
+local nextUpdate = os.clock() + (os.getComputerID() % UPDATE_TICK)
 
 -- Devices are polled one at a time, round-robin, instead of all in one
 -- synchronous burst every INTERVAL. Every peripheral call here is a real

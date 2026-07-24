@@ -115,7 +115,17 @@ local VERSION_FILE  = ".version"
 local REPO_OWNER    = "PrimeAPI"
 local REPO_NAME     = "cc-mqtt"
 local REPO_BRANCH   = "main"
-local UPDATE_TICK   = 60
+-- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
+-- every CC:Tweaked computer on this Minecraft server shares the server's
+-- one outbound IP. At the old 60s tick, just 2 always-running scripts
+-- checking in parallel already exceeds that budget, so most checks were
+-- silently rate-limited and falling back to fetching main's raw file by
+-- BRANCH name - which, unlike the SHA-pinned URL used once an update is
+-- actually found, sits behind GitHub's raw-content CDN and can lag several
+-- minutes behind a real push. 300s cuts total request volume 5x; the
+-- computer-ID-based stagger below spreads checks across that window
+-- instead of every computer bursting at once.
+local UPDATE_TICK   = 300
 
 local currentVersion = "dev"
 if fs.exists(VERSION_FILE) then
@@ -1748,8 +1758,11 @@ local function runDisplay()
     mon.write("no entities enabled - run: subscriber setup")
   end
 
+  -- nextUpdate is staggered by computer ID so a whole fleet of computers
+  -- doesn't burst its GitHub requests in the same second and blow the
+  -- shared per-server-IP rate limit
   local nextDraw, nextReg, nextSub, nextUpdate, nextTermDraw =
-    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + UPDATE_TICK, 0
+    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + (os.getComputerID() % UPDATE_TICK), 0
 
   -- The terminal is a static status console while the dashboard is
   -- running - it used to mirror the entity list live (toggle/alias
