@@ -1,0 +1,53 @@
+name: Build and release
+
+# Every push to main is compiled from src/targets + src/lib (see
+# scripts/build.py) into the flat broker.lua/controller.lua/provider.lua/
+# subscriber.lua/tablet.lua scripts CC:Tweaked computers actually download,
+# which are committed back to main (so `wget .../refs/heads/main/<file>`
+# install instructions and computers still running the pre-release SHA-based
+# updater both keep working unchanged) and also published as a GitHub
+# Release, which is what computers running the current release-based
+# updater (see src/lib/updater.lua) actually check against.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - broker.lua
+      - controller.lua
+      - provider.lua
+      - subscriber.lua
+      - tablet.lua
+      - dist/**
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build compiled scripts
+        run: python3 scripts/build.py --tag "v${{ github.run_number }}" --sha "${{ github.sha }}"
+
+      - name: Commit compiled scripts back to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add broker.lua controller.lua provider.lua subscriber.lua tablet.lua
+          if git diff --cached --quiet; then
+            echo "no compiled output changes to commit"
+          else
+            git commit -m "chore: build v${{ github.run_number }} from ${GITHUB_SHA:0:7} [skip ci]"
+            git push
+          fi
+
+      - name: Create release v${{ github.run_number }}
+        run: |
+          gh release create "v${{ github.run_number }}" \
+            broker.lua controller.lua provider.lua subscriber.lua tablet.lua \
+            --title "v${{ github.run_number }}" \
+            --notes-file dist/release_notes.md

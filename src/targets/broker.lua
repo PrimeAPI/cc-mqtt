@@ -1,0 +1,1026 @@
+--------------------------------------------------------------------
+-- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
+--
+-- * Providers ANNOUNCE themselves and PUBLISH data on topics
+-- * Subscribers SUBSCRIBE with topic patterns (MQTT style: +, #)
+-- * Commands are routed broker -> provider ("command" messages)
+-- * Terminal runs interactive Entity Browser (inspect telemetry, purge offline, trigger actions)
+-- * First connected monitor (if present) lists all known entities;
+--   a second monitor (if present) shows a timestamped rolling log of
+--   every action triggered, newest at the bottom
+--
+-- Save as startup.lua on the broker computer. Needs a modem.
+--------------------------------------------------------------------
+
+local PROTOCOL      = "cbus"
+local HOSTNAME      = "broker"
+local OFFLINE_AFTER = 15   -- seconds without a message => shown offline
+local TICK          = 2    -- monitor refresh / prune interval
+
+peripheral.find("modem", function(n) rednet.open(n) end)
+rednet.host(PROTOCOL, HOSTNAME)
+
+-- discover every attached monitor by name (no assumptions about
+-- peripheral.find's return order), sort so the assignment is stable
+-- across reboots, then take the first for the entity list and the
+-- second (if any) for the action log
+local monitorNames = {}
+for _, name in ipairs(peripheral.getNames()) do
+  if peripheral.getType(name) == "monitor" then
+    monitorNames[#monitorNames + 1] = name
+  end
+end
+table.sort(monitorNames)
+
+local mon      = monitorNames[1] and peripheral.wrap(monitorNames[1])
+local logMon   = monitorNames[2] and peripheral.wrap(monitorNames[2])
+local debugMon = monitorNames[3] and peripheral.wrap(monitorNames[3])
+if mon then mon.setTextScale(0.5) end
+if logMon then logMon.setTextScale(0.5) end
+if debugMon then debugMon.setTextScale(0.5) end
+
+print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
+if mon then print("  " .. monitorNames[1] .. " -> entity list") end
+if logMon then print("  " .. monitorNames[2] .. " -> action log") end
+if debugMon then
+  print("  " .. monitorNames[3] .. " -> diagnostics (msg/s, redraw & loop timing)")
+elseif mon and not logMon then
+  print("  (only one monitor found - action log & diagnostics disabled)")
+end
+
+local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
+local subs      = {}   -- computerId -> {patterns, name}
+local retained  = {}   -- topic -> last data message (sent to new subscribers)
+
+local actionLog = {}   -- { {time=os.date string, text=...}, ... }, oldest first
+local LOG_MAX   = 200  -- hard cap so a long-running broker doesn't grow forever
+
+local viewMode            = "LIST" -- "LIST", "INSPECT", "INPUT"
+local selectedIndex       = 1
+local selectedActionIndex = 1
+local inspectEntityName   = nil
+local inputActionName     = nil
+local inputBuffer         = ""
+local statusBanner        = nil
+
+-- The local terminal console only costs anything while it's actually being
+-- looked at - nobody stands at every broker/provider/controller all day, so
+-- there's no reason to keep redrawing it (and computing what to draw) on a
+-- computer nobody's watching. Starts closed; any key/char opens it, [H]
+-- closes it again. The shared monitor(s) are unaffected by this - those
+-- keep updating on their own schedule regardless, since someone in the
+-- world might actually be looking at them.
+local consoleOn = false
+
+-- Lightweight self-instrumentation, so "is this slow" is something you can
+-- read off a screen instead of guessing. lastIterMs/maxIterMs cover a full
+-- while-loop pass (message handling + redraws); lastRedrawMs/maxRedrawMs
+-- isolate just the redraw cost. If maxIterMs is high while maxRedrawMs and
+-- msgPerSec both stay low, the loop itself has little to do - that points
+-- at external (server-tick) lag rather than anything in this script, since
+-- CC:Tweaked's own event delivery and peripheral/monitor calls slow down
+-- proportionally when the server is struggling to keep up 20 TPS.
+local stats = {
+  msgTotal = 0, msgPerSec = 0, msgWindowCount = 0, msgWindowStart = 0,
+  lastRedrawMs = 0, maxRedrawMs = 0,
+  lastIterMs = 0, maxIterMs = 0,
+  statWindowStart = 0,
+}
+
+--------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+--[[@include lib/updater.lua as Updater]]
+
+-- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
+-- every CC:Tweaked computer on this Minecraft server shares the server's
+-- one outbound IP. At the old 60s tick, just 2 always-running scripts
+-- checking in parallel already exceeds that budget, so most checks were
+-- silently rate-limited and falling back to fetching main's raw file by
+-- BRANCH name, which lags behind GitHub's raw-content CDN by several
+-- minutes. 300s cuts total request volume 5x; the computer-ID-based
+-- stagger applied to nextUpdate below spreads checks across that window
+-- instead of every computer bursting at once.
+local UPDATE_TICK = 300
+
+local updater = Updater.new({ scriptName = "broker.lua" })
+
+local function now() return os.clock() end
+local bootTime = now()
+
+local function setBanner(msg, isError)
+  statusBanner = { text = msg, error = isError or false, time = now() }
+end
+
+local function logAction(text, isError)
+  actionLog[#actionLog + 1] = { time = os.date("%H:%M:%S"), text = text, error = isError or false }
+  if #actionLog > LOG_MAX then table.remove(actionLog, 1) end
+end
+
+local function split(s)
+  local out = {}
+  for part in s:gmatch("[^/]+") do out[#out + 1] = part end
+  return out
+end
+
+-- MQTT-style matching: "energy/+" matches "energy/matrix1", "#" matches all
+local function topicMatches(pattern, topic)
+  local p, t = split(pattern), split(topic)
+  for i = 1, #p do
+    if p[i] == "#" then return true end
+    if t[i] == nil then return false end
+    if p[i] ~= "+" and p[i] ~= t[i] then return false end
+  end
+  return #p == #t
+end
+
+local function send(id, msg) rednet.send(id, msg, PROTOCOL) end
+
+local function forward(msg)
+  for id, sub in pairs(subs) do
+    for _, pat in ipairs(sub.patterns) do
+      if topicMatches(pat, msg.topic) then send(id, msg) break end
+    end
+  end
+end
+
+local function touch(name)
+  local e = entities[name]
+  if e then e.lastSeen = now(); e.online = true end
+end
+
+-- Only ever lists actions the entity actually announced. Guessing actions
+-- from its kind/name (e.g. "anything called a reactor can scram") would
+-- let an operator trigger a command a given peripheral doesn't support.
+local function getActionsForEntity(e)
+  if not e then return {} end
+  local acts = {}
+  local seen = {}
+  local rawList = e.actions or (e.meta and e.meta.actions) or {}
+  for _, a in ipairs(rawList) do
+    if not seen[a] then
+      acts[#acts + 1] = a
+      seen[a] = true
+    end
+  end
+  return acts
+end
+
+local function getRetainedForEntity(name)
+  local out = {}
+  for topic, m in pairs(retained) do
+    if m.entity == name then
+      if type(m.data) == "table" then
+        for k, v in pairs(m.data) do
+          if k:sub(1, 1) ~= "_" then
+            out[k] = v
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function sendCommand(entName, actionName, rawArgs)
+  local e = entities[entName]
+  if not e then
+    return false, "Unknown entity: " .. tostring(entName)
+  end
+  if not e.online then
+    return false, "Entity '" .. tostring(entName) .. "' is offline"
+  end
+  local parsedArgs = rawArgs
+  if rawArgs and rawArgs ~= "" then
+    if tonumber(rawArgs) then parsedArgs = tonumber(rawArgs)
+    elseif rawArgs:lower() == "true" then parsedArgs = true
+    elseif rawArgs:lower() == "false" then parsedArgs = false
+    end
+  else
+    parsedArgs = nil
+  end
+
+  send(e.id, {
+    type = "command",
+    entity = entName,
+    action = actionName,
+    args = parsedArgs,
+    from = os.getComputerID(),
+  })
+  logAction(("[local] %s -> %s(%s)"):format(entName, actionName, tostring(parsedArgs or "")))
+  return true, ("Sent '%s' to %s"):format(actionName, entName)
+end
+
+local function removeOfflineEntity(name)
+  local e = entities[name]
+  if not e then return false, "Entity not found" end
+  if e.online then
+    return false, "Cannot remove online entity '" .. name .. "'"
+  end
+  entities[name] = nil
+  return true, "Removed offline entity '" .. name .. "'"
+end
+
+local function purgeAllOffline()
+  local count = 0
+  for name, e in pairs(entities) do
+    if not e.online then
+      entities[name] = nil
+      count = count + 1
+    end
+  end
+  return count
+end
+
+--------------------------------------------------------------------
+-- monitor display
+--------------------------------------------------------------------
+local function redrawMonitor()
+  if not mon then return end
+  local w, h = mon.getSize()
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  mon.setCursorPos(1, 1)
+  mon.setTextColor(colors.yellow)
+  mon.write("cbus broker  #" .. os.getComputerID())
+  mon.setCursorPos(1, 2)
+  mon.setTextColor(colors.gray)
+  mon.write(string.rep("-", w))
+
+  local names = {}
+  for n in pairs(entities) do names[#names + 1] = n end
+  table.sort(names)
+
+  local y = 3
+  for _, n in ipairs(names) do
+    if y > h then break end
+    local e = entities[n]
+    mon.setCursorPos(1, y)
+    mon.setTextColor(e.online and colors.lime or colors.red)
+    mon.write(e.online and "\7 " or "x ")
+    mon.setTextColor(colors.white)
+    mon.write(n)
+    local tag = " [" .. (e.kind or "?") .. "] v:" .. updater.getShortVer(e.version)
+    if #n + 2 + #tag <= w then
+      mon.setTextColor(colors.lightGray)
+      mon.write(tag)
+    end
+    y = y + 1
+  end
+  if #names == 0 then
+    mon.setCursorPos(1, 3)
+    mon.setTextColor(colors.gray)
+    mon.write("no entities connected")
+  end
+end
+
+-- second monitor (if present): rolling action log, newest at the
+-- bottom - as new entries arrive the oldest ones simply scroll off
+-- the top since we only ever draw the tail that fits
+local function redrawLogMonitor()
+  if not logMon then return end
+  local w, h = logMon.getSize()
+  logMon.setBackgroundColor(colors.black)
+  logMon.clear()
+  logMon.setCursorPos(1, 1)
+  logMon.setTextColor(colors.yellow)
+  logMon.write("cbus action log")
+  logMon.setCursorPos(1, 2)
+  logMon.setTextColor(colors.gray)
+  logMon.write(string.rep("-", w))
+
+  if #actionLog == 0 then
+    logMon.setCursorPos(1, 3)
+    logMon.setTextColor(colors.gray)
+    logMon.write("no actions triggered yet")
+    return
+  end
+
+  local rows = h - 2
+  local startIdx = math.max(1, #actionLog - rows + 1)
+  local y = 3
+  for i = startIdx, #actionLog do
+    local entry = actionLog[i]
+    logMon.setCursorPos(1, y)
+    logMon.setTextColor(colors.lightGray)
+    local stamp = "[" .. entry.time .. "] "
+    logMon.write(stamp)
+    logMon.setTextColor(entry.error and colors.red or colors.white)
+    logMon.write(entry.text:sub(1, math.max(0, w - #stamp)))
+    y = y + 1
+  end
+end
+
+-- optional 3rd monitor: live diagnostics, so "is the broker/network slow,
+-- and why" is something you can read off a screen instead of guessing.
+-- Redrawn on its own (slower) cadence from the main loop, same as the
+-- entity list and action log - never redrawn per-message.
+--
+-- Laid out as a grid of tiles rather than one stat per 3 rows: these
+-- monitors tend to be wide and short (e.g. an 8x2-block strip), and a
+-- single stacked column only ever fills the first couple of rows before
+-- running out of height while leaving nearly the whole width blank. Tiling
+-- left-to-right, wrapping to a new row only when a row of tiles is full,
+-- uses the actual shape of the screen and leaves room to show every
+-- entity individually instead of just a single "oldest" summary.
+local function formatAge(age)
+  if age < 60 then return ("%ds"):format(math.floor(age)) end
+  return ("%dm%02ds"):format(math.floor(age / 60), math.floor(age % 60))
+end
+
+local function redrawDebugMonitor()
+  if not debugMon then return end
+  local w, h = debugMon.getSize()
+  debugMon.setBackgroundColor(colors.black)
+  debugMon.clear()
+
+  local t = now()
+  local online, total = 0, 0
+  local entList = {}
+  for name, e in pairs(entities) do
+    total = total + 1
+    if e.online then online = online + 1 end
+    entList[#entList + 1] = { name = name, e = e, age = t - e.lastSeen }
+  end
+  -- most at-risk (oldest/offline) first, so problems are what you see first
+  table.sort(entList, function(a, b)
+    if a.e.online ~= b.e.online then return not a.e.online end
+    return a.age > b.age
+  end)
+
+  local subCount, topicCount = 0, 0
+  for _ in pairs(subs) do subCount = subCount + 1 end
+  for _ in pairs(retained) do topicCount = topicCount + 1 end
+
+  debugMon.setCursorPos(1, 1)
+  debugMon.setBackgroundColor(colors.blue)
+  debugMon.setTextColor(colors.white)
+  local header = (" cbus diagnostics #%d"):format(os.getComputerID())
+  local upStr = ("up %s "):format(formatAge(t - bootTime))
+  debugMon.write(header .. string.rep(" ", math.max(1, w - #header - #upStr)) .. upStr)
+  debugMon.setBackgroundColor(colors.black)
+
+  -- tile grid: each tile is a fixed-width label/value pair, packed
+  -- left-to-right and wrapped to fill however wide the monitor is
+  local TILE_W = 17
+  local cols = math.max(1, math.floor(w / TILE_W))
+  local tileIdx = 0
+  local function tile(label, value, color)
+    local col = tileIdx % cols
+    local row = math.floor(tileIdx / cols)
+    local x, y = 1 + col * TILE_W, 3 + row * 2
+    if y + 1 <= h then
+      debugMon.setCursorPos(x, y)
+      debugMon.setTextColor(colors.lightGray)
+      debugMon.write(label:sub(1, TILE_W - 1))
+      debugMon.setCursorPos(x, y + 1)
+      debugMon.setTextColor(color or colors.white)
+      debugMon.write(value:sub(1, TILE_W - 1))
+    end
+    tileIdx = tileIdx + 1
+  end
+
+  tile("Entities", ("%d/%d online"):format(online, total))
+  tile("Subscribers", tostring(subCount))
+  tile("Retained topics", tostring(topicCount))
+  tile("Action log", tostring(#actionLog))
+  tile("Messages/sec", ("%.1f"):format(stats.msgPerSec))
+  tile("Redraw ms", ("%d (max %d)"):format(math.floor(stats.lastRedrawMs), math.floor(stats.maxRedrawMs)),
+    stats.maxRedrawMs > 300 and colors.red or colors.lime)
+  tile("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
+    stats.maxIterMs > 500 and colors.red or colors.lime)
+  tile("Update check", updater.getShortVer(updater.currentVersion))
+
+  local tileRows = math.ceil(tileIdx / cols)
+  local listY = 3 + tileRows * 2 + 1
+  if listY > h then return end
+
+  debugMon.setCursorPos(1, listY)
+  debugMon.setTextColor(colors.yellow)
+  debugMon.write(("ENTITIES (%d)"):format(#entList))
+  listY = listY + 1
+
+  -- one line per entity: status dot, name, age - packed the same way as
+  -- the tiles above but denser (1 row instead of 2), so as many entities
+  -- as possible are visible without scrolling
+  local ENT_W = 16
+  local entCols = math.max(1, math.floor(w / ENT_W))
+  local entRows = math.max(0, h - listY + 1)
+  local maxShown = entCols * entRows
+  for i, item in ipairs(entList) do
+    if i > maxShown then
+      local more = #entList - maxShown + 1
+      debugMon.setCursorPos(1 + ((i - 1) % entCols) * ENT_W, listY + math.floor((i - 1) / entCols))
+      debugMon.setTextColor(colors.gray)
+      debugMon.write(("+%d more"):format(more))
+      break
+    end
+    local col = (i - 1) % entCols
+    local row = math.floor((i - 1) / entCols)
+    local x, y = 1 + col * ENT_W, listY + row
+    if y > h then break end
+    debugMon.setCursorPos(x, y)
+    debugMon.setTextColor(item.e.online and colors.lime or colors.red)
+    debugMon.write(item.e.online and "\7" or "x")
+    debugMon.setTextColor(colors.white)
+    local ageStr = formatAge(item.age)
+    local nameW = ENT_W - 1 - #ageStr - 2
+    local name = item.name:sub(1, math.max(1, nameW))
+    debugMon.write(" " .. name .. string.rep(" ", math.max(0, nameW - #name)) .. " ")
+    debugMon.setTextColor(colors.gray)
+    debugMon.write(ageStr)
+  end
+end
+
+--------------------------------------------------------------------
+-- terminal interactive browser
+--------------------------------------------------------------------
+
+-- drawn once (not on a redraw loop) whenever the console is closed
+local function showIdleScreen()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  term.setTextColor(colors.gray)
+  term.write(("cbus broker #%d - press any key for console"):format(os.getComputerID()))
+end
+
+local function redrawTerminal()
+  local w, h = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+
+  if statusBanner and (now() - statusBanner.time > 5) then
+    statusBanner = nil
+  end
+
+  local sortedNames = {}
+  for n in pairs(entities) do sortedNames[#sortedNames + 1] = n end
+  table.sort(sortedNames)
+
+  if selectedIndex > #sortedNames then selectedIndex = math.max(1, #sortedNames) end
+
+  if viewMode == "LIST" then
+    -- Header
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = (" cbus broker #%d (v:%s)"):format(os.getComputerID(), updater.getShortVer(updater.currentVersion))
+    local countText = ("[%d Ent] upd:%s "):format(#sortedNames, updater.status)
+    local space = math.max(1, w - #headerText - #countText)
+    term.write((headerText .. string.rep(" ", space) .. countText):sub(1, w))
+
+    -- Column headers
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.yellow)
+    term.write(" NAME         KIND       VER     STATUS   LAST SEEN")
+    local statsStr = (" %.1fmsg/s redraw:%dms(max %dms)"):format(
+      stats.msgPerSec, math.floor(stats.lastRedrawMs), math.floor(stats.maxRedrawMs))
+    if w > 51 + #statsStr then
+      term.write(statsStr .. string.rep(" ", w - 51 - #statsStr))
+    elseif w > 51 then
+      term.write(string.rep(" ", w - 51))
+    end
+
+    -- List body
+    local listH = h - 3
+    if statusBanner then listH = listH - 1 end
+
+    local pageOffset = math.floor((selectedIndex - 1) / math.max(1, listH)) * listH
+
+    for i = 1, listH do
+      local idx = pageOffset + i
+      local rowY = 2 + i
+      if idx > #sortedNames then break end
+      local name = sortedNames[idx]
+      local e = entities[name]
+
+      term.setCursorPos(1, rowY)
+      if idx == selectedIndex then
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+      else
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+      end
+
+      local selChar = (idx == selectedIndex) and ">" or " "
+      local statStr = e.online and "ONLINE " or "OFFLINE"
+      local statColor = e.online and colors.lime or colors.red
+      local seenSec = math.floor(now() - e.lastSeen)
+      local seenStr = e.online and (seenSec .. "s ago") or "offline"
+      local verStr = updater.getShortVer(e.version)
+
+      term.write(selChar .. " ")
+      term.setTextColor(colors.white)
+      local padName = name .. string.rep(" ", math.max(1, 12 - #name))
+      term.write(padName:sub(1, 12))
+
+      term.setTextColor(colors.lightGray)
+      local padKind = (e.kind or "?") .. string.rep(" ", math.max(1, 10 - #(e.kind or "?")))
+      term.write(padKind:sub(1, 10))
+
+      term.setTextColor(colors.cyan)
+      local padVer = verStr .. string.rep(" ", math.max(1, 8 - #verStr))
+      term.write(padVer:sub(1, 8))
+
+      term.setTextColor(statColor)
+      term.write(statStr .. " ")
+
+      term.setTextColor(colors.gray)
+      term.write(seenStr)
+
+      local cx, _ = term.getCursorPos()
+      if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
+    end
+
+    if #sortedNames == 0 then
+      term.setCursorPos(2, 4)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.gray)
+      term.write("No entities connected yet.")
+    end
+
+    if statusBanner then
+      term.setCursorPos(1, h - 1)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(statusBanner.error and colors.red or colors.lime)
+      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    -- [H]ide goes first, not last: a standard 51-col terminal is narrower
+    -- than the old text ("... [P] Purge All  [H] Hide" alone was 56 chars),
+    -- so anything appended at the end just silently fell off-screen. Put
+    -- the console toggle first so it's always visible, and :sub(1,w) as a
+    -- backstop so a future longer footer clips safely instead of wrapping.
+    local footerText = " [H]ide  [Enter/C]Inspect  [D]elOff  [P]urgeAll"
+    term.write((footerText .. string.rep(" ", math.max(0, w - #footerText))):sub(1, w))
+
+  elseif viewMode == "INSPECT" then
+    local name = inspectEntityName
+    local e = entities[name]
+
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = " Inspect: " .. (name or "?")
+    local statusText = e and (e.online and "[ONLINE] " or "[OFFLINE] ") or "[UNKNOWN] "
+    local space = math.max(1, w - #headerText - #statusText)
+    term.write(headerText .. string.rep(" ", space) .. statusText)
+
+    if not e then
+      term.setCursorPos(2, 3)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.red)
+      term.write("Entity '" .. tostring(name) .. "' no longer exists.")
+    else
+      term.setCursorPos(1, 2)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.lightGray)
+      term.write(("Kind: %s | ID: #%s | Ver: %s | Last: %ds ago"):format(
+        e.kind or "?", tostring(e.id or "?"), updater.getShortVer(e.version), math.floor(now() - e.lastSeen)))
+
+      term.setCursorPos(1, 3)
+      term.setTextColor(colors.gray)
+      local topStr = table.concat(e.topics or {}, ", ")
+      term.write("Topics: " .. (topStr ~= "" and topStr or "(none)"))
+
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("--- LATEST TELEMETRY VALUES ---")
+
+      local retData = getRetainedForEntity(name)
+      local dataKeys = {}
+      for k in pairs(retData) do dataKeys[#dataKeys + 1] = k end
+      table.sort(dataKeys)
+
+      local dataY = 6
+      if #dataKeys == 0 then
+        term.setCursorPos(2, dataY)
+        term.setTextColor(colors.gray)
+        term.write("(no telemetry data received yet)")
+        dataY = dataY + 1
+      else
+        for i, k in ipairs(dataKeys) do
+          if dataY >= h - 7 then
+            term.setCursorPos(2, dataY)
+            term.setTextColor(colors.gray)
+            term.write("... (" .. (#dataKeys - i + 1) .. " more values)")
+            dataY = dataY + 1
+            break
+          end
+          term.setCursorPos(2, dataY)
+          term.setTextColor(colors.lightGray)
+          term.write(k .. ": ")
+          term.setTextColor(colors.white)
+          local v = retData[k]
+          if type(v) == "number" then
+            term.write(string.format(v == math.floor(v) and "%.0f" or "%.2f", v))
+          else
+            term.write(tostring(v))
+          end
+          dataY = dataY + 1
+        end
+      end
+
+      dataY = dataY + 1
+      term.setCursorPos(1, dataY)
+      term.setTextColor(colors.yellow)
+      term.write("--- ACTIONS ---")
+      dataY = dataY + 1
+
+      local actions = getActionsForEntity(e)
+      if selectedActionIndex > #actions then selectedActionIndex = math.max(1, #actions) end
+
+      if #actions == 0 then
+        term.setCursorPos(2, dataY)
+        term.setTextColor(colors.gray)
+        term.write("(no actions available for this entity)")
+      else
+        for j, act in ipairs(actions) do
+          if dataY >= h - 2 then break end
+          term.setCursorPos(2, dataY)
+          if j == selectedActionIndex then
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.white)
+            term.write("> " .. j .. ". " .. act .. " ")
+          else
+            term.setBackgroundColor(colors.black)
+            term.setTextColor(colors.white)
+            term.write("  " .. j .. ". " .. act .. " ")
+          end
+          dataY = dataY + 1
+        end
+      end
+    end
+
+    if statusBanner then
+      term.setCursorPos(1, h - 1)
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(statusBanner.error and colors.red or colors.lime)
+      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter] Trigger Action  [D] Del Off  [B] Back"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+
+  elseif viewMode == "INPUT" then
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    term.write((" Trigger Action: %s on %s"):format(tostring(inputActionName), tostring(inspectEntityName)))
+
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.yellow)
+    term.write("Enter arguments for action '" .. tostring(inputActionName) .. "':")
+
+    term.setCursorPos(1, 4)
+    term.setTextColor(colors.gray)
+    term.write("(Press Enter with empty text for no args, or e.g. 40, IDLE, etc.)")
+
+    term.setCursorPos(1, 6)
+    term.setTextColor(colors.white)
+    term.write(" > " .. inputBuffer .. "_")
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [Enter] Send Command    [Tab] Cancel"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+  end
+end
+
+--------------------------------------------------------------------
+-- user interaction handlers
+--------------------------------------------------------------------
+local function handleTerminalKey(ev)
+  local key = ev[2]
+  local sortedNames = {}
+  for n in pairs(entities) do sortedNames[#sortedNames + 1] = n end
+  table.sort(sortedNames)
+
+  if viewMode == "LIST" then
+    if key == keys.up or key == keys.w then
+      selectedIndex = math.max(1, selectedIndex - 1)
+      redrawTerminal()
+
+    elseif key == keys.down or key == keys.s then
+      selectedIndex = math.min(#sortedNames, selectedIndex + 1)
+      redrawTerminal()
+
+    elseif key == keys.enter or key == keys.right or key == keys.i or key == keys.c then
+      if #sortedNames > 0 and sortedNames[selectedIndex] then
+        inspectEntityName = sortedNames[selectedIndex]
+        selectedActionIndex = 1
+        viewMode = "INSPECT"
+        redrawTerminal()
+      end
+
+    elseif key == keys.d or key == keys.delete then
+      if #sortedNames > 0 and sortedNames[selectedIndex] then
+        local name = sortedNames[selectedIndex]
+        local ok, msg = removeOfflineEntity(name)
+        setBanner(msg, not ok)
+        redrawTerminal()
+      end
+
+    elseif key == keys.p then
+      local n = purgeAllOffline()
+      setBanner(("Purged %d offline entities"):format(n), false)
+      redrawTerminal()
+
+    elseif key == keys.h then
+      consoleOn = false
+      showIdleScreen()
+    end
+
+  elseif viewMode == "INSPECT" then
+    local e = entities[inspectEntityName]
+    local actions = e and getActionsForEntity(e) or {}
+
+    if key == keys.up or key == keys.w then
+      selectedActionIndex = math.max(1, selectedActionIndex - 1)
+      redrawTerminal()
+
+    elseif key == keys.down or key == keys.s then
+      selectedActionIndex = math.min(#actions, selectedActionIndex + 1)
+      redrawTerminal()
+
+    -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
+    -- before it ever reaches CC:Tweaked as a "key" event
+    elseif key == keys.backspace or key == keys.b or key == keys.left then
+      viewMode = "LIST"
+      redrawTerminal()
+
+    elseif key == keys.d or key == keys.delete then
+      if inspectEntityName then
+        local ok, msg = removeOfflineEntity(inspectEntityName)
+        setBanner(msg, not ok)
+        if ok then viewMode = "LIST" end
+        redrawTerminal()
+      end
+
+    elseif key == keys.enter then
+      if #actions > 0 and actions[selectedActionIndex] then
+        inputActionName = actions[selectedActionIndex]
+        inputBuffer = ""
+        viewMode = "INPUT"
+        redrawTerminal()
+      end
+    end
+
+  elseif viewMode == "INPUT" then
+    -- Tab, not Escape: Minecraft eats Escape to close the terminal GUI
+    -- before it ever reaches CC:Tweaked, and letters must stay typeable
+    -- here for action args, so no letter key can double as "cancel".
+    if key == keys.tab then
+      viewMode = "INSPECT"
+      redrawTerminal()
+
+    elseif key == keys.backspace then
+      inputBuffer = inputBuffer:sub(1, -2)
+      redrawTerminal()
+
+    elseif key == keys.enter then
+      local ok, msg = sendCommand(inspectEntityName, inputActionName, inputBuffer)
+      setBanner(msg, not ok)
+      viewMode = "INSPECT"
+      redrawTerminal()
+    end
+  end
+end
+
+local function handleTerminalChar(ev)
+  if viewMode == "INPUT" then
+    local ch = ev[2]
+    if ch and #ch == 1 then
+      inputBuffer = inputBuffer .. ch
+      redrawTerminal()
+    end
+  end
+end
+
+--------------------------------------------------------------------
+-- message handling
+--------------------------------------------------------------------
+local function handle(id, msg)
+  if type(msg) ~= "table" or not msg.type then return end
+
+  if msg.type == "announce" then
+    entities[msg.entity] = {
+      id = id,
+      kind = msg.kind or "provider",
+      topics = msg.topics or {},
+      meta = msg.meta,
+      actions = msg.actions or (msg.meta and msg.meta.actions) or {},
+      version = msg.version or (msg.meta and msg.meta.version) or "dev",
+      lastSeen = now(),
+      online = true,
+    }
+    send(id, { type = "ack", of = "announce" })
+
+  elseif msg.type == "publish" then
+    if msg.entity then
+      if not entities[msg.entity] then
+        entities[msg.entity] = {
+          id = id,
+          kind = (msg.topic and msg.topic:match("^([^/]+)")) or "provider",
+          topics = { msg.topic },
+          actions = msg.actions or {},
+          version = msg.version or "dev",
+          lastSeen = now(),
+          online = true,
+        }
+        send(id, { type = "reannounce_req" })
+      else
+        touch(msg.entity)
+        if msg.actions and #msg.actions > 0 then entities[msg.entity].actions = msg.actions end
+        if msg.version then entities[msg.entity].version = msg.version end
+      end
+    end
+    local out = {
+      type = "data",
+      topic = msg.topic,
+      entity = msg.entity,
+      data = msg.data,
+      actions = msg.actions or (entities[msg.entity] and entities[msg.entity].actions),
+      ts = os.epoch("utc"),
+    }
+    retained[msg.topic] = out
+    forward(out)
+
+  elseif msg.type == "subscribe" then
+    local name = msg.name or ("sub-" .. id)
+    subs[id] = { patterns = msg.patterns or { "#" }, name = name }
+    entities[name] = { id = id, kind = "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
+    send(id, { type = "ack", of = "subscribe" })
+    for topic, m in pairs(retained) do
+      for _, pat in ipairs(subs[id].patterns) do
+        if topicMatches(pat, topic) then send(id, m) break end
+      end
+    end
+
+  elseif msg.type == "registry" or msg.type == "req_registry" then
+    -- Trigger providers to re-announce so action state is fresh
+    for _, e in pairs(entities) do
+      if e.id and e.kind == "provider" then
+        send(e.id, { type = "reannounce_req" })
+      end
+    end
+    local list = {}
+    for name, e in pairs(entities) do
+      list[name] = {
+        kind = e.kind,
+        topics = e.topics,
+        meta = e.meta,
+        actions = e.actions or (e.meta and e.meta.actions) or {},
+        version = e.version,
+        online = e.online
+      }
+    end
+    send(id, { type = "registry", entities = list })
+
+  elseif msg.type == "command" then
+    local e = entities[msg.entity or ""]
+    local requester = (subs[id] and subs[id].name) or ("#" .. tostring(id))
+    if e and e.kind == "provider" and e.online then
+      send(e.id, { type = "command", entity = msg.entity,
+                   action = msg.action, args = msg.args, from = id })
+      send(id, { type = "ack", of = "command" })
+      logAction(("[%s] %s -> %s(%s)"):format(
+        requester, msg.entity, msg.action, tostring(msg.args ~= nil and msg.args or "")))
+    else
+      send(id, { type = "error", of = "command",
+                 reason = "unknown or offline entity: " .. tostring(msg.entity) })
+      logAction(("[%s] %s -> %s FAILED (unknown/offline)"):format(
+        requester, tostring(msg.entity), tostring(msg.action)), true)
+    end
+
+  elseif msg.type == "cmdResult" then
+    setBanner(("Result [%s]: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
+    logAction(("%s result: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
+
+  elseif msg.type == "heartbeat" then
+    touch(msg.entity)
+
+  elseif msg.type == "ping_broker" then
+    send(id, { type = "broker_online", id = os.getComputerID() })
+  end
+end
+
+--------------------------------------------------------------------
+-- main loop
+--------------------------------------------------------------------
+pcall(updater.checkNow)
+rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
+redrawMonitor()
+redrawLogMonitor()
+redrawDebugMonitor()
+showIdleScreen()
+
+local nextTick = now() + TICK
+-- staggered by computer ID so a whole fleet of computers doesn't burst
+-- its GitHub requests in the same second and blow the shared rate limit
+local nextUpdate = now() + (os.getComputerID() % UPDATE_TICK)
+
+-- Redraws are throttled separately from message handling. Forwarding a
+-- message (inside handle(), via forward()) is cheap - just rednet.send()
+-- calls - but redrawMonitor/redrawLogMonitor/redrawDebugMonitor/
+-- redrawTerminal do real monitor/terminal I/O (cursor positioning +
+-- per-cell writes, doubled up by the monitor's 0.5 textScale) which is
+-- genuinely slow. Redrawing on every single rednet_message meant that
+-- with several entities publishing every ~2s, the broker could fall
+-- behind mid-redraw while more messages queued up - delaying forwarding
+-- for EVERY entity at once (not just one), since the broker only gets
+-- back to os.pullEvent() after the redraws finish. Marking "dirty" and
+-- redrawing at a fixed cadence instead keeps forwarding instant while
+-- capping how much time redraws can steal from it.
+local REDRAW_TICK = 0.3
+local nextRedraw = now() + REDRAW_TICK
+local dirty = false
+
+local STATS_WINDOW = 10
+stats.msgWindowStart = now()
+stats.statWindowStart = now()
+
+while true do
+  os.startTimer(0.5)
+  local ev = { os.pullEvent() }
+  local iterT0 = now()
+
+  if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
+    handle(ev[2], ev[3])
+    dirty = true
+    stats.msgTotal = stats.msgTotal + 1
+    stats.msgWindowCount = stats.msgWindowCount + 1
+
+  elseif ev[1] == "key" then
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalKey(ev)
+    end
+
+  elseif ev[1] == "char" then
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalChar(ev)
+    end
+
+  elseif ev[1] == "http_success" or ev[1] == "http_failure" then
+    pcall(updater.handleHttp, ev[1], ev[2], ev[3])
+  end
+
+  local t = now()
+  if t >= nextTick then
+    for _, e in pairs(entities) do
+      if t - e.lastSeen > OFFLINE_AFTER then
+        if e.online then dirty = true end
+        e.online = false
+      end
+    end
+    nextTick = t + TICK
+  end
+
+  if dirty and t >= nextRedraw then
+    local redrawT0 = now()
+    redrawMonitor()
+    redrawLogMonitor()
+    redrawDebugMonitor()
+    if consoleOn then redrawTerminal() end
+    local redrawMs = (now() - redrawT0) * 1000
+    stats.lastRedrawMs = redrawMs
+    if redrawMs > stats.maxRedrawMs then stats.maxRedrawMs = redrawMs end
+    dirty = false
+    nextRedraw = t + REDRAW_TICK
+  end
+
+  if t >= nextUpdate then
+    nextUpdate = t + UPDATE_TICK
+    pcall(updater.checkNow)
+  end
+
+  local iterMs = (now() - iterT0) * 1000
+  stats.lastIterMs = iterMs
+  if iterMs > stats.maxIterMs then stats.maxIterMs = iterMs end
+
+  if t - stats.statWindowStart >= STATS_WINDOW then
+    stats.msgPerSec = stats.msgWindowCount / (t - stats.msgWindowStart)
+    stats.msgWindowCount = 0
+    stats.msgWindowStart = t
+    stats.maxRedrawMs = stats.lastRedrawMs
+    stats.maxIterMs = stats.lastIterMs
+    stats.statWindowStart = t
+  end
+end
