@@ -84,56 +84,26 @@ local function getShortVer(v)
   return v
 end
 
-local function checkAndApplyUpdate(scriptName)
-  if not http then return false end
-  scriptName = scriptName or "broker.lua"
+local HTTP_HEADERS = {
+  ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+  ["Pragma"]        = "no-cache",
+  ["User-Agent"]    = "CC-Tweaked",
+}
 
-  local remoteSha = nil
-  local code = nil
-  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+-- Non-blocking auto-updater. This used to call the synchronous http.get(),
+-- which internally pumps a plain (unfiltered) os.pullEvent() loop until the
+-- request resolves - and that loop DISCARDS every event that isn't the
+-- http_success/http_failure it's waiting for. Since this ran right in the
+-- main loop below, any rednet_message from a provider/subscriber/controller
+-- that arrived during an update check (up to 3 sequential GitHub requests,
+-- every 60s) was silently dropped, not queued - and if a request ever hung
+-- (slow GitHub, no server-side http timeout), the broker went deaf until
+-- someone manually rebooted it. Using the async http.request() API instead
+-- and driving this as a state machine off http_success/http_failure events
+-- (see the main loop) means GitHub checks never block rednet processing.
+local updater = nil  -- { stage = "api"|"fallback"|"commit", url, scriptName, remoteSha }
 
-  -- Primary: Query GitHub API for the latest commit SHA (bypasses CDN cache)
-  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, cb)
-  local apiRes = http.get(apiUrl, {
-    ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-    ["Pragma"]        = "no-cache",
-    ["User-Agent"]    = "CC-Tweaked",
-  })
-
-  if apiRes then
-    local raw = apiRes.readAll()
-    apiRes.close()
-    local data = textutils.unserializeJSON(raw)
-    if type(data) == "table" and data.sha then
-      remoteSha = data.sha
-    end
-  end
-
-  -- Fallback: If GitHub API is unavailable, fetch raw head with cache-busting headers
-  if not remoteSha then
-    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName, cb)
-    local res = http.get(rawUrl, {
-      ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-      ["Pragma"]        = "no-cache",
-      ["User-Agent"]    = "CC-Tweaked",
-    })
-    if res then
-      code = res.readAll()
-      local headers = res.getResponseHeaders()
-      res.close()
-
-      local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
-      if etag then remoteSha = etag:match("(%x%x%x%x%x%x%x+)") end
-      if not remoteSha and code then
-        local hash = 0
-        for i = 1, #code do hash = (hash * 31 + code:byte(i)) % 4294967296 end
-        remoteSha = string.format("%08x", hash)
-      end
-    end
-  end
-
-  if not remoteSha then return false end
-
+local function applyUpdate(remoteSha, code, scriptName)
   local target = shell and shell.getRunningProgram() or "startup.lua"
   if not target or target == "" then target = "startup.lua" end
 
@@ -148,49 +118,113 @@ local function checkAndApplyUpdate(scriptName)
     end
   end
 
+  print("[Updater] Updating " .. target .. " and rebooting...")
+  local f = fs.open(target .. ".tmp", "w")
+  f.write(code)
+  f.close()
+  if fs.exists(target) then fs.delete(target) end
+  fs.move(target .. ".tmp", target)
+
+  local vf = fs.open(VERSION_FILE, "w")
+  vf.write(remoteSha)
+  vf.close()
+
+  sleep(1)
+  os.reboot()
+end
+
+local function updaterFallback()
+  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+  updater.stage = "fallback"
+  updater.url = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s?cb=%s")
+    :format(REPO_OWNER, REPO_NAME, REPO_BRANCH, updater.scriptName, cb)
+  http.request(updater.url, nil, HTTP_HEADERS)
+end
+
+local function updaterResolved(remoteSha, code)
   if currentVersion == "dev" or currentVersion == "" then
     currentVersion = remoteSha
     local f = fs.open(VERSION_FILE, "w")
     if f then f.write(remoteSha) f.close() end
-    return false
+    updater = nil
+    return
   end
 
-  if remoteSha ~= currentVersion then
-    print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+  if remoteSha == currentVersion then
+    updater = nil
+    return
+  end
 
-    -- Fetch exact code using the commit SHA path (bypasses CDN branch cache)
-    if not code then
-      local commitUrl = ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(REPO_OWNER, REPO_NAME, remoteSha, scriptName)
-      local cRes = http.get(commitUrl, {
-        ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-        ["Pragma"]        = "no-cache",
-        ["User-Agent"]    = "CC-Tweaked",
-      })
-      if cRes then
-        code = cRes.readAll()
-        cRes.close()
-      end
+  print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+
+  -- Already have the code (fallback path fetched it directly) -> apply now.
+  -- Otherwise fetch the exact commit's code (bypasses CDN branch cache).
+  if code and #code > 100 then
+    local scriptName = updater.scriptName
+    updater = nil
+    applyUpdate(remoteSha, code, scriptName)
+  else
+    updater.stage = "commit"
+    updater.remoteSha = remoteSha
+    updater.url = ("https://raw.githubusercontent.com/%s/%s/%s/%s")
+      :format(REPO_OWNER, REPO_NAME, remoteSha, updater.scriptName)
+    http.request(updater.url, nil, HTTP_HEADERS)
+  end
+end
+
+-- kicks off a check; a no-op if one is already in flight
+local function checkForUpdate(scriptName)
+  if not http then return end
+  if updater then return end
+  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+  updater = { stage = "api", scriptName = scriptName or "broker.lua" }
+  updater.url = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s")
+    :format(REPO_OWNER, REPO_NAME, REPO_BRANCH, cb)
+  http.request(updater.url, nil, HTTP_HEADERS)
+end
+
+-- fed http_success/http_failure events from the main loop
+local function updaterHandleHttp(eventType, url, handle)
+  if not updater or url ~= updater.url then return end
+
+  if eventType == "http_failure" then
+    if updater.stage == "api" then
+      updaterFallback()
+    else
+      updater = nil
     end
+    return
+  end
 
+  if updater.stage == "api" then
+    local raw = handle.readAll()
+    handle.close()
+    local data = textutils.unserializeJSON(raw)
+    local sha = type(data) == "table" and data.sha
+    if sha then updaterResolved(sha, nil) else updaterFallback() end
+
+  elseif updater.stage == "fallback" then
+    local code = handle.readAll()
+    local headers = handle.getResponseHeaders()
+    handle.close()
+    local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
+    local sha = etag and etag:match("(%x%x%x%x%x%x%x+)")
+    if not sha then
+      local hash = 0
+      for i = 1, #code do hash = (hash * 31 + code:byte(i)) % 4294967296 end
+      sha = string.format("%08x", hash)
+    end
+    updaterResolved(sha, code)
+
+  elseif updater.stage == "commit" then
+    local code = handle.readAll()
+    handle.close()
+    local remoteSha, scriptName = updater.remoteSha, updater.scriptName
+    updater = nil
     if code and #code > 100 then
-      print("[Updater] Updating " .. target .. " and rebooting...")
-
-      local f = fs.open(target .. ".tmp", "w")
-      f.write(code)
-      f.close()
-      if fs.exists(target) then fs.delete(target) end
-      fs.move(target .. ".tmp", target)
-
-      local vf = fs.open(VERSION_FILE, "w")
-      vf.write(remoteSha)
-      vf.close()
-
-      sleep(1)
-      os.reboot()
-      return true
+      applyUpdate(remoteSha, code, scriptName)
     end
   end
-  return false
 end
 
 local function now() return os.clock() end
@@ -613,7 +647,7 @@ local function redrawTerminal()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [Enter] Trigger Action  [D] Del Off  [B/Esc] Back"
+    local footerText = " [Enter] Trigger Action  [D] Del Off  [B] Back"
     term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
 
   elseif viewMode == "INPUT" then
@@ -638,7 +672,7 @@ local function redrawTerminal()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [Enter] Send Command    [Esc] Cancel"
+    local footerText = " [Enter] Send Command    [Tab] Cancel"
     term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
   end
 end
@@ -695,7 +729,9 @@ local function handleTerminalKey(ev)
       selectedActionIndex = math.min(#actions, selectedActionIndex + 1)
       redrawTerminal()
 
-    elseif key == keys.backspace or key == keys.b or key == keys.escape or key == keys.left then
+    -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
+    -- before it ever reaches CC:Tweaked as a "key" event
+    elseif key == keys.backspace or key == keys.b or key == keys.left then
       viewMode = "LIST"
       redrawTerminal()
 
@@ -717,7 +753,10 @@ local function handleTerminalKey(ev)
     end
 
   elseif viewMode == "INPUT" then
-    if key == keys.escape then
+    -- Tab, not Escape: Minecraft eats Escape to close the terminal GUI
+    -- before it ever reaches CC:Tweaked, and letters must stay typeable
+    -- here for action args, so no letter key can double as "cancel".
+    if key == keys.tab then
       viewMode = "INSPECT"
       redrawTerminal()
 
@@ -855,7 +894,7 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
-pcall(checkAndApplyUpdate, "broker.lua")
+pcall(checkForUpdate, "broker.lua")
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawLogMonitor()
@@ -879,6 +918,9 @@ while true do
 
   elseif ev[1] == "char" then
     handleTerminalChar(ev)
+
+  elseif ev[1] == "http_success" or ev[1] == "http_failure" then
+    pcall(updaterHandleHttp, ev[1], ev[2], ev[3])
   end
 
   local t = now()
@@ -894,6 +936,6 @@ while true do
 
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
-    pcall(checkAndApplyUpdate, "broker.lua")
+    pcall(checkForUpdate, "broker.lua")
   end
 end

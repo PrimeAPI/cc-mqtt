@@ -26,6 +26,36 @@ local function getShortVer(v)
   return #v >= 7 and v:sub(1, 7) or v
 end
 
+local HTTP_HEADERS = {
+  ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+  ["Pragma"]        = "no-cache",
+  ["User-Agent"]    = "CC-Tweaked",
+}
+local HTTP_TIMEOUT = 10  -- seconds per request
+
+-- http.get() blocks with NO timeout of its own - if a request ever hung
+-- (slow GitHub, no server-side http timeout configured), this would freeze
+-- the tablet at boot forever with no way to recover short of a manual
+-- reboot. This check still deliberately runs only once at startup (before
+-- rednet.open(), so there's no live network traffic to protect here, unlike
+-- the broker/provider/subscriber/controller), but it now uses the async
+-- http.request() API with an explicit per-request deadline so a stuck
+-- GitHub request can never wedge the boot sequence indefinitely.
+local function awaitHttp(url, timeoutSec)
+  http.request(url, nil, HTTP_HEADERS)
+  local timer = os.startTimer(timeoutSec or HTTP_TIMEOUT)
+  while true do
+    local ev = { os.pullEvent() }
+    if ev[1] == "http_success" and ev[2] == url then
+      return true, ev[3]
+    elseif ev[1] == "http_failure" and ev[2] == url then
+      return false, ev[3]
+    elseif ev[1] == "timer" and ev[2] == timer then
+      return false, "timeout"
+    end
+  end
+end
+
 local function checkAndApplyUpdate(scriptName)
   if not http then return false end
   scriptName = scriptName or "tablet.lua"
@@ -36,13 +66,9 @@ local function checkAndApplyUpdate(scriptName)
 
   -- Primary: Query GitHub API for the latest commit SHA (bypasses CDN cache)
   local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, cb)
-  local apiRes = http.get(apiUrl, {
-    ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-    ["Pragma"]        = "no-cache",
-    ["User-Agent"]    = "CC-Tweaked",
-  })
+  local apiOk, apiRes = awaitHttp(apiUrl)
 
-  if apiRes then
+  if apiOk then
     local raw = apiRes.readAll()
     apiRes.close()
     local data = textutils.unserializeJSON(raw)
@@ -54,12 +80,8 @@ local function checkAndApplyUpdate(scriptName)
   -- Fallback: If GitHub API is unavailable, fetch raw head with cache-busting headers
   if not remoteSha then
     local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName, cb)
-    local res = http.get(rawUrl, {
-      ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-      ["Pragma"]        = "no-cache",
-      ["User-Agent"]    = "CC-Tweaked",
-    })
-    if res then
+    local rawOk, res = awaitHttp(rawUrl)
+    if rawOk then
       code = res.readAll()
       local headers = res.getResponseHeaders()
       res.close()
@@ -103,12 +125,8 @@ local function checkAndApplyUpdate(scriptName)
     -- Fetch exact code using the commit SHA path (bypasses CDN branch cache)
     if not code then
       local commitUrl = ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(REPO_OWNER, REPO_NAME, remoteSha, scriptName)
-      local cRes = http.get(commitUrl, {
-        ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-        ["Pragma"]        = "no-cache",
-        ["User-Agent"]    = "CC-Tweaked",
-      })
-      if cRes then
+      local cOk, cRes = awaitHttp(commitUrl)
+      if cOk then
         code = cRes.readAll()
         cRes.close()
       end
@@ -1376,7 +1394,11 @@ while true do
         end
         activeTab = "SETTINGS_METRICS"
         renderScreen()
-      elseif key == keys.escape then
+      -- Tab, not Escape: Minecraft eats Escape to close the terminal/pocket
+      -- computer GUI before it ever reaches CC:Tweaked as a "key" event,
+      -- and letters must stay typeable here, so no letter key can double
+      -- as "cancel".
+      elseif key == keys.tab then
         activeTab = "SETTINGS_METRICS"
         renderScreen()
       end
@@ -1392,7 +1414,7 @@ while true do
           activeTab = "INPUT_ARG"
         end
         renderScreen()
-      elseif key == keys.escape then
+      elseif key == keys.tab then
         wizardCustomAction = false
         activeTab = "WIZARD_ACTION"
         renderScreen()
@@ -1428,7 +1450,7 @@ while true do
         end
         renderScreen()
 
-      elseif key == keys.escape then
+      elseif key == keys.tab then
         if wizardCustomAction then
           wizardCustomAction = false
           activeTab = "SETTINGS_ACTIONS"

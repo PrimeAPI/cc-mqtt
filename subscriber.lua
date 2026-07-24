@@ -132,56 +132,27 @@ local function getShortVer(v)
   return v
 end
 
-local function checkAndApplyUpdate(scriptName)
-  if not http then return false end
-  scriptName = scriptName or "subscriber.lua"
+local HTTP_HEADERS = {
+  ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+  ["Pragma"]        = "no-cache",
+  ["User-Agent"]    = "CC-Tweaked",
+}
 
-  local remoteSha = nil
-  local code = nil
-  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+-- Non-blocking auto-updater. This used to call the synchronous http.get(),
+-- which internally pumps a plain (unfiltered) os.pullEvent() loop until the
+-- request resolves - and that loop DISCARDS every event that isn't the
+-- http_success/http_failure it's waiting for. Since this ran right in the
+-- main loop below, any rednet_message (fresh telemetry, registry replies)
+-- that arrived during an update check (up to 3 sequential GitHub requests,
+-- every 60s) was silently dropped, not queued - and if a request ever hung
+-- (slow GitHub, no server-side http timeout), this computer went deaf until
+-- someone manually rebooted it. Using the async http.request() API instead
+-- and driving this as a state machine off http_success/http_failure events
+-- (see the main loop / tick()) means GitHub checks never block rednet
+-- processing.
+local updater = nil  -- { stage = "api"|"fallback"|"commit", url, scriptName, remoteSha }
 
-  -- Primary: Query GitHub API for the latest commit SHA (bypasses CDN cache)
-  local apiUrl = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, cb)
-  local apiRes = http.get(apiUrl, {
-    ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-    ["Pragma"]        = "no-cache",
-    ["User-Agent"]    = "CC-Tweaked",
-  })
-
-  if apiRes then
-    local raw = apiRes.readAll()
-    apiRes.close()
-    local data = textutils.unserializeJSON(raw)
-    if type(data) == "table" and data.sha then
-      remoteSha = data.sha
-    end
-  end
-
-  -- Fallback: If GitHub API is unavailable, fetch raw head with cache-busting headers
-  if not remoteSha then
-    local rawUrl = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s?cb=%s"):format(REPO_OWNER, REPO_NAME, REPO_BRANCH, scriptName, cb)
-    local res = http.get(rawUrl, {
-      ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-      ["Pragma"]        = "no-cache",
-      ["User-Agent"]    = "CC-Tweaked",
-    })
-    if res then
-      code = res.readAll()
-      local headers = res.getResponseHeaders()
-      res.close()
-
-      local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
-      if etag then remoteSha = etag:match("(%x%x%x%x%x%x%x+)") end
-      if not remoteSha and code then
-        local hash = 0
-        for i = 1, #code do hash = (hash * 31 + code:byte(i)) % 4294967296 end
-        remoteSha = string.format("%08x", hash)
-      end
-    end
-  end
-
-  if not remoteSha then return false end
-
+local function applyUpdate(remoteSha, code, scriptName)
   local target = shell and shell.getRunningProgram() or "startup.lua"
   if not target or target == "" then target = "startup.lua" end
 
@@ -196,49 +167,113 @@ local function checkAndApplyUpdate(scriptName)
     end
   end
 
+  print("[Updater] Updating " .. target .. " and rebooting...")
+  local f = fs.open(target .. ".tmp", "w")
+  f.write(code)
+  f.close()
+  if fs.exists(target) then fs.delete(target) end
+  fs.move(target .. ".tmp", target)
+
+  local vf = fs.open(VERSION_FILE, "w")
+  vf.write(remoteSha)
+  vf.close()
+
+  sleep(1)
+  os.reboot()
+end
+
+local function updaterFallback()
+  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+  updater.stage = "fallback"
+  updater.url = ("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s?cb=%s")
+    :format(REPO_OWNER, REPO_NAME, REPO_BRANCH, updater.scriptName, cb)
+  http.request(updater.url, nil, HTTP_HEADERS)
+end
+
+local function updaterResolved(remoteSha, code)
   if currentVersion == "dev" or currentVersion == "" then
     currentVersion = remoteSha
     local f = fs.open(VERSION_FILE, "w")
     if f then f.write(remoteSha) f.close() end
-    return false
+    updater = nil
+    return
   end
 
-  if remoteSha ~= currentVersion then
-    print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+  if remoteSha == currentVersion then
+    updater = nil
+    return
+  end
 
-    -- Fetch exact code using the commit SHA path (bypasses CDN branch cache)
-    if not code then
-      local commitUrl = ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(REPO_OWNER, REPO_NAME, remoteSha, scriptName)
-      local cRes = http.get(commitUrl, {
-        ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-        ["Pragma"]        = "no-cache",
-        ["User-Agent"]    = "CC-Tweaked",
-      })
-      if cRes then
-        code = cRes.readAll()
-        cRes.close()
-      end
+  print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
+
+  -- Already have the code (fallback path fetched it directly) -> apply now.
+  -- Otherwise fetch the exact commit's code (bypasses CDN branch cache).
+  if code and #code > 100 then
+    local scriptName = updater.scriptName
+    updater = nil
+    applyUpdate(remoteSha, code, scriptName)
+  else
+    updater.stage = "commit"
+    updater.remoteSha = remoteSha
+    updater.url = ("https://raw.githubusercontent.com/%s/%s/%s/%s")
+      :format(REPO_OWNER, REPO_NAME, remoteSha, updater.scriptName)
+    http.request(updater.url, nil, HTTP_HEADERS)
+  end
+end
+
+-- kicks off a check; a no-op if one is already in flight
+local function checkForUpdate(scriptName)
+  if not http then return end
+  if updater then return end
+  local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
+  updater = { stage = "api", scriptName = scriptName or "subscriber.lua" }
+  updater.url = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s")
+    :format(REPO_OWNER, REPO_NAME, REPO_BRANCH, cb)
+  http.request(updater.url, nil, HTTP_HEADERS)
+end
+
+-- fed http_success/http_failure events from the main loop
+local function updaterHandleHttp(eventType, url, handle)
+  if not updater or url ~= updater.url then return end
+
+  if eventType == "http_failure" then
+    if updater.stage == "api" then
+      updaterFallback()
+    else
+      updater = nil
     end
+    return
+  end
 
+  if updater.stage == "api" then
+    local raw = handle.readAll()
+    handle.close()
+    local data = textutils.unserializeJSON(raw)
+    local sha = type(data) == "table" and data.sha
+    if sha then updaterResolved(sha, nil) else updaterFallback() end
+
+  elseif updater.stage == "fallback" then
+    local code = handle.readAll()
+    local headers = handle.getResponseHeaders()
+    handle.close()
+    local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
+    local sha = etag and etag:match("(%x%x%x%x%x%x%x+)")
+    if not sha then
+      local hash = 0
+      for i = 1, #code do hash = (hash * 31 + code:byte(i)) % 4294967296 end
+      sha = string.format("%08x", hash)
+    end
+    updaterResolved(sha, code)
+
+  elseif updater.stage == "commit" then
+    local code = handle.readAll()
+    handle.close()
+    local remoteSha, scriptName = updater.remoteSha, updater.scriptName
+    updater = nil
     if code and #code > 100 then
-      print("[Updater] Updating " .. target .. " and rebooting...")
-
-      local f = fs.open(target .. ".tmp", "w")
-      f.write(code)
-      f.close()
-      if fs.exists(target) then fs.delete(target) end
-      fs.move(target .. ".tmp", target)
-
-      local vf = fs.open(VERSION_FILE, "w")
-      vf.write(remoteSha)
-      vf.close()
-
-      sleep(1)
-      os.reboot()
-      return true
+      applyUpdate(remoteSha, code, scriptName)
     end
   end
-  return false
 end
 
 --------------------------------------------------------------------
@@ -1022,14 +1057,22 @@ local COLOR_NAMES = {
 
 -- simple arrow-key single-select list, used for entity/action/color
 -- pickers when configuring a button. allowCustom appends a free-text
--- entry. Returns the chosen string, or nil if the user cancelled.
-local function pickList(title, items, allowCustom, colorFn)
+-- entry. currentValue (optional) pre-selects a matching entry, so
+-- re-opening the picker to edit an existing button starts on its
+-- current choice instead of always at the top. Returns the chosen
+-- string, or nil if the user cancelled.
+local function pickList(title, items, allowCustom, colorFn, currentValue)
   local list = {}
   for _, v in ipairs(items) do list[#list + 1] = v end
   if allowCustom then list[#list + 1] = "<custom...>" end
   if #list == 0 then return nil end
 
   local sel, offset = 1, 0
+  if currentValue then
+    for i, v in ipairs(list) do
+      if v == currentValue then sel = i break end
+    end
+  end
   local function draw()
     local w, h = term.getSize()
     tClear()
@@ -1054,7 +1097,7 @@ local function pickList(title, items, allowCustom, colorFn)
         term.write(it:sub(1, w))
       end
     end
-    tLine(h, "up/down:sel enter:pick esc:cancel", colors.lightGray)
+    tLine(h, "up/down:sel enter:pick b:cancel", colors.lightGray)
   end
 
   draw()
@@ -1072,7 +1115,9 @@ local function pickList(title, items, allowCustom, colorFn)
         return txt ~= "" and txt or nil
       end
       return chosen
-    elseif k == keys.escape then
+    -- b, not Escape: Minecraft eats Escape to close the terminal GUI
+    -- before it ever reaches CC:Tweaked as a "key" event
+    elseif k == keys.b then
       return nil
     end
   end
@@ -1399,6 +1444,43 @@ local function fieldsScreen(item)
   end
 end
 
+-- edit an item's own properties in place (title text, or a button's
+-- target entity/action/args/label/colors) - previously the only way to
+-- change any of this was to delete the item and recreate it from
+-- scratch. Panels reuse fieldsScreen (already property-editing, just
+-- under a different key); lines have no editable properties beyond
+-- position/size, which editItem() already covers.
+local function editItemProperties(item)
+  if item.type == "title" then
+    local text = prompt("title text: ", item.text or "")
+    if text ~= "" then
+      item.text = text
+      saveConfig()
+    end
+
+  elseif item.type == "button" then
+    local entities = sortedEntityNames()
+    local entity = pickList("select entity for button:", entities, false, nil, item.entity)
+    if entity then
+      local acts = getEntityActions(entity)
+      local action = pickList("select action on " .. entity .. ":", acts, true, nil, item.action)
+      if action then
+        local label = prompt("button label: ", item.label or action:upper())
+        local argsRaw = prompt("args (blank = none): ", item.args ~= nil and tostring(item.args) or "")
+        local fg = pickList("text color:", COLOR_NAMES, false, function(n) return colors[n] end, item.fg) or item.fg or "white"
+        local bg = pickList("button color:", COLOR_NAMES, false, function(n) return colors[n] end, item.bg) or item.bg or "blue"
+        item.entity, item.action, item.args = entity, action, parseArg(argsRaw)
+        item.label = label ~= "" and label or action:upper()
+        item.fg, item.bg = fg, bg
+        saveConfig()
+      end
+    end
+
+  elseif item.type == "panel" then
+    fieldsScreen(item)
+  end
+end
+
 local function layoutScreen()
   ensurePanels()
   local sel, offset = 1, 0
@@ -1433,7 +1515,7 @@ local function layoutScreen()
     end
     -- kept short & split across 3 rows so it still fits a 39-col
     -- turtle terminal, not just the 51-col computer terminal
-    tLine(h - 2, "enter:edit  x:delete", colors.lightGray)
+    tLine(h - 2, "enter:move/resize  p:properties  x:delete", colors.lightGray)
     tLine(h - 1, "t:title l:line k:button f:fields", colors.lightGray)
     tLine(h, "g:auto-layout b:back q:save&exit", colors.lightGray)
   end
@@ -1519,6 +1601,10 @@ local function layoutScreen()
         fieldsScreen(cfg.layout[sel])
         draw()
         preview(true)
+      elseif c == "p" and cfg.layout[sel] then
+        editItemProperties(cfg.layout[sel])
+        draw()
+        preview(true)
       elseif c == "g" then
         local ans = prompt("regenerate layout? (y/n): ", "n")
         if ans:lower():sub(1, 1) == "y" then
@@ -1565,8 +1651,14 @@ end
 --------------------------------------------------------------------
 -- setup mode
 --------------------------------------------------------------------
-local function runSetup()
-  print("connecting to broker...")
+-- fromDisplay: called from inside runDisplay's own "[S] Setup" button rather
+-- than as the standalone "subscriber setup" command - skips the CLI-style
+-- messaging and hands the result back so the caller can drop straight back
+-- into display mode instead of telling the user to restart the program.
+local function runSetup(fromDisplay)
+  if not fromDisplay then
+    print("connecting to broker...")
+  end
   findBroker()
   subscribe()
   requestRegistry()
@@ -1588,6 +1680,11 @@ local function runSetup()
 
   pcall(ensurePanels)
   saveConfig()
+
+  if fromDisplay then
+    return ok, err
+  end
+
   tClear()
   if ok then
     print("setup saved. start the display with: subscriber")
@@ -1604,9 +1701,6 @@ end
 --------------------------------------------------------------------
 -- display mode & interactive terminal management
 --------------------------------------------------------------------
-local subViewMode      = "LIST"
-local subSelectedIndex = 1
-local aliasBuffer      = ""
 local subStatusBanner  = nil
 
 local function setSubBanner(msg, isError)
@@ -1630,220 +1724,77 @@ local function runDisplay()
     mon.write("no entities enabled - run: subscriber setup")
   end
 
-  local nextDraw, nextReg, nextSub, nextUpdate = 0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + UPDATE_TICK
+  local nextDraw, nextReg, nextSub, nextUpdate, nextTermDraw =
+    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + UPDATE_TICK, 0
 
+  -- The terminal is a static status console while the dashboard is
+  -- running - it used to mirror the entity list live (toggle/alias
+  -- editing, per-entity freshness) and repaint on every single
+  -- rednet_message, which meant term.clear() firing multiple times a
+  -- second and the whole console visibly flashing. All that editing
+  -- already lives in Setup ([S] below), so this just shows identity,
+  -- connection and a countdown, redrawn on its own ~1s cadence (see
+  -- nextTermDraw in tick()) instead of on every network event.
   local function redrawSubscriberTerminal()
     local w, h = term.getSize()
     term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
     term.clear()
 
     if subStatusBanner and (os.clock() - subStatusBanner.time > 5) then
       subStatusBanner = nil
     end
 
-    local sortedNames = {}
-    for n in pairs(cfg.entities) do sortedNames[#sortedNames + 1] = n end
-    table.sort(sortedNames)
+    term.setCursorPos(1, 1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local headerText = (" cbus subscriber: %s (v:%s)"):format(cfg.name, getShortVer(currentVersion))
+    local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
+    local space = math.max(1, w - #headerText - #brokerText)
+    term.write(headerText .. string.rep(" ", space) .. brokerText)
 
-    if subSelectedIndex > #sortedNames then subSelectedIndex = math.max(1, #sortedNames) end
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.lightGray)
+    term.write("Dashboard is running on the monitor.")
 
-    local drawCd = math.max(0, math.floor((nextDraw - os.clock()) * 10) / 10)
-    local regCd  = math.max(0, math.floor(nextReg - os.clock()))
-    local subCd  = math.max(0, math.floor(nextSub - os.clock()))
-    local updCd  = math.max(0, math.floor(nextUpdate - os.clock()))
+    term.setCursorPos(1, 5)
+    term.setTextColor(colors.gray)
+    local updCd = math.max(0, math.floor(nextUpdate - os.clock()))
+    term.write(("Next update check: %ds"):format(updCd))
 
-    if subViewMode == "LIST" then
-      term.setCursorPos(1, 1)
-      term.setBackgroundColor(colors.blue)
-      term.setTextColor(colors.white)
-      local headerText = (" cbus subscriber: %s (v:%s)"):format(cfg.name, getShortVer(currentVersion))
-      local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
-      local space = math.max(1, w - #headerText - #brokerText)
-      term.write(headerText .. string.rep(" ", space) .. brokerText)
-
-      term.setCursorPos(1, 2)
-      term.setBackgroundColor(colors.gray)
-      term.setTextColor(colors.white)
-      local timerText = (" Draw: %.1fs | Reg: %ds | Sub: %ds | Update: %ds"):format(drawCd, regCd, subCd, updCd)
-      term.write(timerText .. string.rep(" ", math.max(0, w - #timerText)))
-
-      term.setCursorPos(1, 3)
-      term.setBackgroundColor(colors.gray)
-      term.setTextColor(colors.yellow)
-      term.write(" ENTITY         ALIAS            ENABLED   FRESHNESS")
-      if w > 52 then term.write(string.rep(" ", w - 52)) end
-
-      local listH = h - 4
-      if subStatusBanner then listH = listH - 1 end
-      local pageOffset = math.floor((subSelectedIndex - 1) / math.max(1, listH)) * listH
-
-      for i = 1, listH do
-        local idx = pageOffset + i
-        local rowY = 3 + i
-        if idx > #sortedNames then break end
-        local name = sortedNames[idx]
-        local c = cfg.entities[name]
-        local e = ents[name]
-
-        term.setCursorPos(1, rowY)
-        if idx == subSelectedIndex then
-          term.setBackgroundColor(colors.gray)
-          term.setTextColor(colors.white)
-        else
-          term.setBackgroundColor(colors.black)
-          term.setTextColor(colors.white)
-        end
-
-        local selChar = (idx == subSelectedIndex) and ">" or " "
-        term.write(selChar .. " ")
-        term.setTextColor(colors.white)
-        local padEnt = name .. string.rep(" ", math.max(1, 13 - #name))
-        term.write(padEnt:sub(1, 13))
-
-        term.setTextColor(colors.lightGray)
-        local aliasStr = (c and c.alias and c.alias ~= "") and c.alias or "-"
-        local padAlias = aliasStr .. string.rep(" ", math.max(1, 16 - #aliasStr))
-        term.write(padAlias:sub(1, 16))
-
-        local isEnabled = c and c.enabled
-        term.setTextColor(isEnabled and colors.lime or colors.red)
-        term.write(isEnabled and "[YES]    " or "[NO]     ")
-
-        local age = e and e.lastSeen and math.floor(os.clock() - e.lastSeen) or nil
-        local freshStr = (e and e.data and age) and (age .. "s ago") or "offline"
-        term.setTextColor(colors.gray)
-        term.write(freshStr)
-
-        local cx, _ = term.getCursorPos()
-        if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
-      end
-
-      if #sortedNames == 0 then
-        term.setCursorPos(2, 5)
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.gray)
-        term.write("No entities registered yet.")
-      end
-
-      if subStatusBanner then
-        term.setCursorPos(1, h - 1)
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(subStatusBanner.error and colors.red or colors.lime)
-        term.write((subStatusBanner.error and "[!] " or "[*] ") .. subStatusBanner.text)
-      end
-
-      term.setCursorPos(1, h)
-      term.setBackgroundColor(colors.blue)
-      term.setTextColor(colors.white)
-      local footerText = " [Space] Toggle  [A/Enter] Alias  [S] Monitor Setup"
-      term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
-
-    elseif subViewMode == "ALIAS_INPUT" then
-      local name = sortedNames[subSelectedIndex]
-
-      term.setCursorPos(1, 1)
-      term.setBackgroundColor(colors.blue)
-      term.setTextColor(colors.white)
-      term.write((" Edit Display Alias for: %s"):format(tostring(name)))
-
-      term.setCursorPos(1, 3)
+    if subStatusBanner then
+      term.setCursorPos(1, h - 1)
       term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.yellow)
-      term.write("Enter new alias for '" .. tostring(name) .. "':")
-
-      term.setCursorPos(1, 4)
-      term.setTextColor(colors.gray)
-      term.write("(Leave blank to reset to default title)")
-
-      term.setCursorPos(1, 6)
-      term.setTextColor(colors.white)
-      term.write(" > " .. aliasBuffer .. "_")
-
-      term.setCursorPos(1, h)
-      term.setBackgroundColor(colors.blue)
-      term.setTextColor(colors.white)
-      local footerText = " [Enter] Save Alias    [Esc] Cancel"
-      term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+      term.setTextColor(subStatusBanner.error and colors.red or colors.lime)
+      term.write((subStatusBanner.error and "[!] " or "[*] ") .. subStatusBanner.text)
     end
+
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    local footerText = " [S] Setup   [R] Force Resync"
+    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
   end
 
   local function handleTerminalKey(ev)
     local key = ev[2]
-    local sortedNames = {}
-    for n in pairs(cfg.entities) do sortedNames[#sortedNames + 1] = n end
-    table.sort(sortedNames)
 
-    if subViewMode == "LIST" then
-      if key == keys.up or key == keys.w then
-        subSelectedIndex = math.max(1, subSelectedIndex - 1)
-        redrawSubscriberTerminal()
+    if key == keys.s then
+      local ok, err = runSetup(true)
+      -- setup's own screens redraw the monitor as a live preview while
+      -- editing; rebuild it fresh here so layout/entity changes actually
+      -- take effect on the real dashboard instead of just the preview.
+      clearMonitor()
+      renderAll()
+      setSubBanner(ok and "Setup saved" or ("Setup error: " .. tostring(err)), not ok)
+      redrawSubscriberTerminal()
 
-      elseif key == keys.down or key == keys.s then
-        subSelectedIndex = math.min(#sortedNames, subSelectedIndex + 1)
-        redrawSubscriberTerminal()
-
-      elseif key == keys.space then
-        if #sortedNames > 0 and sortedNames[subSelectedIndex] then
-          local name = sortedNames[subSelectedIndex]
-          cfg.entities[name] = cfg.entities[name] or { enabled = false }
-          cfg.entities[name].enabled = not cfg.entities[name].enabled
-          saveConfig()
-          ensurePanels()
-          renderAll()
-          setSubBanner(("Toggled %s -> %s"):format(name, cfg.entities[name].enabled and "ENABLED" or "DISABLED"), false)
-          redrawSubscriberTerminal()
-        end
-
-      elseif key == keys.a or key == keys.enter then
-        if #sortedNames > 0 and sortedNames[subSelectedIndex] then
-          local name = sortedNames[subSelectedIndex]
-          aliasBuffer = (cfg.entities[name] and cfg.entities[name].alias) or ""
-          subViewMode = "ALIAS_INPUT"
-          redrawSubscriberTerminal()
-        end
-
-      elseif key == keys.s then
-        runSetup()
-        redrawSubscriberTerminal()
-
-      elseif key == keys.r then
-        subscribe()
-        requestRegistry()
-        setSubBanner("Forced re-subscribe & registry sync", false)
-        redrawSubscriberTerminal()
-      end
-
-    elseif subViewMode == "ALIAS_INPUT" then
-      if key == keys.escape then
-        subViewMode = "LIST"
-        redrawSubscriberTerminal()
-
-      elseif key == keys.backspace then
-        aliasBuffer = aliasBuffer:sub(1, -2)
-        redrawSubscriberTerminal()
-
-      elseif key == keys.enter then
-        if #sortedNames > 0 and sortedNames[subSelectedIndex] then
-          local name = sortedNames[subSelectedIndex]
-          cfg.entities[name] = cfg.entities[name] or { enabled = true }
-          cfg.entities[name].alias = aliasBuffer
-          saveConfig()
-          renderAll()
-          setSubBanner(("Alias for %s set to '%s'"):format(name, aliasBuffer ~= "" and aliasBuffer or name), false)
-        end
-        subViewMode = "LIST"
-        redrawSubscriberTerminal()
-      end
-    end
-  end
-
-  local function handleTerminalChar(ev)
-    if subViewMode == "ALIAS_INPUT" then
-      local ch = ev[2]
-      if ch and #ch == 1 then
-        aliasBuffer = aliasBuffer .. ch
-        redrawSubscriberTerminal()
-      end
+    elseif key == keys.r then
+      subscribe()
+      requestRegistry()
+      setSubBanner("Forced re-subscribe & registry sync", false)
+      redrawSubscriberTerminal()
     end
   end
 
@@ -1869,9 +1820,12 @@ local function runDisplay()
     end
     if t >= nextUpdate then
       nextUpdate = t + UPDATE_TICK
-      pcall(checkAndApplyUpdate, "subscriber.lua")
+      pcall(checkForUpdate, "subscriber.lua")
     end
-    redrawSubscriberTerminal()
+    if t >= nextTermDraw then
+      redrawSubscriberTerminal()
+      nextTermDraw = t + 1
+    end
   end
 
   redrawSubscriberTerminal()
@@ -1883,15 +1837,12 @@ local function runDisplay()
     if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
       local ok, newFound = pcall(handleNet, ev[3], ev[2])
       if ok and newFound then
-        setSubBanner("New entity discovered - enabled in config", false)
+        setSubBanner("New entity discovered (disabled by default - enable it in Setup)", false)
+        redrawSubscriberTerminal()
       end
-      redrawSubscriberTerminal()
 
     elseif ev[1] == "key" then
       handleTerminalKey(ev)
-
-    elseif ev[1] == "char" then
-      handleTerminalChar(ev)
 
     elseif ev[1] == "monitor_touch" then
       local tx, ty = ev[3], ev[4]
@@ -1904,6 +1855,9 @@ local function runDisplay()
           break
         end
       end
+
+    elseif ev[1] == "http_success" or ev[1] == "http_failure" then
+      pcall(updaterHandleHttp, ev[1], ev[2], ev[3])
     end
 
     local ok, err = pcall(tick)
@@ -1915,7 +1869,7 @@ end
 -- main
 --------------------------------------------------------------------
 loadConfig()
-pcall(checkAndApplyUpdate, "subscriber.lua")
+pcall(checkForUpdate, "subscriber.lua")
 if args[1] == "setup" then
   runSetup()
 else
