@@ -710,48 +710,104 @@ local function getDiscoveredActionsFor(entName)
   return acts
 end
 
+--------------------------------------------------------------------
+-- wizard data helpers: multi-clause conditions (AND/OR) and multi-action
+-- lists (several actions fired together off one trigger)
+--------------------------------------------------------------------
+local function newCondClause()
+  return { ent = "", prop = "", op = ">", threshold = "" }
+end
+
+local function condClauseToString(c)
+  if c.raw then return c.raw end
+  return ("%s.%s %s %s"):format(c.ent, c.prop, c.op, c.threshold)
+end
+
+local function buildConditionString(conditions, joiners)
+  local parts = {}
+  for _, c in ipairs(conditions) do
+    parts[#parts + 1] = condClauseToString(c)
+  end
+  local out = parts[1] or ""
+  for i = 2, #parts do
+    out = out .. " " .. (joiners[i - 1] or "and") .. " " .. parts[i]
+  end
+  return out
+end
+
+local function actionToString(a)
+  return ("%s -> %s(%s)"):format(a.entity, a.action, tostring(a.args or ""))
+end
+
+local WIZARD_PHASE_TITLES = {
+  title        = "Rule Title",
+  cond_more    = "Conditions",
+  mode         = "Execution Mode",
+  action_more  = "Actions",
+  else_prompt  = "Else Actions?",
+  else_more    = "Else Actions",
+}
+
+local function wizardPhaseTitle(w)
+  local p = w.phase
+  if p == "cond_entity" or p == "cond_prop" or p == "cond_op" then
+    return ("Condition %d"):format(#w.conditions + 1)
+  elseif p == "action_entity" or p == "action_name" or p == "action_args" then
+    return ("Action %d"):format(#w.actions + 1)
+  elseif p == "else_entity" or p == "else_name" or p == "else_args" then
+    return ("Else Action %d"):format(#w.elseActionsList + 1)
+  end
+  return WIZARD_PHASE_TITLES[p] or p
+end
+
 local function startWizard(existingRuleIndex)
   viewMode = "WIZARD"
   if existingRuleIndex and rules[existingRuleIndex] then
     local r = rules[existingRuleIndex]
+
+    local actionsCopy = {}
+    for _, a in ipairs(r.actions or {}) do
+      actionsCopy[#actionsCopy + 1] = { entity = a.entity, action = a.action, args = tostring(a.args or "") }
+    end
+
+    local elseCopy = {}
+    for _, a in ipairs(r.elseActions or {}) do
+      elseCopy[#elseCopy + 1] = { entity = a.entity, action = a.action, args = tostring(a.args or "") }
+    end
+
     wizardData = {
       editingIndex = existingRuleIndex,
-      step = 1,
+      phase = "title",
       name = r.name or r.id,
-      triggerEnt = "",
-      triggerProp = "",
-      op = ">",
-      threshold = "",
+      -- the existing condition string is preserved verbatim as the first
+      -- clause; additional clauses added via cond_more are structured and
+      -- appended with AND/OR
+      conditions = { { raw = r.condition or "" } },
+      joiners = {},
+      curCond = newCondClause(),
       mode = r.mode or "edge",
-      condition = r.condition or "",
-      actionEntity = r.actions and r.actions[1] and r.actions[1].entity or "",
-      actionName = r.actions and r.actions[1] and r.actions[1].action or "",
-      actionArgs = r.actions and r.actions[1] and tostring(r.actions[1].args or "") or "",
+      actions = actionsCopy,
+      curAction = { entity = "", action = "", args = "" },
       hasElse = not not (r.elseActions and #r.elseActions > 0),
-      elseEntity = r.elseActions and r.elseActions[1] and r.elseActions[1].entity or "",
-      elseName = r.elseActions and r.elseActions[1] and r.elseActions[1].action or "",
-      elseArgs = r.elseActions and r.elseActions[1] and tostring(r.elseActions[1].args or "") or "",
+      elseActionsList = elseCopy,
+      curElseAction = { entity = "", action = "", args = "" },
       inputBuffer = r.name or r.id or "",
       listScroll = 0,
     }
   else
     wizardData = {
       editingIndex = nil,
-      step = 1,
+      phase = "title",
       name = "",
-      triggerEnt = "",
-      triggerProp = "",
-      op = ">",
-      threshold = "",
+      conditions = {},
+      joiners = {},
+      curCond = newCondClause(),
       mode = "edge",
-      condition = "",
-      actionEntity = "",
-      actionName = "",
-      actionArgs = "",
+      actions = {},
+      curAction = { entity = "", action = "", args = "" },
       hasElse = false,
-      elseEntity = "",
-      elseName = "",
-      elseArgs = "",
+      elseActionsList = {},
+      curElseAction = { entity = "", action = "", args = "" },
       inputBuffer = "",
       listScroll = 0,
     }
@@ -770,16 +826,12 @@ local function finishWizard()
     enabled = true,
     mode = wizardData.mode,
     minInterval = 1.0,
-    condition = wizardData.condition,
-    actions = {
-      { entity = wizardData.actionEntity, action = wizardData.actionName, args = wizardData.actionArgs }
-    }
+    condition = buildConditionString(wizardData.conditions, wizardData.joiners),
+    actions = wizardData.actions,
   }
 
-  if wizardData.hasElse and wizardData.elseEntity ~= "" and wizardData.elseName ~= "" then
-    ruleObj.elseActions = {
-      { entity = wizardData.elseEntity, action = wizardData.elseName, args = wizardData.elseArgs }
-    }
+  if wizardData.hasElse and #wizardData.elseActionsList > 0 then
+    ruleObj.elseActions = wizardData.elseActionsList
   end
 
   if wizardData.editingIndex then
@@ -800,9 +852,13 @@ end
 -- terminal interactive TUI
 --------------------------------------------------------------------
 
--- wizard steps that present a numbered, scrollable pick-list (entity,
+-- wizard phases that present a numbered, scrollable pick-list (entity,
 -- property, or action) rather than free text / a fixed menu
-local WIZARD_LIST_STEPS = { [2] = true, [3] = true, [6] = true, [7] = true, [10] = true, [11] = true }
+local WIZARD_LIST_PHASES = {
+  cond_entity = true, cond_prop = true,
+  action_entity = true, action_name = true,
+  else_entity = true, else_name = true,
+}
 
 -- Draws a numbered option list from `startY` up to (excluding) `maxY`,
 -- with a trailing "type custom" entry, honoring wizardData.listScroll so
@@ -946,16 +1002,14 @@ local function redrawTerminal()
     term.setCursorPos(1, 3)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.yellow)
-    local stepTitle = (" INTERACTIVE RULE CREATOR (Step %d) "):format(wizardData.step)
+    local stepTitle = (" INTERACTIVE RULE CREATOR - " .. wizardPhaseTitle(wizardData) .. " "):upper()
     term.write(stepTitle .. string.rep(" ", math.max(0, w - #stepTitle)))
 
     term.setBackgroundColor(colors.black)
 
-    if wizardData.step == 1 then
+    if wizardData.phase == "title" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 1: ")
-      term.setTextColor(colors.white)
       term.write("Rule Title / Friendly Name")
 
       term.setCursorPos(1, 7)
@@ -968,12 +1022,10 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 2 then
+    elseif wizardData.phase == "cond_entity" then
       term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Step 2: ")
       term.setTextColor(colors.white)
-      term.write("Select Trigger Entity (Condition Subject):")
+      term.write("Select Trigger Entity:")
 
       local disco = getDiscoveredEntitiesList()
       local promptY = h - 2
@@ -988,14 +1040,12 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 3 then
+    elseif wizardData.phase == "cond_prop" then
       term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Step 3: ")
       term.setTextColor(colors.white)
-      term.write("Select Telemetry Field for " .. wizardData.triggerEnt .. ":")
+      term.write("Select Telemetry Field for " .. wizardData.curCond.ent .. ":")
 
-      local props = getDiscoveredPropertiesFor(wizardData.triggerEnt)
+      local props = getDiscoveredPropertiesFor(wizardData.curCond.ent)
       local promptY = h - 2
       local startY = 7
       if #props == 0 then
@@ -1014,10 +1064,8 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 4 then
+    elseif wizardData.phase == "cond_op" then
       term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Step 4: ")
       term.setTextColor(colors.white)
       term.write("Select Comparison Operator:")
 
@@ -1033,15 +1081,36 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 11)
       term.setTextColor(colors.yellow)
-      term.write("Enter Value / Threshold (e.g. 20 or 25% or true):")
+      term.write(("Enter operator+value for %s.%s (e.g. >20 or ==true):"):format(wizardData.curCond.ent, wizardData.curCond.prop))
       term.setCursorPos(1, 12)
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 5 then
+    elseif wizardData.phase == "cond_more" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 5: ")
+      term.write("Condition so far:")
+      term.setCursorPos(1, 6)
+      term.setTextColor(colors.white)
+      local condPreview = buildConditionString(wizardData.conditions, wizardData.joiners)
+      term.write((condPreview ~= "" and condPreview or "(none)"):sub(1, w))
+
+      term.setCursorPos(1, 8)
+      term.setTextColor(colors.lime)
+      term.write("[1] No  - Continue to Execution Mode")
+      term.setCursorPos(1, 9)
+      term.setTextColor(colors.lime)
+      term.write("[2] Yes - AND another condition (all must be true)")
+      term.setCursorPos(1, 10)
+      term.setTextColor(colors.lime)
+      term.write("[3] Yes - OR another condition (either can be true)")
+
+      term.setCursorPos(1, 12)
+      term.setTextColor(colors.yellow)
+      term.write("Press 1, 2, or 3.")
+
+    elseif wizardData.phase == "mode" then
+      term.setCursorPos(1, 5)
       term.setTextColor(colors.white)
       term.write("Select Execution Mode:")
 
@@ -1067,12 +1136,12 @@ local function redrawTerminal()
       term.setTextColor(colors.yellow)
       term.write("Condition: ")
       term.setTextColor(colors.cyan)
-      term.write(wizardData.condition)
+      term.write(buildConditionString(wizardData.conditions, wizardData.joiners):sub(1, w - 11))
 
-    elseif wizardData.step == 6 then
+    elseif wizardData.phase == "action_entity" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 6: ")
+      term.write(("Action %d: "):format(#wizardData.actions + 1))
       term.setTextColor(colors.white)
       term.write("Select Action Target Entity:")
 
@@ -1088,14 +1157,14 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 7 then
+    elseif wizardData.phase == "action_name" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 7: ")
+      term.write(("Action %d: "):format(#wizardData.actions + 1))
       term.setTextColor(colors.white)
-      term.write("Select Action Method for " .. wizardData.actionEntity .. ":")
+      term.write("Select Method for " .. wizardData.curAction.entity .. ":")
 
-      local acts = getDiscoveredActionsFor(wizardData.actionEntity)
+      local acts = getDiscoveredActionsFor(wizardData.curAction.entity)
       local promptY = h - 2
       local startY = 7
       if #acts == 0 then
@@ -1114,12 +1183,12 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 8 then
+    elseif wizardData.phase == "action_args" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 8: ")
+      term.write(("Action %d: "):format(#wizardData.actions + 1))
       term.setTextColor(colors.white)
-      term.write("Action Arguments (math/units/string):")
+      term.write("Arguments (math/units/string):")
 
       term.setCursorPos(1, 7)
       term.setTextColor(colors.gray)
@@ -1131,12 +1200,35 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 9 then
+    elseif wizardData.phase == "action_more" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 9: ")
+      term.write("Actions so far (all fire together when triggered):")
+
+      local y = 6
+      for i, a in ipairs(wizardData.actions) do
+        if y >= 9 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.white)
+        term.write((" %d. %s"):format(i, actionToString(a)):sub(1, w))
+        y = y + 1
+      end
+
+      term.setCursorPos(1, 10)
+      term.setTextColor(colors.lime)
+      term.write("[1] No  - Continue")
+      term.setCursorPos(1, 11)
+      term.setTextColor(colors.lime)
+      term.write("[2] Yes - Add another action to fire at the same time")
+
+      term.setCursorPos(1, 13)
+      term.setTextColor(colors.yellow)
+      term.write("Press 1 or 2.")
+
+    elseif wizardData.phase == "else_prompt" then
+      term.setCursorPos(1, 5)
       term.setTextColor(colors.white)
-      term.write("Configure Else Action (when condition is false)?")
+      term.write("Configure Else Actions (when condition is false)?")
 
       term.setCursorPos(1, 7)
       term.setTextColor(colors.lime)
@@ -1150,12 +1242,12 @@ local function redrawTerminal()
       term.setTextColor(colors.yellow)
       term.write("Press 1 or 2.")
 
-    elseif wizardData.step == 10 then
+    elseif wizardData.phase == "else_entity" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 10: ")
+      term.write(("Else Action %d: "):format(#wizardData.elseActionsList + 1))
       term.setTextColor(colors.white)
-      term.write("Else Action Target Entity:")
+      term.write("Target Entity:")
 
       local disco = getDiscoveredEntitiesList()
       local promptY = h - 2
@@ -1169,14 +1261,14 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 11 then
+    elseif wizardData.phase == "else_name" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 11: ")
+      term.write(("Else Action %d: "):format(#wizardData.elseActionsList + 1))
       term.setTextColor(colors.white)
-      term.write("Else Action Name for " .. wizardData.elseEntity .. ":")
+      term.write("Method for " .. wizardData.curElseAction.entity .. ":")
 
-      local acts = getDiscoveredActionsFor(wizardData.elseEntity)
+      local acts = getDiscoveredActionsFor(wizardData.curElseAction.entity)
       local promptY = h - 2
       local startY = 7
       if #acts == 0 then
@@ -1195,12 +1287,12 @@ local function redrawTerminal()
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
-    elseif wizardData.step == 12 then
+    elseif wizardData.phase == "else_args" then
       term.setCursorPos(1, 5)
       term.setTextColor(colors.cyan)
-      term.write("Step 12: ")
+      term.write(("Else Action %d: "):format(#wizardData.elseActionsList + 1))
       term.setTextColor(colors.white)
-      term.write("Else Action Arguments:")
+      term.write("Arguments:")
 
       term.setCursorPos(1, 7)
       term.setTextColor(colors.gray)
@@ -1211,6 +1303,31 @@ local function redrawTerminal()
       term.write("Else Args: ")
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
+
+    elseif wizardData.phase == "else_more" then
+      term.setCursorPos(1, 5)
+      term.setTextColor(colors.cyan)
+      term.write("Else actions so far (all fire together):")
+
+      local y = 6
+      for i, a in ipairs(wizardData.elseActionsList) do
+        if y >= 9 then break end
+        term.setCursorPos(1, y)
+        term.setTextColor(colors.white)
+        term.write((" %d. %s"):format(i, actionToString(a)):sub(1, w))
+        y = y + 1
+      end
+
+      term.setCursorPos(1, 10)
+      term.setTextColor(colors.lime)
+      term.write("[1] No  - Finish and save rule")
+      term.setCursorPos(1, 11)
+      term.setTextColor(colors.lime)
+      term.write("[2] Yes - Add another else action")
+
+      term.setCursorPos(1, 13)
+      term.setTextColor(colors.yellow)
+      term.write("Press 1 or 2.")
     end
 
   elseif viewMode == "INSPECT" then
@@ -1327,7 +1444,7 @@ local function redrawTerminal()
   term.setTextColor(colors.white)
 
   if viewMode == "WIZARD" then
-    local ctrlStr = WIZARD_LIST_STEPS[wizardData and wizardData.step]
+    local ctrlStr = WIZARD_LIST_PHASES[wizardData and wizardData.phase]
       and " [Up/Down]Scroll List | [Enter]Next Step | [Esc]Cancel"
       or " [Enter]Next Step | [Esc]Cancel Wizard"
     term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
@@ -1339,37 +1456,39 @@ end
 
 local function handleWizardInput(val)
   if not wizardData then return end
-  local step = wizardData.step
-  wizardData.listScroll = 0 -- fresh list view whenever we move to a new step
+  local phase = wizardData.phase
+  wizardData.listScroll = 0 -- fresh list view whenever we move to a new phase
 
-  if step == 1 then
+  if phase == "title" then
     wizardData.name = val
-    wizardData.step = 2
+    -- editing a rule preloads its existing condition as clause 1, so skip
+    -- straight past the guided entity/prop/op picker for it
+    wizardData.phase = (#wizardData.conditions > 0) and "cond_more" or "cond_entity"
     wizardData.inputBuffer = ""
 
-  elseif step == 2 then
+  elseif phase == "cond_entity" then
     local disco = getDiscoveredEntitiesList()
     local num = tonumber(val)
     if num and num >= 1 and num <= #disco then
-      wizardData.triggerEnt = disco[num]
+      wizardData.curCond.ent = disco[num]
     else
-      wizardData.triggerEnt = val
+      wizardData.curCond.ent = val
     end
-    wizardData.step = 3
+    wizardData.phase = "cond_prop"
     wizardData.inputBuffer = ""
 
-  elseif step == 3 then
-    local props = getDiscoveredPropertiesFor(wizardData.triggerEnt)
+  elseif phase == "cond_prop" then
+    local props = getDiscoveredPropertiesFor(wizardData.curCond.ent)
     local num = tonumber(val)
     if num and num >= 1 and num <= #props then
-      wizardData.triggerProp = props[num].name
+      wizardData.curCond.prop = props[num].name
     else
-      wizardData.triggerProp = val
+      wizardData.curCond.prop = val
     end
-    wizardData.step = 4
+    wizardData.phase = "cond_op"
     wizardData.inputBuffer = ""
 
-  elseif step == 4 then
+  elseif phase == "cond_op" then
     local opChar = ">"
     local threshVal = val
 
@@ -1380,84 +1499,121 @@ local function handleWizardInput(val)
     elseif val:sub(1, 1) == ">" then opChar = ">"; threshVal = val:sub(2)
     elseif val:sub(1, 1) == "<" then opChar = "<"; threshVal = val:sub(2)
     end
-
     threshVal = threshVal:gsub("^%s+", "")
 
-    wizardData.condition = ("%s.%s %s %s"):format(wizardData.triggerEnt, wizardData.triggerProp, opChar, threshVal)
-    wizardData.step = 5
+    wizardData.curCond.op = opChar
+    wizardData.curCond.threshold = threshVal
+    table.insert(wizardData.conditions, wizardData.curCond)
+    wizardData.curCond = newCondClause()
+    wizardData.phase = "cond_more"
     wizardData.inputBuffer = ""
 
-  elseif step == 5 then
+  elseif phase == "cond_more" then
+    if val == "2" or val:lower() == "and" then
+      table.insert(wizardData.joiners, "and")
+      wizardData.phase = "cond_entity"
+    elseif val == "3" or val:lower() == "or" then
+      table.insert(wizardData.joiners, "or")
+      wizardData.phase = "cond_entity"
+    else
+      wizardData.phase = "mode"
+    end
+    wizardData.inputBuffer = ""
+
+  elseif phase == "mode" then
     if val == "1" or val:lower():find("edge") then wizardData.mode = "edge"
     elseif val == "2" or val:lower():find("cont") then wizardData.mode = "continuous"
     elseif val == "3" or val:lower():find("state") then wizardData.mode = "state"
     else wizardData.mode = "edge" end
 
-    wizardData.step = 6
+    wizardData.phase = (#wizardData.actions > 0) and "action_more" or "action_entity"
     wizardData.inputBuffer = ""
 
-  elseif step == 6 then
+  elseif phase == "action_entity" then
     local disco = getDiscoveredEntitiesList()
     local num = tonumber(val)
     if num and num >= 1 and num <= #disco then
-      wizardData.actionEntity = disco[num]
+      wizardData.curAction.entity = disco[num]
     else
-      wizardData.actionEntity = val
+      wizardData.curAction.entity = val
     end
-    wizardData.step = 7
+    wizardData.phase = "action_name"
     wizardData.inputBuffer = ""
 
-  elseif step == 7 then
-    local acts = getDiscoveredActionsFor(wizardData.actionEntity)
+  elseif phase == "action_name" then
+    local acts = getDiscoveredActionsFor(wizardData.curAction.entity)
     local num = tonumber(val)
     if num and num >= 1 and num <= #acts then
-      wizardData.actionName = acts[num]
+      wizardData.curAction.action = acts[num]
     else
-      wizardData.actionName = val
+      wizardData.curAction.action = val
     end
-    wizardData.step = 8
-    wizardData.inputBuffer = wizardData.actionArgs or ""
+    wizardData.phase = "action_args"
+    wizardData.inputBuffer = wizardData.curAction.args or ""
 
-  elseif step == 8 then
-    wizardData.actionArgs = val
-    wizardData.step = 9
+  elseif phase == "action_args" then
+    wizardData.curAction.args = val
+    table.insert(wizardData.actions, wizardData.curAction)
+    wizardData.curAction = { entity = "", action = "", args = "" }
+    wizardData.phase = "action_more"
     wizardData.inputBuffer = ""
 
-  elseif step == 9 then
+  elseif phase == "action_more" then
+    if val == "2" or val:lower() == "y" or val:lower() == "yes" then
+      wizardData.phase = "action_entity"
+      wizardData.inputBuffer = ""
+    else
+      wizardData.phase = (#wizardData.elseActionsList > 0) and "else_more" or "else_prompt"
+      wizardData.inputBuffer = ""
+    end
+
+  elseif phase == "else_prompt" then
     if val == "2" or val:lower() == "y" or val:lower() == "yes" then
       wizardData.hasElse = true
-      wizardData.step = 10
+      wizardData.phase = "else_entity"
       wizardData.inputBuffer = ""
     else
       wizardData.hasElse = false
       finishWizard()
     end
 
-  elseif step == 10 then
+  elseif phase == "else_entity" then
     local disco = getDiscoveredEntitiesList()
     local num = tonumber(val)
     if num and num >= 1 and num <= #disco then
-      wizardData.elseEntity = disco[num]
+      wizardData.curElseAction.entity = disco[num]
     else
-      wizardData.elseEntity = val
+      wizardData.curElseAction.entity = val
     end
-    wizardData.step = 11
+    wizardData.phase = "else_name"
     wizardData.inputBuffer = ""
 
-  elseif step == 11 then
-    local acts = getDiscoveredActionsFor(wizardData.elseEntity)
+  elseif phase == "else_name" then
+    local acts = getDiscoveredActionsFor(wizardData.curElseAction.entity)
     local num = tonumber(val)
     if num and num >= 1 and num <= #acts then
-      wizardData.elseName = acts[num]
+      wizardData.curElseAction.action = acts[num]
     else
-      wizardData.elseName = val
+      wizardData.curElseAction.action = val
     end
-    wizardData.step = 12
-    wizardData.inputBuffer = wizardData.elseArgs or ""
+    wizardData.phase = "else_args"
+    wizardData.inputBuffer = wizardData.curElseAction.args or ""
 
-  elseif step == 12 then
-    wizardData.elseArgs = val
-    finishWizard()
+  elseif phase == "else_args" then
+    wizardData.curElseAction.args = val
+    table.insert(wizardData.elseActionsList, wizardData.curElseAction)
+    wizardData.curElseAction = { entity = "", action = "", args = "" }
+    wizardData.hasElse = true
+    wizardData.phase = "else_more"
+    wizardData.inputBuffer = ""
+
+  elseif phase == "else_more" then
+    if val == "2" or val:lower() == "y" or val:lower() == "yes" then
+      wizardData.phase = "else_entity"
+      wizardData.inputBuffer = ""
+    else
+      finishWizard()
+    end
   end
 end
 
@@ -1478,13 +1634,13 @@ local function handleTerminalKey(ev)
       end
 
     elseif key == keys.up then
-      if wizardData and WIZARD_LIST_STEPS[wizardData.step] then
+      if wizardData and WIZARD_LIST_PHASES[wizardData.phase] then
         wizardData.listScroll = math.max(0, (wizardData.listScroll or 0) - 1)
         redrawTerminal()
       end
 
     elseif key == keys.down then
-      if wizardData and WIZARD_LIST_STEPS[wizardData.step] then
+      if wizardData and WIZARD_LIST_PHASES[wizardData.phase] then
         wizardData.listScroll = (wizardData.listScroll or 0) + 1 -- clamped on next draw
         redrawTerminal()
       end
