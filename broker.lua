@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release v1 | commit 9d57795 | built 2026-07-24T23:41:49Z
+-- cc-mqtt broker.lua | release dev | commit 42289ba | built 2026-07-24T23:48:41Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
@@ -139,7 +139,6 @@ local function getShortVer(v)
   if #v >= 7 then return v:sub(1, 7) end
   return v
 end
-Updater.getShortVer = getShortVer
 
 -- Must stay bit-identical to scripts/build.py's fallback_hash() - that
 -- script pre-computes this exact checksum for the release body / VERSION
@@ -179,6 +178,7 @@ end
 -- opts = { scriptName, repoOwner, repoName, repoBranch, versionFile, updateTick }
 function Updater.new(opts)
   local self = {}
+  self.getShortVer = getShortVer
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"

@@ -44,7 +44,6 @@ local function getShortVer(v)
   if #v >= 7 then return v:sub(1, 7) end
   return v
 end
-Updater.getShortVer = getShortVer
 
 -- Must stay bit-identical to scripts/build.py's fallback_hash() - that
 -- script pre-computes this exact checksum for the release body / VERSION
@@ -84,6 +83,7 @@ end
 -- opts = { scriptName, repoOwner, repoName, repoBranch, versionFile, updateTick }
 function Updater.new(opts)
   local self = {}
+  self.getShortVer = getShortVer
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"
