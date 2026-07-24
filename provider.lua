@@ -169,6 +169,7 @@ local HANDLERS = {
       local running = tryCall(p, "getStatus") == true
       local temp = tryCall(p, "getTemperature") or 0
       local damage = tryCall(p, "getDamagePercent") or 0
+      local waste = tryCall(p, "getWasteFilledPercentage") or 0
       return {
         formed = true,
         status = running and "RUNNING" or "SCRAMMED",
@@ -177,11 +178,11 @@ local HANDLERS = {
         fuel = tryCall(p, "getFuelFilledPercentage") or 0,
         coolant = tryCall(p, "getCoolantFilledPercentage") or 0,
         heated = tryCall(p, "getHeatedCoolantFilledPercentage") or 0,
-        waste = tryCall(p, "getWasteFilledPercentage") or 0,
+        waste = waste,
         burnRate = fmtSI(tryCall(p, "getBurnRate"), "mB/t"),
         actualBurn = fmtSI(tryCall(p, "getActualBurnRate"), "mB/t"),
         _running = running, _temp = temp, _damage = damage,
-        _waste = tryCall(p, "getWasteFilledPercentage") or 0,
+        _waste = waste,
       }
     end,
     actions = function(p)
@@ -1157,10 +1158,17 @@ local function publish(dev)
   local ok, data = pcall(dev.handler.collect, dev.p, dev)
   if not ok or type(data) ~= "table" then data = { formed = false } end
 
+  -- was previously declared only inside the "generic handler" branch below,
+  -- so on every normal poll cycle it fell through to an undeclared global
+  -- (always nil) by the time it was used in the "publish" message at the
+  -- bottom of this function - the broker happened to paper over it with
+  -- its own cached actions list, but this entity's own announcement of its
+  -- actions was silently never actually sent on the regular publish path.
+  local actionNames = getActionNames(dev)
+
   -- generic handler: build meta from first successful sample
   if not dev.fields and next(data) then
     dev.fields = deriveFields(data)
-    local actionNames = getActionNames(dev)
     send({ type = "announce", entity = dev.entity, kind = "provider",
            topics = { dev.topic },
            meta = { title = dev.title, fields = dev.fields, actions = actionNames, version = currentVersion },
@@ -1260,6 +1268,16 @@ end
 local nextPub = 0
 local nextAnn = os.clock() + ANNOUNCE
 local nextUpdate = os.clock() + UPDATE_TICK
+
+-- Devices are polled one at a time, round-robin, instead of all in one
+-- synchronous burst every INTERVAL. Every peripheral call here is a real
+-- cross-thread call into the game and takes real wall-clock time; with
+-- several devices attached to one computer, polling all of them back to
+-- back can block this coroutine for long enough that an incoming
+-- "command" rednet message (e.g. a scram) sits unprocessed until the
+-- whole batch finishes. Spreading polls out bounds the worst-case delay
+-- to "one device's collect() call" instead of "every device's".
+local pollIndex = 1
 
 local function redrawTerminal()
   local w, h = term.getSize()
@@ -1601,8 +1619,18 @@ while true do
 
       elseif msg.type == "command" then
         handleCommand(msg)
-        nextPub = os.clock() + 0.5
-        nextAnn = os.clock() + ANNOUNCE
+        -- Re-collect and publish telemetry for exactly the device that
+        -- was just acted on, right now, instead of waiting for its next
+        -- turn in the poll rotation (up to INTERVAL seconds away). This
+        -- is what makes the network see the new state promptly after an
+        -- action, rather than the action landing but nothing downstream
+        -- (rule engine, dashboards) hearing about it for a while.
+        for _, dev in ipairs(devices) do
+          if dev.entity == msg.entity then
+            publish(dev)
+            break
+          end
+        end
       end
     end
     redrawTerminal()
@@ -1619,9 +1647,11 @@ while true do
   end
 
   local t = os.clock()
-  if t >= nextPub then
-    for _, dev in ipairs(devices) do publish(dev) end
-    nextPub = t + INTERVAL
+  if #devices > 0 and t >= nextPub then
+    publish(devices[pollIndex])
+    pollIndex = pollIndex + 1
+    if pollIndex > #devices then pollIndex = 1 end
+    nextPub = t + (INTERVAL / #devices)
     redrawTerminal()
   end
   if t >= nextAnn then
