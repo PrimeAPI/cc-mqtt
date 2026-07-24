@@ -884,6 +884,8 @@ local function redrawTerminal()
     end
 
   elseif viewMode == "WIZARD" and wizardData then
+    wizardData.inputBuffer = wizardData.inputBuffer or "" -- guard against a nil buffer crashing every "_" concat below
+
     term.setCursorPos(1, 3)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.yellow)
@@ -934,7 +936,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 13)
       term.setTextColor(colors.yellow)
-      term.write("Select [1-%d] or Type: "):format(#disco + 1)
+      term.write(("Select [1-%d] or Type: "):format(#disco + 1))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -967,7 +969,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 13)
       term.setTextColor(colors.yellow)
-      term.write("Select [1-%d] or Type: "):format(#props + 1)
+      term.write(("Select [1-%d] or Type: "):format(#props + 1))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1048,7 +1050,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 13)
       term.setTextColor(colors.yellow)
-      term.write("Select [1-%d] or Type: "):format(#disco + 1)
+      term.write(("Select [1-%d] or Type: "):format(#disco + 1))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1079,7 +1081,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 13)
       term.setTextColor(colors.yellow)
-      term.write("Select [1-%d] or Type: "):format(#acts + 1)
+      term.write(("Select [1-%d] or Type: "):format(#acts + 1))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1141,7 +1143,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 13)
       term.setTextColor(colors.yellow)
-      term.write("Select [1-%d] or Type: "):format(#disco + 1)
+      term.write(("Select [1-%d] or Type: "):format(#disco + 1))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1172,7 +1174,7 @@ local function redrawTerminal()
 
       term.setCursorPos(1, 13)
       term.setTextColor(colors.yellow)
-      term.write("Select [1-%d] or Type: "):format(#acts + 1)
+      term.write(("Select [1-%d] or Type: "):format(#acts + 1))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
