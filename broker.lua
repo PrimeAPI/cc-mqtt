@@ -236,6 +236,9 @@ local function touch(name)
   if e then e.lastSeen = now(); e.online = true end
 end
 
+-- Only ever lists actions the entity actually announced. Guessing actions
+-- from its kind/name (e.g. "anything called a reactor can scram") would
+-- let an operator trigger a command a given peripheral doesn't support.
 local function getActionsForEntity(e)
   if not e then return {} end
   local acts = {}
@@ -245,17 +248,6 @@ local function getActionsForEntity(e)
     if not seen[a] then
       acts[#acts + 1] = a
       seen[a] = true
-    end
-  end
-  if #acts == 0 then
-    local k = (e.kind or ""):lower()
-    local name = (inspectEntityName or ""):lower()
-    if k:find("reactor") or k:find("fission") or name:find("fission") then
-      acts = { "activate", "scram", "setBurnRate" }
-    elseif k:find("fusion") or name:find("fusion") then
-      acts = { "setInjectionRate" }
-    elseif k:find("turbine") or name:find("turbine") then
-      acts = { "setDumpingMode", "nextDumpingMode" }
     end
   end
   return acts

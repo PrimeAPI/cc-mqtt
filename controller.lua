@@ -316,7 +316,7 @@ local function preprocessExpression(expr)
   return s
 end
 
-local function createEvalEnv()
+local function createEvalEnv(refTracker)
   local env = {
     math = math,
     abs = math.abs,
@@ -334,6 +334,7 @@ local function createEvalEnv()
   setmetatable(env, {
     __index = function(t, entName)
       if rawget(t, entName) ~= nil then return rawget(t, entName) end
+      if refTracker then refTracker[entName] = true end
 
       local proxy = {}
       setmetatable(proxy, {
@@ -363,10 +364,10 @@ local function createEvalEnv()
   return env
 end
 
-local function safeEval(exprString)
+local function safeEval(exprString, refTracker)
   local prep = preprocessExpression(exprString)
   local code = "return (" .. prep .. ")"
-  local fn, err = load(code, "rule_expr", "t", createEvalEnv())
+  local fn, err = load(code, "rule_expr", "t", createEvalEnv(refTracker))
   if not fn then
     return nil, "Syntax error: " .. tostring(err)
   end
@@ -377,6 +378,33 @@ local function safeEval(exprString)
   end
 
   return res, nil
+end
+
+--------------------------------------------------------------------
+-- safety: an entity's telemetry must be recent and the entity must be
+-- online before any rule is allowed to act on it. A rule referencing
+-- offline/stale/unknown entities is not "false" - it is UNKNOWN, and
+-- automations must never treat unknown plant state as safe to act on.
+--------------------------------------------------------------------
+local STALE_AFTER = 20 -- seconds; broker marks entities offline after 15s
+
+local function isEntityUnsafeToActOn(entQuery)
+  local name, sData = findEntityState(entQuery)
+  if not name then
+    return true, "no telemetry ever received"
+  end
+
+  local e = entities[name]
+  if e and e.online == false then
+    return true, "entity reported OFFLINE by broker"
+  end
+
+  local lastSeen = sData and sData._lastSeen
+  if not lastSeen or (now() - lastSeen) > STALE_AFTER then
+    return true, "telemetry is stale (no update in " .. STALE_AFTER .. "s)"
+  end
+
+  return false, nil
 end
 
 --------------------------------------------------------------------
@@ -427,11 +455,21 @@ local function evaluateRule(rule)
   rule._lastEval = now()
   rule._execCount = rule._execCount or 0
 
-  local res, err = safeEval(rule.condition)
+  local refs = {}
+  local res, err = safeEval(rule.condition, refs)
   if err then
     rule._status = "ERR"
     rule._lastErr = err
     return
+  end
+
+  for entName in pairs(refs) do
+    local unsafe, reason = isEntityUnsafeToActOn(entName)
+    if unsafe then
+      rule._status = "STALE"
+      rule._lastErr = ("'%s' %s - rule suppressed for safety"):format(entName, reason)
+      return
+    end
   end
 
   rule._lastErr = nil
@@ -544,6 +582,9 @@ local function redrawMonitor()
     elseif st == "ERR" then
       mon.setTextColor(colors.red)
       mon.write("[ERR]  ")
+    elseif st == "STALE" then
+      mon.setTextColor(colors.magenta)
+      mon.write("[STALE]")
     elseif st == "OFF" then
       mon.setTextColor(colors.gray)
       mon.write("[OFF]  ")
@@ -636,51 +677,36 @@ end
 
 local function getDiscoveredPropertiesFor(entName)
   local props = {}
-  local sData = state[entName]
+  local _, sData = findEntityState(entName)
   if sData then
     for k, v in pairs(sData) do
       if k:sub(1, 1) ~= "_" and type(v) ~= "table" then
         props[#props + 1] = { name = k, val = v }
       end
     end
+    table.sort(props, function(a, b) return a.name < b.name end)
   end
 
-  if #props == 0 then
-    local norm = normalizeKey(entName)
-    if norm:find("reactor") or norm:find("fission") then
-      props = { { name = "wastePercent", val = 0 }, { name = "isActive", val = false }, { name = "damagePercent", val = 0 } }
-    elseif norm:find("matrix") or norm:find("energy") then
-      props = { { name = "fillPercent", val = 0 }, { name = "stored", val = 0 } }
-    elseif norm:find("tank") then
-      props = { { name = "fillPercent", val = 0 } }
-    else
-      props = { { name = "active", val = false }, { name = "fillPercent", val = 0 } }
-    end
-  end
-
+  -- No fallback/guessed properties here: this list must only ever contain
+  -- fields the entity has actually reported over the network. Anything
+  -- else (e.g. "reactors have wastePercent") is a fabricated example,
+  -- not a real capability of *this* entity.
   return props
 end
 
 local function getDiscoveredActionsFor(entName)
   local acts = {}
-  local e = entities[entName]
+  local name = (select(1, findEntityState(entName))) or entName
+  local e = entities[name]
   if e and e.actions then
     for _, a in ipairs(e.actions) do acts[#acts + 1] = a end
   end
 
-  if #acts == 0 then
-    local norm = normalizeKey(entName)
-    if norm:find("reactor") or norm:find("fission") then
-      acts = { "scram", "activate", "setBurnRate" }
-    elseif norm:find("matrix") or norm:find("sps") or norm:find("energy") then
-      acts = { "setMaxFlow" }
-    elseif norm:find("chat") then
-      acts = { "chat" }
-    else
-      acts = { "activate", "deactivate", "toggle", "setMaxFlow" }
-    end
-  end
-
+  -- No fallback/guessed actions here: an entity only ever offers the
+  -- actions it actually announced to the broker. Guessing "reactors can
+  -- scram" is fine as documentation, but wrong as executable logic - it
+  -- lets the wizard build a rule that calls an action the real peripheral
+  -- may not support.
   return acts
 end
 
@@ -826,6 +852,7 @@ local function redrawTerminal()
       if st == "TRIG" then term.setTextColor(colors.orange)
       elseif st == "ACTIVE" then term.setTextColor(colors.cyan)
       elseif st == "ERR" then term.setTextColor(colors.red)
+      elseif st == "STALE" then term.setTextColor(colors.magenta)
       elseif st == "OFF" then term.setTextColor(colors.gray)
       else term.setTextColor(colors.lime) end
 
@@ -920,6 +947,11 @@ local function redrawTerminal()
 
       local props = getDiscoveredPropertiesFor(wizardData.triggerEnt)
       local y = 7
+      if #props == 0 then
+        term.setTextColor(colors.gray)
+        term.write("(no telemetry reported yet - type the field name manually)")
+        y = y + 1
+      end
       for idx, p in ipairs(props) do
         if y >= 11 then break end
         term.setCursorPos(1, y)
@@ -1029,6 +1061,11 @@ local function redrawTerminal()
 
       local acts = getDiscoveredActionsFor(wizardData.actionEntity)
       local y = 7
+      if #acts == 0 then
+        term.setTextColor(colors.gray)
+        term.write("(no actions reported yet - type the action name manually)")
+        y = y + 1
+      end
       for idx, act in ipairs(acts) do
         if y >= 11 then break end
         term.setCursorPos(1, y)
@@ -1117,6 +1154,11 @@ local function redrawTerminal()
 
       local acts = getDiscoveredActionsFor(wizardData.elseEntity)
       local y = 7
+      if #acts == 0 then
+        term.setTextColor(colors.gray)
+        term.write("(no actions reported yet - type the action name manually)")
+        y = y + 1
+      end
       for idx, act in ipairs(acts) do
         if y >= 11 then break end
         term.setCursorPos(1, y)

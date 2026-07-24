@@ -76,7 +76,8 @@ If you are familiar with the **MQTT** protocol (ISO/IEC 20922), `cc:mqtt` implem
   * **Interactive Terminal Rule Creator / Editor Wizard**: Create or edit automation rules directly on the computer terminal step-by-step with live entity and action suggestions!
   * **Flexible Expression Engine**: Evaluates conditions and dynamic action arguments with built-in unit constants (`MFE/t`, `kFE/t`, `GFE/t`) and property proxies.
   * **Multiple Execution Modes**: Supports `edge` (trigger once on state change), `continuous` (dynamic proportional scaling), and `state` (then/else state transitions).
-  * **Monitor Status & Audit Log**: Renders rule health badges (`[OK]`, `[TRIG]`, `[ACT]`, `[OFF]`, `[ERR]`) and a real-time scrolling audit log of invoked actions.
+  * **Fail-Safe on Unknown State**: If any entity a rule's condition depends on is offline or its telemetry hasn't updated recently (stale), the rule is suppressed (`[STALE]`) instead of acting on old data — an entity you haven't heard from is treated as *unknown*, never as *safe*.
+  * **Monitor Status & Audit Log**: Renders rule health badges (`[OK]`, `[TRIG]`, `[ACT]`, `[OFF]`, `[ERR]`, `[STALE]`) and a real-time scrolling audit log of invoked actions.
   * **Interactive Terminal TUI**:
     * `[N]`: Launch **Interactive Rule Creator Wizard** to add a new automation rule step-by-step.
     * `[E]` / `[Enter]`: Launch **Interactive Rule Editor Wizard** to edit the selected rule.
@@ -162,7 +163,7 @@ reboot
   * `[E]`: Inspect rule parameters, condition string, action lists, and last error trace.
   * `[Tab]`: View real-time monitored entity telemetry cache.
 * **Monitor Display**:
-  * Displays color-coded rule status badges (`[OK]`, `[TRIG]`, `[ACT]`, `[ERR]`, `[OFF]`) and execution counters (`x142`).
+  * Displays color-coded rule status badges (`[OK]`, `[TRIG]`, `[ACT]`, `[ERR]`, `[OFF]`, `[STALE]`) and execution counters (`x142`).
   * Live bottom section renders real-time action audit log entries (e.g. `[14:22:05] EnergyController-SPS->setMaxFlow(8540000000)`).
 
 ### 📱 Pocket Computer Controller & Dashboard (`tablet.lua`)
@@ -179,7 +180,9 @@ reboot
 
 ## ⚡ Automation Use Cases (`automations.cfg`)
 
-`controller.lua` automatically generates an `automations.cfg` configuration file on boot. Below are example rules implemented out-of-the-box:
+`controller.lua` boots with an empty rule set and generates a blank `automations.cfg` on first run — it ships **no** rules out-of-the-box. Everything is created by you via the Interactive Rule Creator Wizard on the terminal, built from whatever entities, telemetry fields, and actions your network *actually* reports.
+
+The rules below are illustrative use cases only, written here to describe the kinds of automations the wizard should be able to express. They are not entity names or actions the software knows about — `controller.lua` must never hardcode `fisionReactor`, `inductionmatrix`, `scram`, etc. as special cases. Any entity/property/action shown in the wizard has to come from real network discovery (the broker's registry and retained telemetry), or the wizard is lying to you.
 
 ```lua
 -- 1. Fission Reactor Emergency Safety Scram & Chat Alert
