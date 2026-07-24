@@ -32,17 +32,20 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 table.sort(monitorNames)
 
-local mon    = monitorNames[1] and peripheral.wrap(monitorNames[1])
-local logMon = monitorNames[2] and peripheral.wrap(monitorNames[2])
+local mon      = monitorNames[1] and peripheral.wrap(monitorNames[1])
+local logMon   = monitorNames[2] and peripheral.wrap(monitorNames[2])
+local debugMon = monitorNames[3] and peripheral.wrap(monitorNames[3])
 if mon then mon.setTextScale(0.5) end
 if logMon then logMon.setTextScale(0.5) end
+if debugMon then debugMon.setTextScale(1) end
 
 print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
 if mon then print("  " .. monitorNames[1] .. " -> entity list") end
-if logMon then
-  print("  " .. monitorNames[2] .. " -> action log")
-elseif mon then
-  print("  (only one monitor found - action log disabled)")
+if logMon then print("  " .. monitorNames[2] .. " -> action log") end
+if debugMon then
+  print("  " .. monitorNames[3] .. " -> diagnostics (msg/s, redraw & loop timing)")
+elseif mon and not logMon then
+  print("  (only one monitor found - action log & diagnostics disabled)")
 end
 
 local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
@@ -59,6 +62,30 @@ local inspectEntityName   = nil
 local inputActionName     = nil
 local inputBuffer         = ""
 local statusBanner        = nil
+
+-- The local terminal console only costs anything while it's actually being
+-- looked at - nobody stands at every broker/provider/controller all day, so
+-- there's no reason to keep redrawing it (and computing what to draw) on a
+-- computer nobody's watching. Starts closed; any key/char opens it, [H]
+-- closes it again. The shared monitor(s) are unaffected by this - those
+-- keep updating on their own schedule regardless, since someone in the
+-- world might actually be looking at them.
+local consoleOn = false
+
+-- Lightweight self-instrumentation, so "is this slow" is something you can
+-- read off a screen instead of guessing. lastIterMs/maxIterMs cover a full
+-- while-loop pass (message handling + redraws); lastRedrawMs/maxRedrawMs
+-- isolate just the redraw cost. If maxIterMs is high while maxRedrawMs and
+-- msgPerSec both stay low, the loop itself has little to do - that points
+-- at external (server-tick) lag rather than anything in this script, since
+-- CC:Tweaked's own event delivery and peripheral/monitor calls slow down
+-- proportionally when the server is struggling to keep up 20 TPS.
+local stats = {
+  msgTotal = 0, msgPerSec = 0, msgWindowCount = 0, msgWindowStart = 0,
+  lastRedrawMs = 0, maxRedrawMs = 0,
+  lastIterMs = 0, maxIterMs = 0,
+  statWindowStart = 0,
+}
 
 --------------------------------------------------------------------
 -- auto updater
@@ -432,9 +459,69 @@ local function redrawLogMonitor()
   end
 end
 
+-- optional 3rd monitor: live diagnostics, so "is the broker/network slow,
+-- and why" is something you can read off a screen instead of guessing.
+-- Redrawn on its own (slower) cadence from the main loop, same as the
+-- entity list and action log - never redrawn per-message.
+local function redrawDebugMonitor()
+  if not debugMon then return end
+  local w, h = debugMon.getSize()
+  debugMon.setBackgroundColor(colors.black)
+  debugMon.clear()
+  debugMon.setCursorPos(1, 1)
+  debugMon.setTextColor(colors.yellow)
+  debugMon.write("cbus diagnostics")
+  debugMon.setCursorPos(1, 2)
+  debugMon.setTextColor(colors.gray)
+  debugMon.write(string.rep("-", w))
+
+  local online, total, oldestAge = 0, 0, 0
+  local t = now()
+  for _, e in pairs(entities) do
+    total = total + 1
+    if e.online then
+      online = online + 1
+      local age = t - e.lastSeen
+      if age > oldestAge then oldestAge = age end
+    end
+  end
+
+  local y = 3
+  local function line(label, value, color)
+    if y + 1 > h then return end
+    debugMon.setCursorPos(1, y)
+    debugMon.setTextColor(colors.lightGray)
+    debugMon.write(label)
+    debugMon.setCursorPos(1, y + 1)
+    debugMon.setTextColor(color or colors.white)
+    debugMon.write(value)
+    y = y + 3
+  end
+
+  line("Entities online", ("%d / %d"):format(online, total))
+  line("Messages/sec", ("%.1f"):format(stats.msgPerSec))
+  line("Last redraw", ("%d ms"):format(math.floor(stats.lastRedrawMs)))
+  line("Worst redraw (10s)", ("%d ms"):format(math.floor(stats.maxRedrawMs)),
+    stats.maxRedrawMs > 300 and colors.red or colors.lime)
+  line("Worst loop pass (10s)", ("%d ms"):format(math.floor(stats.maxIterMs)),
+    stats.maxIterMs > 500 and colors.red or colors.lime)
+  line("Oldest live entity", ("%d s ago"):format(math.floor(oldestAge)),
+    oldestAge > OFFLINE_AFTER / 2 and colors.red or colors.lime)
+end
+
 --------------------------------------------------------------------
 -- terminal interactive browser
 --------------------------------------------------------------------
+
+-- drawn once (not on a redraw loop) whenever the console is closed
+local function showIdleScreen()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  term.setTextColor(colors.gray)
+  term.write(("cbus broker #%d - press any key for console"):format(os.getComputerID()))
+end
+
 local function redrawTerminal()
   local w, h = term.getSize()
   term.setBackgroundColor(colors.black)
@@ -465,7 +552,13 @@ local function redrawTerminal()
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.yellow)
     term.write(" NAME         KIND       VER     STATUS   LAST SEEN")
-    if w > 51 then term.write(string.rep(" ", w - 51)) end
+    local statsStr = (" %.1fmsg/s redraw:%dms(max %dms)"):format(
+      stats.msgPerSec, math.floor(stats.lastRedrawMs), math.floor(stats.maxRedrawMs))
+    if w > 51 + #statsStr then
+      term.write(statsStr .. string.rep(" ", w - 51 - #statsStr))
+    elseif w > 51 then
+      term.write(string.rep(" ", w - 51))
+    end
 
     -- List body
     local listH = h - 3
@@ -536,7 +629,7 @@ local function redrawTerminal()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [Enter/C] Inspect  [D] Del Off  [P] Purge All"
+    local footerText = " [Enter/C] Inspect  [D] Del Off  [P] Purge All  [H] Hide"
     term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
 
   elseif viewMode == "INSPECT" then
@@ -715,6 +808,10 @@ local function handleTerminalKey(ev)
       local n = purgeAllOffline()
       setBanner(("Purged %d offline entities"):format(n), false)
       redrawTerminal()
+
+    elseif key == keys.h then
+      consoleOn = false
+      showIdleScreen()
     end
 
   elseif viewMode == "INSPECT" then
@@ -898,39 +995,58 @@ pcall(checkForUpdate, "broker.lua")
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawLogMonitor()
-redrawTerminal()
+redrawDebugMonitor()
+showIdleScreen()
 
 local nextTick = now() + TICK
 local nextUpdate = now() + UPDATE_TICK
 
 -- Redraws are throttled separately from message handling. Forwarding a
 -- message (inside handle(), via forward()) is cheap - just rednet.send()
--- calls - but redrawMonitor/redrawLogMonitor/redrawTerminal do real
--- monitor/terminal I/O (cursor positioning + per-cell writes, doubled up
--- by the monitor's 0.5 textScale) which is genuinely slow. Redrawing on
--- every single rednet_message meant that with several entities publishing
--- every ~2s, the broker could fall behind mid-redraw while more messages
--- queued up - delaying forwarding for EVERY entity at once (not just one),
--- since the broker only gets back to os.pullEvent() after the redraws
--- finish. Marking "dirty" and redrawing at a fixed cadence instead keeps
--- forwarding instant while capping how much time redraws can steal from it.
+-- calls - but redrawMonitor/redrawLogMonitor/redrawDebugMonitor/
+-- redrawTerminal do real monitor/terminal I/O (cursor positioning +
+-- per-cell writes, doubled up by the monitor's 0.5 textScale) which is
+-- genuinely slow. Redrawing on every single rednet_message meant that
+-- with several entities publishing every ~2s, the broker could fall
+-- behind mid-redraw while more messages queued up - delaying forwarding
+-- for EVERY entity at once (not just one), since the broker only gets
+-- back to os.pullEvent() after the redraws finish. Marking "dirty" and
+-- redrawing at a fixed cadence instead keeps forwarding instant while
+-- capping how much time redraws can steal from it.
 local REDRAW_TICK = 0.3
 local nextRedraw = now() + REDRAW_TICK
 local dirty = false
 
+local STATS_WINDOW = 10
+stats.msgWindowStart = now()
+stats.statWindowStart = now()
+
 while true do
   os.startTimer(0.5)
   local ev = { os.pullEvent() }
+  local iterT0 = now()
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     handle(ev[2], ev[3])
     dirty = true
+    stats.msgTotal = stats.msgTotal + 1
+    stats.msgWindowCount = stats.msgWindowCount + 1
 
   elseif ev[1] == "key" then
-    handleTerminalKey(ev)
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalKey(ev)
+    end
 
   elseif ev[1] == "char" then
-    handleTerminalChar(ev)
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalChar(ev)
+    end
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
     pcall(updaterHandleHttp, ev[1], ev[2], ev[3])
@@ -948,9 +1064,14 @@ while true do
   end
 
   if dirty and t >= nextRedraw then
+    local redrawT0 = now()
     redrawMonitor()
     redrawLogMonitor()
-    redrawTerminal()
+    redrawDebugMonitor()
+    if consoleOn then redrawTerminal() end
+    local redrawMs = (now() - redrawT0) * 1000
+    stats.lastRedrawMs = redrawMs
+    if redrawMs > stats.maxRedrawMs then stats.maxRedrawMs = redrawMs end
     dirty = false
     nextRedraw = t + REDRAW_TICK
   end
@@ -958,5 +1079,18 @@ while true do
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
     pcall(checkForUpdate, "broker.lua")
+  end
+
+  local iterMs = (now() - iterT0) * 1000
+  stats.lastIterMs = iterMs
+  if iterMs > stats.maxIterMs then stats.maxIterMs = iterMs end
+
+  if t - stats.statWindowStart >= STATS_WINDOW then
+    stats.msgPerSec = stats.msgWindowCount / (t - stats.msgWindowStart)
+    stats.msgWindowCount = 0
+    stats.msgWindowStart = t
+    stats.maxRedrawMs = stats.lastRedrawMs
+    stats.maxIterMs = stats.lastIterMs
+    stats.statWindowStart = t
   end
 end

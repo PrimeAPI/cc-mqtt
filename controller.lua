@@ -37,6 +37,12 @@ local selectedIndex = 1
 local statusBanner  = nil
 local pendingDelete = false
 
+-- The local terminal console only costs anything while it's actually being
+-- looked at, and nobody stands at every controller computer all day. Starts
+-- closed; any key/char opens it, [H] closes it again. Rule evaluation and
+-- telemetry handling are unaffected either way.
+local consoleOn = false
+
 -- Wizard state for creating/editing rules
 local wizardData    = nil
 
@@ -1048,6 +1054,15 @@ local function drawWizardOptionList(startY, maxY, items, formatFn, customLabel)
   return y, total
 end
 
+-- drawn once (not on a redraw loop) whenever the console is closed
+local function showIdleScreen()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  term.setTextColor(colors.gray)
+  term.write(("cbus controller #%d - press any key for console"):format(os.getComputerID()))
+end
+
 local function redrawTerminal()
   local w, h = term.getSize()
   term.setBackgroundColor(colors.black)
@@ -1592,7 +1607,7 @@ local function redrawTerminal()
       or " [Enter]Next Step | [Tab]Cancel Wizard"
     term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
   else
-    local ctrlStr = " [N]New | [E]Edit | [D]Delete | [Space]Toggle | [T]Test | [Tab]View"
+    local ctrlStr = " [N]New | [E]Edit | [D]Delete | [Space]Toggle | [T]Test | [Tab]View | [H]Hide"
     term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
   end
 end
@@ -1876,6 +1891,10 @@ local function handleTerminalKey(ev)
       loadConfig()
       setBanner("Reloaded automations.cfg", false)
       redrawTerminal()
+
+    elseif key == keys.h then
+      consoleOn = false
+      showIdleScreen()
     end
 
   elseif viewMode == "INSPECT" then
@@ -1968,7 +1987,7 @@ rednet.send(broker, {
 rednet.send(broker, { type = "req_registry" }, PROTOCOL)
 
 redrawMonitor()
-redrawTerminal()
+showIdleScreen()
 
 local nextEval   = now() + EVAL_TICK
 local nextSync   = now() + SYNC_TICK
@@ -1996,10 +2015,20 @@ while true do
     dirty = true
 
   elseif ev[1] == "key" then
-    handleTerminalKey(ev)
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalKey(ev)
+    end
 
   elseif ev[1] == "char" then
-    handleTerminalChar(ev)
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalChar(ev)
+    end
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
     pcall(updaterHandleHttp, ev[1], ev[2], ev[3])
@@ -2014,7 +2043,7 @@ while true do
 
   if dirty and t >= nextRedraw then
     redrawMonitor()
-    redrawTerminal()
+    if consoleOn then redrawTerminal() end
     dirty = false
     nextRedraw = t + REDRAW_TICK
   end

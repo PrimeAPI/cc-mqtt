@@ -1268,8 +1268,23 @@ local inputActionName     = nil
 local inputBuffer         = ""
 local statusBanner        = nil
 
+-- The local terminal console only costs anything while it's actually being
+-- looked at, and nobody stands at every provider computer all day. Starts
+-- closed; any key/char opens it, [H] closes it again. Publishing/collecting
+-- and command handling are unaffected either way.
+local consoleOn = false
+
 local function setBanner(msg, isError)
   statusBanner = { text = msg, error = isError or false, time = os.clock() }
+end
+
+-- drawn once (not on a redraw loop) whenever the console is closed
+local function showIdleScreen()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  term.setTextColor(colors.gray)
+  term.write(("cbus provider #%d - press any key for console"):format(os.getComputerID()))
 end
 
 local function simulateAction(dev, actionName, rawArgs)
@@ -1402,7 +1417,7 @@ local function redrawTerminal()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [Enter/C] Inspect & Actions  [R] Force Push"
+    local footerText = " [Enter/C] Inspect & Actions  [R] Force Push  [H] Hide"
     term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
 
   elseif viewMode == "INSPECT" then
@@ -1564,6 +1579,10 @@ local function handleTerminalKey(ev)
       announceAll()
       setBanner("Forced immediate publish & re-announce", false)
       redrawTerminal()
+
+    elseif key == keys.h then
+      consoleOn = false
+      showIdleScreen()
     end
 
   elseif viewMode == "INSPECT" then
@@ -1642,11 +1661,12 @@ while not findBroker(false) do
 end
 
 announceAll()
-redrawTerminal()
+showIdleScreen()
 
 while true do
   os.startTimer(0.5)
   local ev = { os.pullEvent() }
+  local dirty = false
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     local msg = ev[3]
@@ -1671,17 +1691,27 @@ while true do
         end
       end
     end
-    redrawTerminal()
+    dirty = true
 
   elseif ev[1] == "key" then
-    handleTerminalKey(ev)
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalKey(ev)
+    end
 
   elseif ev[1] == "char" then
-    handleTerminalChar(ev)
+    if not consoleOn then
+      consoleOn = true
+      redrawTerminal()
+    else
+      handleTerminalChar(ev)
+    end
 
   elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
     setBanner("Peripheral change detected - reboot to rescan", true)
-    redrawTerminal()
+    dirty = true
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
     pcall(updaterHandleHttp, ev[1], ev[2], ev[3])
@@ -1693,7 +1723,7 @@ while true do
     pollIndex = pollIndex + 1
     if pollIndex > #devices then pollIndex = 1 end
     nextPub = t + (INTERVAL / #devices)
-    redrawTerminal()
+    dirty = true
   end
   if t >= nextAnn then
     -- only look the broker up if we don't already have one - rednet.lookup()
@@ -1706,11 +1736,17 @@ while true do
     if not broker then findBroker(true) end
     announceAll()
     nextAnn = t + ANNOUNCE
-    redrawTerminal()
+    dirty = true
   end
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
     pcall(checkForUpdate, "provider.lua")
-    redrawTerminal()
+    dirty = true
   end
+
+  -- the console only gets redrawn if it's actually open - a provider
+  -- computer nobody is standing at doesn't need term I/O recomputed on
+  -- every publish cycle (which, with several devices, can be several
+  -- times a second)
+  if dirty and consoleOn then redrawTerminal() end
 end

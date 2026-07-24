@@ -301,8 +301,13 @@ local function send(msg)
 end
 
 local function subscribe()
-  local b = rednet.lookup(PROTOCOL, "broker")
-  if b then broker = b end
+  -- no rednet.lookup() here - it blocks and silently discards any other
+  -- rednet_message (i.e. live data) that arrives while it waits for a
+  -- reply. This ran on every subscribe() call, including every single
+  -- SUB_INTERVAL tick in the display loop (see runDisplay), which is
+  -- almost certainly why data kept going stale even after findBroker()
+  -- itself was guarded elsewhere. send() already falls back to
+  -- findBroker() if broker is somehow still unknown.
   send({ type = "subscribe", name = cfg.name, patterns = { "#" }, version = currentVersion })
 end
 
@@ -1703,8 +1708,23 @@ end
 --------------------------------------------------------------------
 local subStatusBanner  = nil
 
+-- The local terminal console only costs anything while it's actually being
+-- looked at. Starts closed; any key opens it, [H] closes it again. The
+-- monitor dashboard is unaffected either way - it keeps rendering on its
+-- own schedule regardless of console state.
+local consoleOn = false
+
 local function setSubBanner(msg, isError)
   subStatusBanner = { text = msg, error = isError or false, time = os.clock() }
+end
+
+-- drawn once (not on a redraw loop) whenever the console is closed
+local function showIdleScreen()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  term.setTextColor(colors.gray)
+  term.write(("cbus subscriber: %s - press any key for console"):format(cfg.name))
 end
 
 local function runDisplay()
@@ -1773,7 +1793,7 @@ local function runDisplay()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [S] Setup   [R] Force Resync"
+    local footerText = " [S] Setup   [R] Force Resync   [H] Hide"
     term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
   end
 
@@ -1795,6 +1815,10 @@ local function runDisplay()
       requestRegistry()
       setSubBanner("Forced re-subscribe & registry sync", false)
       redrawSubscriberTerminal()
+
+    elseif key == keys.h then
+      consoleOn = false
+      showIdleScreen()
     end
   end
 
@@ -1827,13 +1851,13 @@ local function runDisplay()
       nextUpdate = t + UPDATE_TICK
       pcall(checkForUpdate, "subscriber.lua")
     end
-    if t >= nextTermDraw then
+    if consoleOn and t >= nextTermDraw then
       redrawSubscriberTerminal()
       nextTermDraw = t + 1
     end
   end
 
-  redrawSubscriberTerminal()
+  showIdleScreen()
 
   while true do
     os.startTimer(0.5)
@@ -1843,11 +1867,17 @@ local function runDisplay()
       local ok, newFound = pcall(handleNet, ev[3], ev[2])
       if ok and newFound then
         setSubBanner("New entity discovered (disabled by default - enable it in Setup)", false)
-        redrawSubscriberTerminal()
+        if consoleOn then redrawSubscriberTerminal() end
       end
 
     elseif ev[1] == "key" then
-      handleTerminalKey(ev)
+      if not consoleOn then
+        consoleOn = true
+        redrawSubscriberTerminal()
+        nextTermDraw = os.clock() + 1
+      else
+        handleTerminalKey(ev)
+      end
 
     elseif ev[1] == "monitor_touch" then
       local tx, ty = ev[3], ev[4]
