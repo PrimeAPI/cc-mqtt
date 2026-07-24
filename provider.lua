@@ -1,4 +1,4 @@
--- BUILD 1 -- bump this by 1 every time this file is edited, so you can
+-- BUILD 2 -- bump this by 1 every time this file is edited, so you can
 -- eyeball it against a running computer's copy without touching GitHub.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
@@ -1377,7 +1377,12 @@ local function simulateAction(dev, actionName, rawArgs)
 end
 
 local nextPub = 0
-local nextAnn = os.clock() + ANNOUNCE
+-- due immediately: the first main-loop iteration does the broker lookup +
+-- initial announceAll() (see the "if t >= nextAnn" block below) instead of
+-- a separate blocking pre-loop wait, so a missing/slow broker can never
+-- delay entering the loop itself (see the startup section for why that
+-- matters for the update checker too).
+local nextAnn = 0
 -- staggered by computer ID so a whole fleet of computers doesn't burst
 -- its GitHub requests in the same second and blow the shared rate limit
 local nextUpdate = os.clock() + (os.getComputerID() % UPDATE_TICK)
@@ -1774,26 +1779,27 @@ if #devices == 0 then
   return
 end
 
-while not findBroker(false) do
-  sleep(2)
-end
-
-announceAll()
-showIdleScreen()
-
--- Fired here, not before the findBroker wait above: findBroker()/sleep()
--- both pump a FILTERED os.pullEvent() internally (waiting on a
--- rednet_message reply / a timer), which silently discards any other
--- event - including the http_success/http_failure this check's
--- http.request() produces - that arrives while they're waiting. A
--- dropped response leaves `updater` permanently non-nil, and
--- checkForUpdate() no-ops forever after that (see "if updater then
--- return end" above) - so the very first, startup, check would
--- occasionally (in practice: often, since a GitHub round-trip is easily
--- as long as one findBroker retry) wedge the updater for good. Firing it
--- here, right before the main loop's own unfiltered os.pullEvent(),
--- guarantees the response is always caught by updaterHandleHttp below.
+-- Fired as the very first thing, before ANYTHING that could block or pump
+-- its own filtered event loop - including a broker lookup. This used to
+-- sit after a "while not findBroker(false) do sleep(2) end" wait:
+-- findBroker() (rednet.lookup) and sleep() both internally pump their own
+-- os.pullEvent() loop until THEIR event shows up, silently discarding any
+-- other event that arrives meanwhile - including the http_success this
+-- check's http.request() produces. That's already bad enough (the
+-- response gets dropped, `updater` never clears, and checkForUpdate()
+-- silently no-ops forever after - see "if updater then return end"
+-- above), but that retrying wait loop is also UNBOUNDED: if no broker is
+-- reachable yet - or ever, e.g. running this script on its own for
+-- testing - it never returns at all, so checkForUpdate() never even ran.
+-- "always check on startup" had silently become "only check on startup
+-- if a broker happens to already be up." Broker discovery is now handled
+-- entirely from inside the main loop below (nextAnn, initialized already
+-- due, plus the "broker_online" rednet handler), which already tolerates
+-- broker == nil throughout (see send()) - so nothing here blocks, and
+-- this fires unconditionally, broker or no broker.
 pcall(checkForUpdate, "provider.lua")
+
+showIdleScreen()
 
 while true do
   os.startTimer(0.5)
