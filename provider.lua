@@ -1031,6 +1031,14 @@ local HTTP_HEADERS = {
 -- (see the main loop) means GitHub checks never block rednet processing.
 local updater = nil  -- { stage = "api"|"fallback"|"commit", url, scriptName, remoteSha }
 
+-- Short status word shown on the terminal (see the header line in
+-- redrawTerminal) plus a full message printed to the console log. Update
+-- checks used to fail completely silently - with the console hidden by
+-- default (see consoleOn), that made "the server blocks the http API" and
+-- "it's just not due for a check yet" indistinguishable from the outside.
+local updaterStatus = "never checked"
+local httpDisabledWarned = false
+
 local function applyUpdate(remoteSha, code, scriptName)
   local target = shell and shell.getRunningProgram() or "startup.lua"
   if not target or target == "" then target = "startup.lua" end
@@ -1083,10 +1091,12 @@ local function updaterResolved(remoteSha, code)
   -- the same download-and-apply path below) means the computer's code is
   -- actually guaranteed to match what .version claims.
   if remoteSha == currentVersion then
+    updaterStatus = "up to date"
     updater = nil
     return
   end
 
+  updaterStatus = "updating"
   print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
 
   -- Already have the code (fallback path fetched it directly) -> apply now.
@@ -1106,8 +1116,20 @@ end
 
 -- kicks off a check; a no-op if one is already in flight
 local function checkForUpdate(scriptName)
-  if not http then return end
+  if not http then
+    updaterStatus = "http disabled"
+    if not httpDisabledWarned then
+      httpDisabledWarned = true
+      print("[Updater] the 'http' API is disabled on this server (or this")
+      print("[Updater] computer isn't allowed to use it) - auto-update")
+      print("[Updater] cannot work. Ask a server admin to enable http (and")
+      print("[Updater] allow github.com/githubusercontent.com) in the")
+      print("[Updater] CC:Tweaked server config.")
+    end
+    return
+  end
   if updater then return end
+  updaterStatus = "checking"
   local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
   updater = { stage = "api", scriptName = scriptName or "provider.lua" }
   updater.url = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s")
@@ -1115,7 +1137,10 @@ local function checkForUpdate(scriptName)
   http.request(updater.url, nil, HTTP_HEADERS)
 end
 
--- fed http_success/http_failure events from the main loop
+-- fed http_success/http_failure events from the main loop. "handle" is a
+-- response handle on http_success, but on http_failure CC:Tweaked passes
+-- the error message string in that same event slot instead - captured
+-- here as the reason so a check failure is actually visible somewhere.
 local function updaterHandleHttp(eventType, url, handle)
   if not updater or url ~= updater.url then return end
 
@@ -1123,6 +1148,8 @@ local function updaterHandleHttp(eventType, url, handle)
     if updater.stage == "api" then
       updaterFallback()
     else
+      updaterStatus = "check failed"
+      print(("[Updater] %s check failed: %s"):format(updater.stage, tostring(handle)))
       updater = nil
     end
     return
@@ -1423,9 +1450,9 @@ local function redrawTerminal()
     term.setCursorPos(1, 2)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.white)
-    local timerText = (" Push: %.1fs | Announce: %ds | Update: %ds | Loop max: %dms/10s"):format(
-      pushCd, annCd, updCd, math.floor(providerStats.maxIterMs))
-    term.write(timerText .. string.rep(" ", math.max(0, w - #timerText)))
+    local timerText = (" Push:%.1fs Ann:%ds Upd:%s(%ds) Loop:%dms"):format(
+      pushCd, annCd, updaterStatus, updCd, math.floor(providerStats.maxIterMs))
+    term.write((timerText .. string.rep(" ", math.max(0, w - #timerText))):sub(1, w))
 
     term.setCursorPos(1, 3)
     term.setBackgroundColor(colors.gray)
@@ -1745,14 +1772,26 @@ if #devices == 0 then
   return
 end
 
-pcall(checkForUpdate, "provider.lua")
-
 while not findBroker(false) do
   sleep(2)
 end
 
 announceAll()
 showIdleScreen()
+
+-- Fired here, not before the findBroker wait above: findBroker()/sleep()
+-- both pump a FILTERED os.pullEvent() internally (waiting on a
+-- rednet_message reply / a timer), which silently discards any other
+-- event - including the http_success/http_failure this check's
+-- http.request() produces - that arrives while they're waiting. A
+-- dropped response leaves `updater` permanently non-nil, and
+-- checkForUpdate() no-ops forever after that (see "if updater then
+-- return end" above) - so the very first, startup, check would
+-- occasionally (in practice: often, since a GitHub round-trip is easily
+-- as long as one findBroker retry) wedge the updater for good. Firing it
+-- here, right before the main loop's own unfiltered os.pullEvent(),
+-- guarantees the response is always caught by updaterHandleHttp below.
+pcall(checkForUpdate, "provider.lua")
 
 while true do
   os.startTimer(0.5)

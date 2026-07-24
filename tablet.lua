@@ -57,7 +57,14 @@ local function awaitHttp(url, timeoutSec)
 end
 
 local function checkAndApplyUpdate(scriptName)
-  if not http then return false end
+  if not http then
+    print("[Updater] the 'http' API is disabled on this server (or this")
+    print("[Updater] computer isn't allowed to use it) - auto-update")
+    print("[Updater] cannot work. Ask a server admin to enable http (and")
+    print("[Updater] allow github.com/githubusercontent.com) in the")
+    print("[Updater] CC:Tweaked server config.")
+    return false, "http disabled"
+  end
   scriptName = scriptName or "tablet.lua"
 
   local remoteSha = nil
@@ -96,7 +103,7 @@ local function checkAndApplyUpdate(scriptName)
     end
   end
 
-  if not remoteSha then return false end
+  if not remoteSha then return false, "check failed" end
 
   local target = shell and shell.getRunningProgram() or "startup.lua"
   if not target or target == "" then target = "startup.lua" end
@@ -1323,12 +1330,17 @@ term.setCursorPos(1, 1)
 term.setTextColor(colors.yellow)
 print("[Updater] Checking GitHub for updates...")
 
-local ok, updated = pcall(checkAndApplyUpdate, "tablet.lua")
+local ok, updated, reason = pcall(checkAndApplyUpdate, "tablet.lua")
 if ok then
   if updated then
     print("[Updater] Update applied! Rebooting...")
     return
-  else
+  elseif reason == "check failed" then
+    printError("[Updater] couldn't reach GitHub - skipping this check")
+  elseif reason ~= "http disabled" then
+    -- "http disabled" already printed its own explanation above - saying
+    -- "up to date" on top of that would be actively misleading, since it
+    -- never actually checked
     print(("[Updater] Up to date (v:%s)"):format(getShortVer(currentVersion)))
   end
 else

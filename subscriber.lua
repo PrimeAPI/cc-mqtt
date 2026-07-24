@@ -162,6 +162,14 @@ local HTTP_HEADERS = {
 -- processing.
 local updater = nil  -- { stage = "api"|"fallback"|"commit", url, scriptName, remoteSha }
 
+-- Short status word shown on the terminal (see redrawSubscriberTerminal)
+-- plus a full message printed to the console log. Update checks used to
+-- fail completely silently - with the console hidden by default (see
+-- consoleOn), that made "the server blocks the http API" and "it's just
+-- not due for a check yet" indistinguishable from the outside.
+local updaterStatus = "never checked"
+local httpDisabledWarned = false
+
 local function applyUpdate(remoteSha, code, scriptName)
   local target = shell and shell.getRunningProgram() or "startup.lua"
   if not target or target == "" then target = "startup.lua" end
@@ -214,10 +222,12 @@ local function updaterResolved(remoteSha, code)
   -- the same download-and-apply path below) means the computer's code is
   -- actually guaranteed to match what .version claims.
   if remoteSha == currentVersion then
+    updaterStatus = "up to date"
     updater = nil
     return
   end
 
+  updaterStatus = "updating"
   print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
 
   -- Already have the code (fallback path fetched it directly) -> apply now.
@@ -237,8 +247,20 @@ end
 
 -- kicks off a check; a no-op if one is already in flight
 local function checkForUpdate(scriptName)
-  if not http then return end
+  if not http then
+    updaterStatus = "http disabled"
+    if not httpDisabledWarned then
+      httpDisabledWarned = true
+      print("[Updater] the 'http' API is disabled on this server (or this")
+      print("[Updater] computer isn't allowed to use it) - auto-update")
+      print("[Updater] cannot work. Ask a server admin to enable http (and")
+      print("[Updater] allow github.com/githubusercontent.com) in the")
+      print("[Updater] CC:Tweaked server config.")
+    end
+    return
+  end
   if updater then return end
+  updaterStatus = "checking"
   local cb = os.epoch and os.epoch("utc") or (os.clock() * 1000)
   updater = { stage = "api", scriptName = scriptName or "subscriber.lua" }
   updater.url = ("https://api.github.com/repos/%s/%s/commits/%s?cb=%s")
@@ -246,7 +268,10 @@ local function checkForUpdate(scriptName)
   http.request(updater.url, nil, HTTP_HEADERS)
 end
 
--- fed http_success/http_failure events from the main loop
+-- fed http_success/http_failure events from the main loop. "handle" is a
+-- response handle on http_success, but on http_failure CC:Tweaked passes
+-- the error message string in that same event slot instead - captured
+-- here as the reason so a check failure is actually visible somewhere.
 local function updaterHandleHttp(eventType, url, handle)
   if not updater or url ~= updater.url then return end
 
@@ -254,6 +279,8 @@ local function updaterHandleHttp(eventType, url, handle)
     if updater.stage == "api" then
       updaterFallback()
     else
+      updaterStatus = "check failed"
+      print(("[Updater] %s check failed: %s"):format(updater.stage, tostring(handle)))
       updater = nil
     end
     return
@@ -1798,7 +1825,7 @@ local function runDisplay()
     term.setCursorPos(1, 5)
     term.setTextColor(colors.gray)
     local updCd = math.max(0, math.floor(nextUpdate - os.clock()))
-    term.write(("Next update check: %ds"):format(updCd))
+    term.write((("Update: %s - next check in %ds"):format(updaterStatus, updCd)):sub(1, w))
 
     if subStatusBanner then
       term.setCursorPos(1, h - 1)
