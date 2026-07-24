@@ -37,7 +37,7 @@ local logMon   = monitorNames[2] and peripheral.wrap(monitorNames[2])
 local debugMon = monitorNames[3] and peripheral.wrap(monitorNames[3])
 if mon then mon.setTextScale(0.5) end
 if logMon then logMon.setTextScale(0.5) end
-if debugMon then debugMon.setTextScale(1) end
+if debugMon then debugMon.setTextScale(0.5) end
 
 print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
 if mon then print("  " .. monitorNames[1] .. " -> entity list") end
@@ -255,6 +255,7 @@ local function updaterHandleHttp(eventType, url, handle)
 end
 
 local function now() return os.clock() end
+local bootTime = now()
 
 local function setBanner(msg, isError)
   statusBanner = { text = msg, error = isError or false, time = now() }
@@ -463,50 +464,121 @@ end
 -- and why" is something you can read off a screen instead of guessing.
 -- Redrawn on its own (slower) cadence from the main loop, same as the
 -- entity list and action log - never redrawn per-message.
+--
+-- Laid out as a grid of tiles rather than one stat per 3 rows: these
+-- monitors tend to be wide and short (e.g. an 8x2-block strip), and a
+-- single stacked column only ever fills the first couple of rows before
+-- running out of height while leaving nearly the whole width blank. Tiling
+-- left-to-right, wrapping to a new row only when a row of tiles is full,
+-- uses the actual shape of the screen and leaves room to show every
+-- entity individually instead of just a single "oldest" summary.
+local function formatAge(age)
+  if age < 60 then return ("%ds"):format(math.floor(age)) end
+  return ("%dm%02ds"):format(math.floor(age / 60), math.floor(age % 60))
+end
+
 local function redrawDebugMonitor()
   if not debugMon then return end
   local w, h = debugMon.getSize()
   debugMon.setBackgroundColor(colors.black)
   debugMon.clear()
-  debugMon.setCursorPos(1, 1)
-  debugMon.setTextColor(colors.yellow)
-  debugMon.write("cbus diagnostics")
-  debugMon.setCursorPos(1, 2)
-  debugMon.setTextColor(colors.gray)
-  debugMon.write(string.rep("-", w))
 
-  local online, total, oldestAge = 0, 0, 0
   local t = now()
-  for _, e in pairs(entities) do
+  local online, total = 0, 0
+  local entList = {}
+  for name, e in pairs(entities) do
     total = total + 1
-    if e.online then
-      online = online + 1
-      local age = t - e.lastSeen
-      if age > oldestAge then oldestAge = age end
+    if e.online then online = online + 1 end
+    entList[#entList + 1] = { name = name, e = e, age = t - e.lastSeen }
+  end
+  -- most at-risk (oldest/offline) first, so problems are what you see first
+  table.sort(entList, function(a, b)
+    if a.e.online ~= b.e.online then return not a.e.online end
+    return a.age > b.age
+  end)
+
+  local subCount, topicCount = 0, 0
+  for _ in pairs(subs) do subCount = subCount + 1 end
+  for _ in pairs(retained) do topicCount = topicCount + 1 end
+
+  debugMon.setCursorPos(1, 1)
+  debugMon.setBackgroundColor(colors.blue)
+  debugMon.setTextColor(colors.white)
+  local header = (" cbus diagnostics #%d"):format(os.getComputerID())
+  local upStr = ("up %s "):format(formatAge(t - bootTime))
+  debugMon.write(header .. string.rep(" ", math.max(1, w - #header - #upStr)) .. upStr)
+  debugMon.setBackgroundColor(colors.black)
+
+  -- tile grid: each tile is a fixed-width label/value pair, packed
+  -- left-to-right and wrapped to fill however wide the monitor is
+  local TILE_W = 17
+  local cols = math.max(1, math.floor(w / TILE_W))
+  local tileIdx = 0
+  local function tile(label, value, color)
+    local col = tileIdx % cols
+    local row = math.floor(tileIdx / cols)
+    local x, y = 1 + col * TILE_W, 3 + row * 2
+    if y + 1 <= h then
+      debugMon.setCursorPos(x, y)
+      debugMon.setTextColor(colors.lightGray)
+      debugMon.write(label:sub(1, TILE_W - 1))
+      debugMon.setCursorPos(x, y + 1)
+      debugMon.setTextColor(color or colors.white)
+      debugMon.write(value:sub(1, TILE_W - 1))
     end
+    tileIdx = tileIdx + 1
   end
 
-  local y = 3
-  local function line(label, value, color)
-    if y + 1 > h then return end
-    debugMon.setCursorPos(1, y)
-    debugMon.setTextColor(colors.lightGray)
-    debugMon.write(label)
-    debugMon.setCursorPos(1, y + 1)
-    debugMon.setTextColor(color or colors.white)
-    debugMon.write(value)
-    y = y + 3
-  end
-
-  line("Entities online", ("%d / %d"):format(online, total))
-  line("Messages/sec", ("%.1f"):format(stats.msgPerSec))
-  line("Last redraw", ("%d ms"):format(math.floor(stats.lastRedrawMs)))
-  line("Worst redraw (10s)", ("%d ms"):format(math.floor(stats.maxRedrawMs)),
+  tile("Entities", ("%d/%d online"):format(online, total))
+  tile("Subscribers", tostring(subCount))
+  tile("Retained topics", tostring(topicCount))
+  tile("Action log", tostring(#actionLog))
+  tile("Messages/sec", ("%.1f"):format(stats.msgPerSec))
+  tile("Redraw ms", ("%d (max %d)"):format(math.floor(stats.lastRedrawMs), math.floor(stats.maxRedrawMs)),
     stats.maxRedrawMs > 300 and colors.red or colors.lime)
-  line("Worst loop pass (10s)", ("%d ms"):format(math.floor(stats.maxIterMs)),
+  tile("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
     stats.maxIterMs > 500 and colors.red or colors.lime)
-  line("Oldest live entity", ("%d s ago"):format(math.floor(oldestAge)),
-    oldestAge > OFFLINE_AFTER / 2 and colors.red or colors.lime)
+  tile("Update check", getShortVer(currentVersion))
+
+  local tileRows = math.ceil(tileIdx / cols)
+  local listY = 3 + tileRows * 2 + 1
+  if listY > h then return end
+
+  debugMon.setCursorPos(1, listY)
+  debugMon.setTextColor(colors.yellow)
+  debugMon.write(("ENTITIES (%d)"):format(#entList))
+  listY = listY + 1
+
+  -- one line per entity: status dot, name, age - packed the same way as
+  -- the tiles above but denser (1 row instead of 2), so as many entities
+  -- as possible are visible without scrolling
+  local ENT_W = 16
+  local entCols = math.max(1, math.floor(w / ENT_W))
+  local entRows = math.max(0, h - listY + 1)
+  local maxShown = entCols * entRows
+  for i, item in ipairs(entList) do
+    if i > maxShown then
+      local more = #entList - maxShown + 1
+      debugMon.setCursorPos(1 + ((i - 1) % entCols) * ENT_W, listY + math.floor((i - 1) / entCols))
+      debugMon.setTextColor(colors.gray)
+      debugMon.write(("+%d more"):format(more))
+      break
+    end
+    local col = (i - 1) % entCols
+    local row = math.floor((i - 1) / entCols)
+    local x, y = 1 + col * ENT_W, listY + row
+    if y > h then break end
+    debugMon.setCursorPos(x, y)
+    debugMon.setTextColor(item.e.online and colors.lime or colors.red)
+    debugMon.write(item.e.online and "\7" or "x")
+    debugMon.setTextColor(colors.white)
+    local ageStr = formatAge(item.age)
+    local nameW = ENT_W - 1 - #ageStr - 2
+    local name = item.name:sub(1, math.max(1, nameW))
+    debugMon.write(" " .. name .. string.rep(" ", math.max(0, nameW - #name)) .. " ")
+    debugMon.setTextColor(colors.gray)
+    debugMon.write(ageStr)
+  end
 end
 
 --------------------------------------------------------------------
@@ -629,8 +701,13 @@ local function redrawTerminal()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [Enter/C] Inspect  [D] Del Off  [P] Purge All  [H] Hide"
-    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+    -- [H]ide goes first, not last: a standard 51-col terminal is narrower
+    -- than the old text ("... [P] Purge All  [H] Hide" alone was 56 chars),
+    -- so anything appended at the end just silently fell off-screen. Put
+    -- the console toggle first so it's always visible, and :sub(1,w) as a
+    -- backstop so a future longer footer clips safely instead of wrapping.
+    local footerText = " [H]ide  [Enter/C]Inspect  [D]elOff  [P]urgeAll"
+    term.write((footerText .. string.rep(" ", math.max(0, w - #footerText))):sub(1, w))
 
   elseif viewMode == "INSPECT" then
     local name = inspectEntityName

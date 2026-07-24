@@ -1793,8 +1793,8 @@ local function runDisplay()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [S] Setup   [R] Force Resync   [H] Hide"
-    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+    local footerText = " [H]ide  [S] Setup   [R] Force Resync"
+    term.write((footerText .. string.rep(" ", math.max(0, w - #footerText))):sub(1, w))
   end
 
   local function handleTerminalKey(ev)

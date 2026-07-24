@@ -1417,8 +1417,12 @@ local function redrawTerminal()
     term.setCursorPos(1, h)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.white)
-    local footerText = " [Enter/C] Inspect & Actions  [R] Force Push  [H] Hide"
-    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
+    -- [H]ide goes first, not last: a standard 51-col terminal is narrower
+    -- than the old text (54 chars), so the appended hint silently fell
+    -- off-screen. :sub(1,w) as a backstop so it clips safely if it ever
+    -- doesn't fit rather than wrapping unexpectedly.
+    local footerText = " [H]ide  [Enter/C]Inspect&Act  [R]Push"
+    term.write((footerText .. string.rep(" ", math.max(0, w - #footerText))):sub(1, w))
 
   elseif viewMode == "INSPECT" then
     local dev = devices[selectedIndex]

@@ -1601,14 +1601,18 @@ local function redrawTerminal()
   term.setBackgroundColor(colors.blue)
   term.setTextColor(colors.white)
 
+  -- these footers used to overflow a standard 51-col terminal (the wizard
+  -- list-phase one was 54 chars, the main one 77 with [H]Hide tacked on
+  -- the end), so the tail - including the console-hide hint - silently
+  -- clipped off-screen. Shortened to fit, and :sub(1,w) as a backstop.
   if viewMode == "WIZARD" then
     local ctrlStr = WIZARD_LIST_PHASES[wizardData and wizardData.phase]
-      and " [Up/Down]Scroll List | [Enter]Next Step | [Tab]Cancel"
-      or " [Enter]Next Step | [Tab]Cancel Wizard"
-    term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
+      and " [Up/Down]Scroll [Enter]Next [Tab]Cancel"
+      or " [Enter]Next Step [Tab]Cancel Wizard"
+    term.write((ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr))):sub(1, w))
   else
-    local ctrlStr = " [N]New | [E]Edit | [D]Delete | [Space]Toggle | [T]Test | [Tab]View | [H]Hide"
-    term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
+    local ctrlStr = " [H]ide [N]ew [E]dit [D]el [Spc]Tgl [T]est [Tab]Vw"
+    term.write((ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr))):sub(1, w))
   end
 end
 
