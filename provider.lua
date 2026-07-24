@@ -1188,8 +1188,27 @@ local function announceAll()
   end
 end
 
+-- CC:Tweaked peripheral calls are synchronous, cross-thread calls into the
+-- game with no async/timeout API - if one hangs or runs long (a huge ME
+-- system, a multiblock under server lag, ...), NOTHING else on this
+-- computer can run until it returns: not publishing another device, not
+-- answering a "command", nothing. That's a hard limit of the platform, not
+-- something this script can route around. What it CAN do is measure which
+-- device is slow (surfaced in the terminal, see redrawTerminal) and back
+-- that specific device off so it stops eating a disproportionate share of
+-- every other device's round-robin turns - see nextPollIndex().
+local SLOW_COLLECT_MS = 1000
+local BACKOFF_SECONDS = 8
+
 local function publish(dev)
+  local collectT0 = os.clock()
   local ok, data = pcall(dev.handler.collect, dev.p, dev)
+  local collectMs = (os.clock() - collectT0) * 1000
+  dev._lastCollectMs = collectMs
+  if collectMs > (dev._maxCollectMs or 0) then dev._maxCollectMs = collectMs end
+  if collectMs > SLOW_COLLECT_MS then
+    dev._backoffUntil = os.clock() + BACKOFF_SECONDS
+  end
   if not ok or type(data) ~= "table" then data = { formed = false } end
 
   -- was previously declared only inside the "generic handler" branch below,
@@ -1328,6 +1347,39 @@ local nextUpdate = os.clock() + UPDATE_TICK
 -- to "one device's collect() call" instead of "every device's".
 local pollIndex = 1
 
+-- Picks the next device to poll, skipping any currently in backoff (see
+-- SLOW_COLLECT_MS above) so a chronically slow device doesn't keep eating
+-- a full round-robin turn every cycle - the other devices on this same
+-- computer get proportionally more turns, and better liveness, while it's
+-- being deprioritized. Falls back to polling something anyway if every
+-- device is backed off at once (e.g. under server-wide lag), rather than
+-- stalling publishing entirely.
+local function nextPollIndex(fromIndex)
+  local t = os.clock()
+  for i = 1, #devices do
+    local idx = ((fromIndex - 1 + i) % #devices) + 1
+    local dev = devices[idx]
+    if not dev._backoffUntil or dev._backoffUntil <= t then
+      return idx
+    end
+  end
+  return (fromIndex % #devices) + 1
+end
+
+-- Worst-in-10s time for a full loop pass (message/command handling + the
+-- device poll, if one happened this iteration). If this stays high while
+-- COLLECT times in the terminal stay low, the slowdown isn't any single
+-- peripheral - it's this computer (or the server) generally struggling,
+-- which points at server-side lag rather than a device to isolate.
+-- Declared here (before redrawTerminal, which reads it) rather than down
+-- by the main loop that updates it: redrawTerminal is a closure, and Lua
+-- resolves the free variables in a closure's body against whatever locals
+-- are already in scope at the point the closure is DEFINED in the source -
+-- declaring this later would make redrawTerminal see a global (nil)
+-- instead of this local, however early the assignment runs at runtime.
+local providerStats = { lastIterMs = 0, maxIterMs = 0, statWindowStart = os.clock() }
+local STATS_WINDOW = 10
+
 local function redrawTerminal()
   local w, h = term.getSize()
   term.setBackgroundColor(colors.black)
@@ -1355,14 +1407,15 @@ local function redrawTerminal()
     term.setCursorPos(1, 2)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.white)
-    local timerText = (" Push: %.1fs | Announce: %ds | Update: %ds"):format(pushCd, annCd, updCd)
+    local timerText = (" Push: %.1fs | Announce: %ds | Update: %ds | Loop max: %dms/10s"):format(
+      pushCd, annCd, updCd, math.floor(providerStats.maxIterMs))
     term.write(timerText .. string.rep(" ", math.max(0, w - #timerText)))
 
     term.setCursorPos(1, 3)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.yellow)
-    term.write(" ENTITY          TOPIC             TYPE")
-    if w > 42 then term.write(string.rep(" ", w - 42)) end
+    term.write(" ENTITY          TOPIC             TYPE          COLLECT")
+    if w > 51 then term.write(string.rep(" ", w - 51)) end
 
     local listH = h - 4
     if statusBanner then listH = listH - 1 end
@@ -1394,7 +1447,25 @@ local function redrawTerminal()
       term.write(padTop:sub(1, 17))
 
       term.setTextColor(colors.cyan)
-      term.write(dev.title or "?")
+      local padTitle = (dev.title or "?") .. string.rep(" ", math.max(1, 14 - #(dev.title or "?")))
+      term.write(padTitle:sub(1, 14))
+
+      -- collect() timing for THIS device's last poll: how you actually
+      -- see which peripheral is dragging the whole computer down, since a
+      -- slow synchronous call here can't be diagnosed any other way. Red
+      -- once it's slow enough to trigger backoff (see SLOW_COLLECT_MS).
+      local backedOff = dev._backoffUntil and dev._backoffUntil > os.clock()
+      if dev._lastCollectMs then
+        term.setTextColor(dev._lastCollectMs > SLOW_COLLECT_MS and colors.red or colors.lime)
+        term.write(("%dms"):format(math.floor(dev._lastCollectMs)))
+        if backedOff then
+          term.setTextColor(colors.orange)
+          term.write(" (backoff)")
+        end
+      else
+        term.setTextColor(colors.gray)
+        term.write("-")
+      end
 
       local cx, _ = term.getCursorPos()
       if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
@@ -1670,6 +1741,7 @@ showIdleScreen()
 while true do
   os.startTimer(0.5)
   local ev = { os.pullEvent() }
+  local iterT0 = os.clock()
   local dirty = false
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
@@ -1724,8 +1796,7 @@ while true do
   local t = os.clock()
   if #devices > 0 and t >= nextPub then
     publish(devices[pollIndex])
-    pollIndex = pollIndex + 1
-    if pollIndex > #devices then pollIndex = 1 end
+    pollIndex = nextPollIndex(pollIndex)
     nextPub = t + (INTERVAL / #devices)
     dirty = true
   end
@@ -1753,4 +1824,12 @@ while true do
   -- every publish cycle (which, with several devices, can be several
   -- times a second)
   if dirty and consoleOn then redrawTerminal() end
+
+  local iterMs = (os.clock() - iterT0) * 1000
+  providerStats.lastIterMs = iterMs
+  if iterMs > providerStats.maxIterMs then providerStats.maxIterMs = iterMs end
+  if os.clock() - providerStats.statWindowStart >= STATS_WINDOW then
+    providerStats.maxIterMs = providerStats.lastIterMs
+    providerStats.statWindowStart = os.clock()
+  end
 end
