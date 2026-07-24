@@ -112,13 +112,18 @@ local function checkAndApplyUpdate(scriptName)
     end
   end
 
-  if currentVersion == "dev" or currentVersion == "" then
-    currentVersion = remoteSha
-    local f = fs.open(VERSION_FILE, "w")
-    if f then f.write(remoteSha) f.close() end
-    return false
-  end
-
+  -- currentVersion starts as "dev" whenever .version is missing or empty -
+  -- a fresh deployment, or someone deleting it to force a re-check. This
+  -- USED to just adopt remoteSha as "current" here without ever
+  -- downloading anything, on the assumption that "dev" meant a developer
+  -- was intentionally running local code and shouldn't have it clobbered.
+  -- In practice that meant the very first check on any real deployment
+  -- silently marked itself up to date without ever having fetched the
+  -- actual latest code - so it would never auto-update again until a
+  -- LATER commit landed, no matter how far behind main it already was.
+  -- Treating "dev" as just another out-of-date version (falls through to
+  -- the same download-and-apply path below) means the computer's code is
+  -- actually guaranteed to match what .version claims.
   if remoteSha ~= currentVersion then
     print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(currentVersion), getShortVer(remoteSha)))
 
