@@ -1948,14 +1948,26 @@ local nextEval   = now() + EVAL_TICK
 local nextSync   = now() + SYNC_TICK
 local nextUpdate = now() + UPDATE_TICK
 
+-- Redraws are throttled separately from message handling, same reasoning
+-- as the broker: redrawMonitor/redrawTerminal do real monitor/terminal I/O,
+-- which is genuinely slow, while handling a message (state update + rule
+-- bookkeeping) is cheap. The controller subscribes to "#" - every topic
+-- from every provider on the network - so redrawing on every single
+-- rednet_message meant its message-handling loop could fall behind under
+-- normal network load, delaying processing of the NEXT message (including
+-- time-sensitive "command" triggers). Marking "dirty" and redrawing at a
+-- fixed cadence instead keeps message handling fast regardless of traffic.
+local REDRAW_TICK = 0.3
+local nextRedraw = now() + REDRAW_TICK
+local dirty = false
+
 while true do
   os.startTimer(0.2)
   local ev = { os.pullEvent() }
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     handleMessage(ev[2], ev[3])
-    redrawMonitor()
-    redrawTerminal()
+    dirty = true
 
   elseif ev[1] == "key" then
     handleTerminalKey(ev)
@@ -1970,9 +1982,15 @@ while true do
   local t = now()
   if t >= nextEval then
     evaluateAllRules()
+    dirty = true
+    nextEval = t + EVAL_TICK
+  end
+
+  if dirty and t >= nextRedraw then
     redrawMonitor()
     redrawTerminal()
-    nextEval = t + EVAL_TICK
+    dirty = false
+    nextRedraw = t + REDRAW_TICK
   end
 
   if t >= nextSync then

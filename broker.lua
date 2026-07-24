@@ -903,15 +903,28 @@ redrawTerminal()
 local nextTick = now() + TICK
 local nextUpdate = now() + UPDATE_TICK
 
+-- Redraws are throttled separately from message handling. Forwarding a
+-- message (inside handle(), via forward()) is cheap - just rednet.send()
+-- calls - but redrawMonitor/redrawLogMonitor/redrawTerminal do real
+-- monitor/terminal I/O (cursor positioning + per-cell writes, doubled up
+-- by the monitor's 0.5 textScale) which is genuinely slow. Redrawing on
+-- every single rednet_message meant that with several entities publishing
+-- every ~2s, the broker could fall behind mid-redraw while more messages
+-- queued up - delaying forwarding for EVERY entity at once (not just one),
+-- since the broker only gets back to os.pullEvent() after the redraws
+-- finish. Marking "dirty" and redrawing at a fixed cadence instead keeps
+-- forwarding instant while capping how much time redraws can steal from it.
+local REDRAW_TICK = 0.3
+local nextRedraw = now() + REDRAW_TICK
+local dirty = false
+
 while true do
   os.startTimer(0.5)
   local ev = { os.pullEvent() }
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     handle(ev[2], ev[3])
-    redrawMonitor()
-    redrawLogMonitor()
-    redrawTerminal()
+    dirty = true
 
   elseif ev[1] == "key" then
     handleTerminalKey(ev)
@@ -926,12 +939,20 @@ while true do
   local t = now()
   if t >= nextTick then
     for _, e in pairs(entities) do
-      if t - e.lastSeen > OFFLINE_AFTER then e.online = false end
+      if t - e.lastSeen > OFFLINE_AFTER then
+        if e.online then dirty = true end
+        e.online = false
+      end
     end
+    nextTick = t + TICK
+  end
+
+  if dirty and t >= nextRedraw then
     redrawMonitor()
     redrawLogMonitor()
     redrawTerminal()
-    nextTick = t + TICK
+    dirty = false
+    nextRedraw = t + REDRAW_TICK
   end
 
   if t >= nextUpdate then
