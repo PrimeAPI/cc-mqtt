@@ -732,6 +732,7 @@ local function startWizard(existingRuleIndex)
       elseName = r.elseActions and r.elseActions[1] and r.elseActions[1].action or "",
       elseArgs = r.elseActions and r.elseActions[1] and tostring(r.elseActions[1].args or "") or "",
       inputBuffer = r.name or r.id or "",
+      listScroll = 0,
     }
   else
     wizardData = {
@@ -752,6 +753,7 @@ local function startWizard(existingRuleIndex)
       elseName = "",
       elseArgs = "",
       inputBuffer = "",
+      listScroll = 0,
     }
   end
 end
@@ -797,6 +799,61 @@ end
 --------------------------------------------------------------------
 -- terminal interactive TUI
 --------------------------------------------------------------------
+
+-- wizard steps that present a numbered, scrollable pick-list (entity,
+-- property, or action) rather than free text / a fixed menu
+local WIZARD_LIST_STEPS = { [2] = true, [3] = true, [6] = true, [7] = true, [10] = true, [11] = true }
+
+-- Draws a numbered option list from `startY` up to (excluding) `maxY`,
+-- with a trailing "type custom" entry, honoring wizardData.listScroll so
+-- lists longer than the available rows can be scrolled into view instead
+-- of silently cutting off past whatever fits on screen.
+-- formatFn(item) -> label, sublabel (sublabel may be nil)
+-- Returns the row just below whatever was drawn.
+local function drawWizardOptionList(startY, maxY, items, formatFn, customLabel)
+  local total = #items + 1 -- +1 for the trailing custom entry
+  local capacity = math.max(1, maxY - startY)
+  local maxScroll = math.max(0, total - capacity)
+  wizardData.listScroll = math.max(0, math.min(wizardData.listScroll or 0, maxScroll))
+  local scroll = wizardData.listScroll
+
+  local y = startY
+  if scroll > 0 then
+    term.setCursorPos(1, y)
+    term.setTextColor(colors.gray)
+    term.write(("-- %d more above (Up arrow) --"):format(scroll))
+    y = y + 1
+  end
+
+  local idx = scroll + 1
+  while y < maxY and idx <= total do
+    term.setCursorPos(1, y)
+    if idx <= #items then
+      term.setTextColor(colors.lime)
+      local label, sub = formatFn(items[idx])
+      term.write((" [%d] %s"):format(idx, label))
+      if sub then
+        term.setTextColor(colors.gray)
+        term.write(" " .. sub)
+      end
+    else
+      term.setTextColor(colors.yellow)
+      term.write((" [%d] %s"):format(idx, customLabel))
+    end
+    y = y + 1
+    idx = idx + 1
+  end
+
+  if idx <= total then
+    term.setCursorPos(1, y)
+    term.setTextColor(colors.gray)
+    term.write(("-- %d more below (Down arrow) --"):format(total - idx + 1))
+    y = y + 1
+  end
+
+  return y, total
+end
+
 local function redrawTerminal()
   local w, h = term.getSize()
   term.setBackgroundColor(colors.black)
@@ -919,24 +976,15 @@ local function redrawTerminal()
       term.write("Select Trigger Entity (Condition Subject):")
 
       local disco = getDiscoveredEntitiesList()
-      local y = 7
-      for idx, ent in ipairs(disco) do
-        if y >= 11 then break end
+      local promptY = h - 2
+      local _, total = drawWizardOptionList(7, promptY - 1, disco, function(ent)
         local k = entities[ent] and entities[ent].kind or "entity"
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.lime)
-        term.write((" [%d] %s"):format(idx, ent))
-        term.setTextColor(colors.gray)
-        term.write(" (" .. k .. ")")
-        y = y + 1
-      end
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] Type Custom Entity..."):format(#disco + 1))
+        return ent, "(" .. k .. ")"
+      end, "Type Custom Entity...")
 
-      term.setCursorPos(1, 13)
+      term.setCursorPos(1, promptY)
       term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(#disco + 1))
+      term.write(("Select [1-%d] or Type: "):format(total))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -948,28 +996,21 @@ local function redrawTerminal()
       term.write("Select Telemetry Field for " .. wizardData.triggerEnt .. ":")
 
       local props = getDiscoveredPropertiesFor(wizardData.triggerEnt)
-      local y = 7
+      local promptY = h - 2
+      local startY = 7
       if #props == 0 then
+        term.setCursorPos(1, startY)
         term.setTextColor(colors.gray)
         term.write("(no telemetry reported yet - type the field name manually)")
-        y = y + 1
+        startY = startY + 1
       end
-      for idx, p in ipairs(props) do
-        if y >= 11 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.lime)
-        term.write((" [%d] %s"):format(idx, p.name))
-        term.setTextColor(colors.gray)
-        term.write(" (live: " .. formatNum(p.val) .. ")")
-        y = y + 1
-      end
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] Type Custom Expression..."):format(#props + 1))
+      local _, total = drawWizardOptionList(startY, promptY - 1, props, function(p)
+        return p.name, "(live: " .. formatNum(p.val) .. ")"
+      end, "Type Custom Expression...")
 
-      term.setCursorPos(1, 13)
+      term.setCursorPos(1, promptY)
       term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(#props + 1))
+      term.write(("Select [1-%d] or Type: "):format(total))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1036,21 +1077,14 @@ local function redrawTerminal()
       term.write("Select Action Target Entity:")
 
       local disco = getDiscoveredEntitiesList()
-      local y = 7
-      for idx, ent in ipairs(disco) do
-        if y >= 11 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.lime)
-        term.write((" [%d] %s"):format(idx, ent))
-        y = y + 1
-      end
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] Type Custom Entity..."):format(#disco + 1))
+      local promptY = h - 2
+      local _, total = drawWizardOptionList(7, promptY - 1, disco, function(ent)
+        return ent, nil
+      end, "Type Custom Entity...")
 
-      term.setCursorPos(1, 13)
+      term.setCursorPos(1, promptY)
       term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(#disco + 1))
+      term.write(("Select [1-%d] or Type: "):format(total))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1062,26 +1096,21 @@ local function redrawTerminal()
       term.write("Select Action Method for " .. wizardData.actionEntity .. ":")
 
       local acts = getDiscoveredActionsFor(wizardData.actionEntity)
-      local y = 7
+      local promptY = h - 2
+      local startY = 7
       if #acts == 0 then
+        term.setCursorPos(1, startY)
         term.setTextColor(colors.gray)
         term.write("(no actions reported yet - type the action name manually)")
-        y = y + 1
+        startY = startY + 1
       end
-      for idx, act in ipairs(acts) do
-        if y >= 11 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.lime)
-        term.write((" [%d] %s"):format(idx, act))
-        y = y + 1
-      end
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] Type Custom Action..."):format(#acts + 1))
+      local _, total = drawWizardOptionList(startY, promptY - 1, acts, function(act)
+        return act, nil
+      end, "Type Custom Action...")
 
-      term.setCursorPos(1, 13)
+      term.setCursorPos(1, promptY)
       term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(#acts + 1))
+      term.write(("Select [1-%d] or Type: "):format(total))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1129,21 +1158,14 @@ local function redrawTerminal()
       term.write("Else Action Target Entity:")
 
       local disco = getDiscoveredEntitiesList()
-      local y = 7
-      for idx, ent in ipairs(disco) do
-        if y >= 11 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.lime)
-        term.write((" [%d] %s"):format(idx, ent))
-        y = y + 1
-      end
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] Type Custom Entity..."):format(#disco + 1))
+      local promptY = h - 2
+      local _, total = drawWizardOptionList(7, promptY - 1, disco, function(ent)
+        return ent, nil
+      end, "Type Custom Entity...")
 
-      term.setCursorPos(1, 13)
+      term.setCursorPos(1, promptY)
       term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(#disco + 1))
+      term.write(("Select [1-%d] or Type: "):format(total))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1155,26 +1177,21 @@ local function redrawTerminal()
       term.write("Else Action Name for " .. wizardData.elseEntity .. ":")
 
       local acts = getDiscoveredActionsFor(wizardData.elseEntity)
-      local y = 7
+      local promptY = h - 2
+      local startY = 7
       if #acts == 0 then
+        term.setCursorPos(1, startY)
         term.setTextColor(colors.gray)
         term.write("(no actions reported yet - type the action name manually)")
-        y = y + 1
+        startY = startY + 1
       end
-      for idx, act in ipairs(acts) do
-        if y >= 11 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.lime)
-        term.write((" [%d] %s"):format(idx, act))
-        y = y + 1
-      end
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] Type Custom Action..."):format(#acts + 1))
+      local _, total = drawWizardOptionList(startY, promptY - 1, acts, function(act)
+        return act, nil
+      end, "Type Custom Action...")
 
-      term.setCursorPos(1, 13)
+      term.setCursorPos(1, promptY)
       term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(#acts + 1))
+      term.write(("Select [1-%d] or Type: "):format(total))
       term.setTextColor(colors.white)
       term.write(wizardData.inputBuffer .. "_")
 
@@ -1310,7 +1327,9 @@ local function redrawTerminal()
   term.setTextColor(colors.white)
 
   if viewMode == "WIZARD" then
-    local ctrlStr = " [Enter]Next Step | [Esc]Cancel Wizard"
+    local ctrlStr = WIZARD_LIST_STEPS[wizardData and wizardData.step]
+      and " [Up/Down]Scroll List | [Enter]Next Step | [Esc]Cancel"
+      or " [Enter]Next Step | [Esc]Cancel Wizard"
     term.write(ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr)))
   else
     local ctrlStr = " [N]New | [E]Edit | [D]Delete | [Space]Toggle | [T]Test | [Tab]View"
@@ -1321,6 +1340,7 @@ end
 local function handleWizardInput(val)
   if not wizardData then return end
   local step = wizardData.step
+  wizardData.listScroll = 0 -- fresh list view whenever we move to a new step
 
   if step == 1 then
     wizardData.name = val
@@ -1454,6 +1474,18 @@ local function handleTerminalKey(ev)
     elseif key == keys.backspace then
       if wizardData and #wizardData.inputBuffer > 0 then
         wizardData.inputBuffer = wizardData.inputBuffer:sub(1, -2)
+        redrawTerminal()
+      end
+
+    elseif key == keys.up then
+      if wizardData and WIZARD_LIST_STEPS[wizardData.step] then
+        wizardData.listScroll = math.max(0, (wizardData.listScroll or 0) - 1)
+        redrawTerminal()
+      end
+
+    elseif key == keys.down then
+      if wizardData and WIZARD_LIST_STEPS[wizardData.step] then
+        wizardData.listScroll = (wizardData.listScroll or 0) + 1 -- clamped on next draw
         redrawTerminal()
       end
 
