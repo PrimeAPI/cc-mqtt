@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v16 | commit ee35565 | built 2026-07-25T13:16:21Z
+-- cc-mqtt provider.lua | release v17 | commit ba916c7 | built 2026-07-25T17:42:35Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
@@ -1656,8 +1656,16 @@ function Screen.new(dev, opts)
   -- the end of a redraw blits the finished frame to hardware in one shot,
   -- so the device only ever shows complete frames, never the in-between
   -- clear.
+  -- window.create() needs an actual terminal-redirect object as its
+  -- parent - a wrapped monitor or another window qualifies, but the
+  -- `term` global itself is the multiplexer table, not one, and
+  -- CC:Tweaked refuses it at runtime ("term is not a recommended window
+  -- parent, try term.current() instead"). term.current() resolves it to
+  -- the real redirect target; anything else (monitor, window) is passed
+  -- through unchanged.
+  local winParent = (realDev == term) and term.current() or realDev
   local w, h = realDev.getSize()
-  dev = window.create(realDev, 1, 1, w, h, false)
+  dev = window.create(winParent, 1, 1, w, h, false)
 
   local self = { dev = realDev }
 
