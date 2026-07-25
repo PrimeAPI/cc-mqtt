@@ -1,4 +1,4 @@
--- cc-mqtt subscriber.lua | release v21 | commit 364a4ca | built 2026-07-25T20:04:13Z
+-- cc-mqtt subscriber.lua | release v22 | commit 49ce801 | built 2026-07-25T21:07:56Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -1289,7 +1289,7 @@ local function subscribe()
   -- almost certainly why data kept going stale even after findBroker()
   -- itself was guarded elsewhere. send() already falls back to
   -- findBroker() if broker is somehow still unknown.
-  send({ type = "subscribe", name = cfg.name, patterns = { "#" }, version = updater.currentVersion })
+  send({ type = "subscribe", kind = "subscriber", name = cfg.name, patterns = { "#" }, version = updater.currentVersion })
 end
 
 local function requestRegistry() send({ type = "registry" }) end
