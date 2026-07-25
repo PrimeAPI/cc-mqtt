@@ -196,6 +196,29 @@ function Updater.new(opts)
     nextCheckAt = os.clock() + (self.status == "check failed" and FAILURE_RETRY or updateTick)
   end
 
+  -- CC:Tweaked's http API has no way to explicitly cancel/close an
+  -- in-flight request from Lua - when this module's own watchdog gives up
+  -- on one, the underlying connection (if CC:Tweaked is even still holding
+  -- one open) can't be told to stop. Observed in practice: a check that
+  -- worked instantly earlier in a session starts hanging later in that
+  -- SAME session, on the same host, after several other checks have
+  -- already timed out - consistent with connections leaking rather than
+  -- actually being freed. A reboot is a guaranteed clean slate (fresh
+  -- network stack, no accumulated state) where nothing else in this
+  -- module can be, so a run of consecutive full-check failures reboots
+  -- rather than continuing to retry in a session that may be degraded.
+  local consecutiveFailures = 0
+  local MAX_CONSECUTIVE_FAILURES = 3
+
+  local function recordFailure()
+    consecutiveFailures = consecutiveFailures + 1
+    if consecutiveFailures >= MAX_CONSECUTIVE_FAILURES then
+      debugPrint("%d consecutive full check failures - rebooting for a clean network state", consecutiveFailures)
+      sleep(1)
+      os.reboot()
+    end
+  end
+
   -- For a terminal/monitor countdown display, e.g. "Update: 42s".
   function self.secondsUntilNextCheck()
     return math.max(0, math.floor(nextCheckAt - os.clock()))
@@ -248,8 +271,17 @@ function Updater.new(opts)
       :format(repoOwner, repoName, cacheBust())
   end
 
-  local function startFallback()
-    state = { stage = "fallback", url = fallbackUrl() }
+  -- knownTagName: carried forward from the release stage when available
+  -- (i.e. whenever we're falling back FROM "asset", not from "release"
+  -- itself never having parsed at all). Fixed a real bug: without this,
+  -- a successful fallback wrote an ETag/content-hash as the version -
+  -- NOT the actual release tag - so the next check's tag_name comparison
+  -- would never match it, and "new version detected" would fire again
+  -- forever even after a fully successful update. Now a fallback that
+  -- completes while we already know the true tag writes THAT instead,
+  -- which is what every future check actually compares against.
+  local function startFallback(knownTagName)
+    state = { stage = "fallback", url = fallbackUrl(), tagName = knownTagName }
     stateStartedAt = os.clock()
     httpRequest(state.url, DOWNLOAD_HEADERS, REQUEST_TIMEOUT)
   end
@@ -269,11 +301,12 @@ function Updater.new(opts)
     local elapsed = stateStartedAt and (os.clock() - stateStartedAt) or -1
     if stage == "release" or stage == "asset" then
       debugPrint("%s check failed after %.1fs (%s) - falling back to raw content", stage, elapsed, reason)
-      startFallback()
+      startFallback(stage == "asset" and state.tagName or nil)
     else
       self.status = "check failed"
       debugPrint("%s check failed after %.1fs: %s", stage, elapsed, reason)
       state = nil
+      recordFailure()
       scheduleNext()
     end
   end
@@ -361,6 +394,7 @@ function Updater.new(opts)
       if tagName == self.currentVersion then
         self.status = "up to date"
         state = nil
+        consecutiveFailures = 0
         scheduleNext()
         return
       end
@@ -396,12 +430,12 @@ function Updater.new(opts)
         -- usually an actual error page/JSON from GitHub (rate limit,
         -- permission, ...) worth seeing verbatim rather than guessing at.
         debugPrint("asset response looked invalid, falling back to raw content. Body was: %s", tostring(code))
-        startFallback()
+        startFallback(state.tagName)
         return
       end
       if state.checksum and rollingHash(code) ~= state.checksum then
         debugPrint("asset checksum mismatch (got %s, expected %s), falling back to raw content", rollingHash(code), state.checksum)
-        startFallback()
+        startFallback(state.tagName)
         return
       end
       local tagName = state.tagName
@@ -420,12 +454,23 @@ function Updater.new(opts)
         scheduleNext()
         return
       end
-      local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
-      local version = etag and etag:match("(%x%x%x%x%x%x%x+)")
-      if not version then version = rollingHash(code) end
+      -- Prefer the real release tag when we already know it (carried
+      -- forward from the release stage - see startFallback()) over an
+      -- ETag/content-hash: whatever gets written here is what every
+      -- FUTURE check's tag_name comparison has to match, and only the
+      -- real tag ever will. We also already know it differs from
+      -- currentVersion (that's why we got here), so no need to re-check.
+      -- Only fall back to deriving something when we truly never learned
+      -- the real tag (the release response itself failed to parse).
+      local version = state.tagName
+      if not version then
+        local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
+        version = (etag and etag:match("(%x%x%x%x%x%x%x+)")) or rollingHash(code)
+      end
       state = nil
       if version == self.currentVersion then
         self.status = "up to date"
+        consecutiveFailures = 0
         scheduleNext()
       else
         self.status = "updating"
@@ -500,8 +545,15 @@ function Updater.new(opts)
     fbRes.close()
     debugPrint("fallback body: %d bytes", code and #code or 0)
     if type(code) ~= "string" or #code < 100 then return false, "check failed" end
-    local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
-    local version = etag and etag:match("(%x%x%x%x%x%x%x+)") or rollingHash(code)
+    -- Prefer the real release tag when already known (see the async
+    -- path's identical fallback-stage comment for why) over an
+    -- ETag/content-hash - only the real tag will ever match a future
+    -- check's tag_name comparison.
+    local version = tagName
+    if not version then
+      local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
+      version = (etag and etag:match("(%x%x%x%x%x%x%x+)")) or rollingHash(code)
+    end
     if version == self.currentVersion then return false, "up to date" end
     applyUpdate(version, code) -- reboots, does not return
   end
