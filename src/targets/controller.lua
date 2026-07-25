@@ -84,10 +84,28 @@ end
 --------------------------------------------------------------------
 -- automations configuration management
 --------------------------------------------------------------------
+-- rule._status/_lastEval/_execCount/_lastRun/_lastState/_lastErr (see
+-- evaluateRule()) are all runtime scratch state recomputed every
+-- EVAL_TICK, not part of a rule's actual saved definition. Persisting
+-- them carried os.clock()-relative timestamps (_lastRun, _lastEval)
+-- across a reboot - os.clock() itself restarts near 0 on every boot, so
+-- ruleNextRunLabel()'s "minInt - (now() - _lastRun)" countdown went
+-- wildly wrong (tens of thousands of seconds) for any "continuous" rule
+-- until it next fired for real and overwrote the stale value.
+local function withoutRuntimeFields(rule)
+  local clean = {}
+  for k, v in pairs(rule) do
+    if k:sub(1, 1) ~= "_" then clean[k] = v end
+  end
+  return clean
+end
+
 local function saveConfig()
+  local cleanRules = {}
+  for i, r in ipairs(rules) do cleanRules[i] = withoutRuntimeFields(r) end
   local f = fs.open(CONFIG_FILE .. ".tmp", "w")
   if f then
-    f.write(textutils.serialize({ rules = rules }))
+    f.write(textutils.serialize({ rules = cleanRules }))
     f.close()
     if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
     fs.move(CONFIG_FILE .. ".tmp", CONFIG_FILE)
@@ -103,7 +121,12 @@ local function loadConfig()
       f.close()
       local parsed = textutils.unserialize(raw)
       if parsed and parsed.rules then
-        rules = parsed.rules
+        -- Defensively strip runtime fields even from a config saved
+        -- before saveConfig() stopped writing them - guarantees every
+        -- countdown/status starts clean on this boot regardless of
+        -- what's already on disk from an earlier version.
+        rules = {}
+        for i, r in ipairs(parsed.rules) do rules[i] = withoutRuntimeFields(r) end
         return
       end
     end
