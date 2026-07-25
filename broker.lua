@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release v26 | commit 28ef560 | built 2026-07-25T23:28:31Z
+-- cc-mqtt broker.lua | release v27 | commit 8bdd4a4 | built 2026-07-25T23:34:41Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -233,6 +233,17 @@ function Updater.new(opts)
       self.pendingTag, self.updateDetectedAt = tagName, os.epoch("utc")
     end
   end
+
+  -- os.epoch("utc") of the last time a check against GitHub actually
+  -- resolved a definitive answer (current tag vs. latest tag), whether
+  -- that came from the "release" stage or a "fallback" stage that still
+  -- learned the real tag - as opposed to merely being attempted. A
+  -- rate-limited/failed/timed-out check does NOT move this. In-memory
+  -- only, like updateDetectedAt above - a routine check reoccurs every
+  -- updateTick regardless of a reboot, so nothing is lost by not
+  -- persisting it. Used by a status monitor to show "last successful
+  -- check" alongside self.secondsUntilNextCheck()'s "next check" timer.
+  self.lastCheckedAt = nil
 
   -- Short status word for a terminal/monitor header line, plus a full
   -- message printed to the console log. Checks used to fail completely
@@ -587,6 +598,7 @@ function Updater.new(opts)
         return
       end
       notePendingTag(tagName)
+      self.lastCheckedAt = os.epoch("utc")
       if tagName == self.currentVersion then
         self.status = "up to date"
         state = nil
@@ -660,6 +672,7 @@ function Updater.new(opts)
       -- stage may simply succeed next time.
       local version = state.tagName
       state = nil
+      if version then self.lastCheckedAt = os.epoch("utc") end
       if not version then
         self.status = "check failed"
         debugPrint("fallback content fetched, but no real release tag was ever learned - not applying (would require a made-up version), will retry")
@@ -1737,6 +1750,10 @@ local function drawStatus(screen)
   stat("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
     stats.maxIterMs > 500 and colors.red or colors.lime)
   stat("Update", ("%s (v:%s)"):format(updater.status, updater.getShortVer(updater.currentVersion)))
+  stat("Next Check", Util.formatDuration(updater.secondsUntilNextCheck()))
+  stat("Last Checked", updater.lastCheckedAt
+    and (Util.formatDuration((os.epoch("utc") - updater.lastCheckedAt) / 1000) .. " ago")
+    or "never")
   -- only shown while an update is actually pending (see updater.lua's
   -- notePendingTag) - clears itself back to nothing once applied, since
   -- the broker reboots right after anyway
