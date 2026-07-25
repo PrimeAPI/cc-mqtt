@@ -630,7 +630,7 @@ local function drawList(screen)
   -- so anything appended at the end just silently fell off-screen. Put the
   -- console toggle first so it's always visible - screen.row() clips to
   -- width as a backstop either way.
-  screen.row(h, " [H]ide  [Enter/C]Inspect  [D]elOff  [P]urgeAll", colors.white, colors.blue)
+  screen.row(h, " [H]ide  [Enter/C]Inspect  [D]elOff  [P]urge  [U]pd", colors.white, colors.blue)
 end
 
 local function drawInspect(screen)
@@ -748,6 +748,14 @@ local function listOnKey(screen, ev)
 
   elseif key == keys.h then
     screen.enterScreensaver()
+
+  elseif key == keys.u then
+    -- checkNow() itself no-ops if a check is already in flight (state ~=
+    -- nil) - the banner reflects that rather than pretending a fresh
+    -- check was actually kicked off, so mashing U doesn't look broken.
+    local already = updater.status == "checking"
+    updater.safeCall(updater.checkNow)
+    screen.banner(already and "Update check already in progress" or "Checking for updates now...", false)
   end
 end
 
