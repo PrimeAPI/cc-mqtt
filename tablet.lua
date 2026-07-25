@@ -1,4 +1,4 @@
--- cc-mqtt tablet.lua | release v13 | commit d1ed07b | built 2026-07-25T02:03:24Z
+-- cc-mqtt tablet.lua | release dev | commit fc33b95 | built 2026-07-25T02:15:07Z
 -- Generated from src/targets/tablet.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cc-mqtt tablet controller & dashboard for pocket computers
