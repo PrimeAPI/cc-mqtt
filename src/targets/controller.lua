@@ -1579,6 +1579,15 @@ local function handleMessage(srcId, msg)
       version = updater.currentVersion
     }, PROTOCOL)
 
+  elseif msg.type == "ack" then
+    -- The broker piggybacks fleet update info on every subscribe ack (see
+    -- broker.lua's relayInfoForKind()) instead of this controller ever
+    -- querying GitHub's rate-limited releases/latest itself.
+    updater.safeCall(updater.noteRelaySeen)
+    if msg.update then
+      updater.safeCall(updater.applyFromRelay, msg.update.tagName, msg.update.assetUrl, msg.update.checksum)
+    end
+
   elseif msg.type == "data" then
     local entName = msg.entity or (msg.topic and msg.topic:match("^[^/]+/([^/]+)"))
     if entName then

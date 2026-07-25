@@ -32,6 +32,12 @@ local STALE_AFTER  = 8    -- s without data -> panel shows an error
 local STATUS_ROWS  = 1    -- top row(s) reserved for the status bar
 local REG_INTERVAL = 10
 local SUB_INTERVAL = 15
+-- Ring-buffer depth for each numeric field's history (see the "data"
+-- handler below and sparkline()/forecast rendering in renderPanel) - 180
+-- samples is ~6 minutes at a provider's default 2s publish interval, long
+-- enough for a meaningful trend/graph while staying a small, fixed memory
+-- cost regardless of how long a subscriber has been running.
+local HISTORY_MAX  = 180
 
 local args = { ... }
 
@@ -181,12 +187,39 @@ local function handleNet(msg, senderId)
     subscribe()
     requestRegistry()
 
+  elseif msg.type == "ack" then
+    -- The broker piggybacks fleet update info on every subscribe ack (see
+    -- broker.lua's relayInfoForKind()) instead of this subscriber ever
+    -- querying GitHub's rate-limited releases/latest itself.
+    updater.safeCall(updater.noteRelaySeen)
+    if msg.update then
+      updater.safeCall(updater.applyFromRelay, msg.update.tagName, msg.update.assetUrl, msg.update.checksum)
+    end
+
   elseif msg.type == "data" and msg.entity then
     ents[msg.entity] = ents[msg.entity] or {}
     local e = ents[msg.entity]
     e.data, e.lastSeen, e.stale = msg.data, os.clock(), false
     if msg.topic then e.kind = msg.topic:match("^([^/]+)/") or e.kind end
     if msg.actions and #msg.actions > 0 then e.actions = msg.actions end
+
+    -- Ring-buffer every numeric field for forecast/sparkline rendering
+    -- (see renderPanel) - fed here rather than only when a panel actually
+    -- displays it, so history keeps accumulating for fields a panel isn't
+    -- currently drawing (e.g. while its setup screen is open) and a graph
+    -- doesn't come up empty the moment it's toggled on.
+    if type(msg.data) == "table" then
+      e.history = e.history or {}
+      local t = os.clock()
+      for k, v in pairs(msg.data) do
+        if type(v) == "number" and k:sub(1, 1) ~= "_" then
+          local h = e.history[k]
+          if not h then h = {}; e.history[k] = h end
+          h[#h + 1] = { t = t, v = v }
+          if #h > HISTORY_MAX then table.remove(h, 1) end
+        end
+      end
+    end
 
   elseif msg.type == "registry" and msg.entities then
     for name, info in pairs(msg.entities) do
@@ -347,6 +380,121 @@ local function gaugeRow(win, y, w, label, frac, invert)
   return y + 1
 end
 
+-- plain left-aligned text row, no label/value split - used for the
+-- forecast ETA line under a gauge (see forecastText below).
+local function textRow(win, y, w, text, col)
+  win.setCursorPos(1, y)
+  win.setBackgroundColor(colors.black)
+  win.setTextColor(col or colors.gray)
+  win.write((text or ""):sub(1, w))
+  return y + 1
+end
+
+--------------------------------------------------------------------
+-- forecast (ETA) & trend sparkline - both driven by the per-field
+-- history ring buffer built in handleNet's "data" branch (see
+-- HISTORY_MAX/e.history above)
+--------------------------------------------------------------------
+-- A rate needs a few seconds of spread between its oldest and newest
+-- sample, or two back-to-back publishes a tick apart would read as a
+-- wildly exaggerated instantaneous rate.
+local MIN_TREND_SPAN = 4
+local function trendRate(history)
+  if not history or #history < 2 then return nil end
+  local oldest, newest = history[1], history[#history]
+  local dt = newest.t - oldest.t
+  if dt < MIN_TREND_SPAN then return nil end
+  return (newest.v - oldest.v) / dt
+end
+
+-- ETA text ("full in 12m30s" / "empty in 4m02s") for a gauge-type field.
+-- Gauge values are already 0..1 fractions (see gaugeRow's own numeric
+-- pass-through above), so history samples for a gauge field double as
+-- fraction/second rate math directly with no rescaling. A flat trend or
+-- a value already at its bound in the direction it's heading returns
+-- nil - nothing meaningful to project.
+local MIN_TREND_RATE = 0.0005 -- fraction/sec
+local function forecastText(history, curFrac)
+  local rate = trendRate(history)
+  if not rate or math.abs(rate) < MIN_TREND_RATE then return nil end
+  curFrac = math.max(0, math.min(1, curFrac or 0))
+  if rate > 0 then
+    if curFrac >= 1 then return nil end
+    return "-> full in " .. Util.formatDuration((1 - curFrac) / rate)
+  else
+    if curFrac <= 0 then return nil end
+    return "-> empty in " .. Util.formatDuration(curFrac / -rate)
+  end
+end
+
+-- Compact multi-row bar history: each column is one (bucket-averaged, if
+-- there's more history than columns) sample, right-aligned so the newest
+-- sample is always the rightmost column, height auto-scaled between the
+-- visible window's own observed min/max so a trend reads clearly
+-- regardless of the field's absolute unit range - a 62%->65% creep and a
+-- 6.8G->6.9G creep both fill the same visual range. Drawn with the same
+-- background-colored blank-cell technique gaugeRow uses for its fill bar,
+-- just column-by-column and bottom-up instead of one horizontal run.
+local SPARK_ROWS = 3
+local function sparkline(win, y, w, history, gaugeStyle, invert)
+  for r = 1, SPARK_ROWS do
+    win.setCursorPos(1, y + r - 1)
+    win.setBackgroundColor(colors.black)
+    win.write(string.rep(" ", w))
+  end
+
+  if not history or #history == 0 then
+    win.setCursorPos(1, y)
+    win.setTextColor(colors.gray)
+    win.write(("(collecting history...)"):sub(1, w))
+    return y + SPARK_ROWS
+  end
+
+  local cols = math.max(1, w)
+  local n = #history
+  local values = {}
+  if n <= cols then
+    for i = 1, n do values[i] = history[i].v end
+  else
+    for c = 1, cols do
+      local lo = math.floor((c - 1) * n / cols) + 1
+      local hi = math.max(lo, math.floor(c * n / cols))
+      local sum, count = 0, 0
+      for i = lo, hi do sum = sum + history[i].v; count = count + 1 end
+      values[c] = sum / count
+    end
+  end
+
+  local vmin, vmax = values[1], values[1]
+  for _, v in ipairs(values) do
+    if v < vmin then vmin = v end
+    if v > vmax then vmax = v end
+  end
+  local span = vmax - vmin
+  if span < 1e-9 then span = 1 end -- flat history: draw a flush single-height baseline, not a divide-by-zero
+
+  local startX = math.max(1, w - #values + 1)
+  for c, v in ipairs(values) do
+    local frac = (v - vmin) / span
+    local col
+    if gaugeStyle then
+      col = invert and ((frac > 0.5) and colors.red or (frac > 0.25 and colors.yellow or colors.lime))
+                    or ((frac < 0.25) and colors.red or (frac < 0.5 and colors.yellow or colors.lime))
+    else
+      col = colors.cyan
+    end
+    local filledRows = math.max(1, math.floor(frac * SPARK_ROWS + 0.5))
+    local x = startX + c - 1
+    win.setBackgroundColor(col)
+    for r = SPARK_ROWS - filledRows + 1, SPARK_ROWS do
+      win.setCursorPos(x, y + r - 1)
+      win.write(" ")
+    end
+  end
+  win.setBackgroundColor(colors.black)
+  return y + SPARK_ROWS
+end
+
 local function renderPanel(win, item)
   local name = item.entity
   win.setVisible(false)
@@ -422,6 +570,7 @@ local function renderPanel(win, item)
         local val, err = evalCalc(cf.expr, d)
         fieldList[#fieldList + 1] = {
           key = cf.key, label = cf.label, type = cf.type or "number", invert = cf.invert,
+          forecast = cf.forecast, graph = cf.graph,
           _calcVal = val, _calcErr = err ~= nil,
         }
       else
@@ -429,7 +578,15 @@ local function renderPanel(win, item)
         for _, mf in ipairs((meta and meta.fields) or autoFields(d)) do
           if mf.key == cf.key then def = mf break end
         end
-        fieldList[#fieldList + 1] = def or { key = cf.key, label = cf.key, type = "number" }
+        def = def or { key = cf.key, label = cf.key, type = "number" }
+        -- Copied rather than reused directly - def may be the actual
+        -- shared meta.fields entry, and forecast/graph are per-PANEL
+        -- opt-ins (see fieldsScreen's 'f'/'g' toggles), not part of the
+        -- entity's own announced field metadata.
+        fieldList[#fieldList + 1] = {
+          key = def.key, label = def.label, type = def.type, invert = def.invert,
+          forecast = cf.forecast, graph = cf.graph,
+        }
       end
     end
   else
@@ -445,6 +602,13 @@ local function renderPanel(win, item)
     elseif v ~= nil then
       if f.type == "gauge" then
         y = gaugeRow(win, y, w, f.label, v, f.invert)
+        -- forecast only ever offered (see fieldsScreen's 'f' toggle) for
+        -- gauge-type fields, but re-checked here too in case a field's
+        -- announced type changed since this panel's config was saved
+        if f.forecast and f.type == "gauge" and y <= h then
+          local fc = forecastText(ent.history and ent.history[f.key], v)
+          if fc then y = textRow(win, y, w, "  " .. fc, colors.gray) end
+        end
       else
         local text, col = nil, colors.white
         if f.type == "energy" then
@@ -467,6 +631,9 @@ local function renderPanel(win, item)
         end
         row(win, y, w, f.label, text, col)
         y = y + 1
+      end
+      if f.graph and type(v) == "number" and y <= h then
+        y = sparkline(win, y, w, ent.history and ent.history[f.key], f.type == "gauge", f.invert)
       end
     end
   end
@@ -1185,6 +1352,46 @@ local function fieldsScreen(item)
     item.fields[#item.fields + 1] = { source = "meta", key = f.key }
   end
 
+  -- forecast/graph are per-PANEL opt-ins stored on the item.fields entry
+  -- itself (see renderPanel's fieldList build, which copies them onto
+  -- what actually gets drawn) - read-only lookup for display, and a
+  -- find-or-create version for the 'f'/'g' toggles below, since toggling
+  -- an unchecked-but-implicitly-shown field has to first make it explicit.
+  local function findMetaEntry(f)
+    if not item.fields then return nil end
+    for _, cf in ipairs(item.fields) do
+      if cf.source == "meta" and cf.key == f.key then return cf end
+    end
+    return nil
+  end
+
+  local function findOrCreateMetaEntry(f)
+    ensureExplicit()
+    local cf = findMetaEntry(f)
+    if cf then return cf end
+    cf = { source = "meta", key = f.key }
+    item.fields[#item.fields + 1] = cf
+    return cf
+  end
+
+  -- forecast only makes sense for a gauge (0..1 fraction) field - offering
+  -- it on a plain number/energy/rate/text field would have nothing
+  -- meaningful to project against (no "full"/"empty" bound)
+  local function toggleForecast(r)
+    if r.f.type ~= "gauge" then return end
+    local cf = r.kind == "meta" and findOrCreateMetaEntry(r.f) or r.f
+    cf.forecast = not cf.forecast or nil
+  end
+
+  -- graph works for any numeric field type - only text (non-numeric)
+  -- fields are excluded, since the history ring buffer never stores
+  -- non-numeric samples for them in the first place (see handleNet)
+  local function toggleGraph(r)
+    if r.f.type == "text" then return end
+    local cf = r.kind == "meta" and findOrCreateMetaEntry(r.f) or r.f
+    cf.graph = not cf.graph or nil
+  end
+
   setupDraw = function(scr)
     local w, h = scr.size()
     scr.row(1, "fields: " .. entityTitle(item.entity), colors.yellow)
@@ -1201,9 +1408,12 @@ local function fieldsScreen(item)
       local line
       if r.kind == "meta" then
         local mark = isChecked(r.f) and "[x]" or "[ ]"
-        line = ("%s %s (%s)"):format(mark, r.f.label or r.f.key, r.f.type or "number")
+        local cf = findMetaEntry(r.f)
+        local flags = (cf and cf.forecast and " [fcst]" or "") .. (cf and cf.graph and " [graph]" or "")
+        line = ("%s %s (%s)%s"):format(mark, r.f.label or r.f.key, r.f.type or "number", flags)
       else
-        line = ("[calc] %s = %s"):format(r.f.label or r.f.key, r.f.expr)
+        local flags = (r.f.forecast and " [fcst]" or "") .. (r.f.graph and " [graph]" or "")
+        line = ("[calc] %s = %s%s"):format(r.f.label or r.f.key, r.f.expr, flags)
       end
       if idx == selIdx then
         scr.row(2 + i, line, colors.black, colors.yellow)
@@ -1213,7 +1423,7 @@ local function fieldsScreen(item)
     end
     if #list == 0 then scr.row(4, "no fields known yet - waiting for data...", colors.gray) end
     scr.row(h - 2, ("mode: %s"):format(item.fields and "custom selection" or "showing all (default)"), colors.lightGray)
-    scr.row(h - 1, "space:toggle c:+calc x:delcalc r:reset", colors.lightGray)
+    scr.row(h - 1, "spc:toggle f:fcst g:graph c:+calc x:del r:reset", colors.lightGray)
     scr.row(h, "enter/b: back", colors.lightGray)
   end
   local function drawTerm() setupRedraw() end
@@ -1242,6 +1452,14 @@ local function fieldsScreen(item)
       local r = list[selIdx]
       if c == " " and r and r.kind == "meta" then
         toggleMeta(r.f)
+        saveConfig()
+        drawTerm() drawMon()
+      elseif c == "f" and r then
+        toggleForecast(r)
+        saveConfig()
+        drawTerm() drawMon()
+      elseif c == "g" and r then
+        toggleGraph(r)
         saveConfig()
         drawTerm() drawMon()
       elseif c == "c" then

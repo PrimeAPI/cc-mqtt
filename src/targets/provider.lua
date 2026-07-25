@@ -1519,6 +1519,18 @@ while true do
         if ev[2] then broker = ev[2] end
         announceAll()
 
+      elseif msg.type == "ack" then
+        -- The broker piggybacks fleet update info on every announce ack
+        -- (see broker.lua's relayInfoForKind()) instead of this provider
+        -- ever querying GitHub's rate-limited releases/latest itself -
+        -- noteRelaySeen() alone (even with no msg.update, i.e. "nothing
+        -- new") is enough to suppress this provider's own direct check,
+        -- see updater.tick()'s RELAY_GRACE window.
+        updater.safeCall(updater.noteRelaySeen)
+        if msg.update then
+          updater.safeCall(updater.applyFromRelay, msg.update.tagName, msg.update.assetUrl, msg.update.checksum)
+        end
+
       elseif msg.type == "command" then
         handleCommand(msg)
         -- Re-collect and publish telemetry for exactly the device that

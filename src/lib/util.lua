@@ -47,6 +47,20 @@ function Util.fmtUnit(n, unit, forceSign)
   return sign .. num .. " " .. prefix .. (unit or "")
 end
 
+-- Compact duration: 45 -> "45s", 750 -> "12m30s", 5400 -> "1h30m". Used for
+-- both "last seen Ns ago" style ages and forecast ETAs (see subscriber.lua's
+-- gauge-field forecast rendering), which is why hours are handled too -
+-- an ETA can run much longer than anything else in this codebase times.
+function Util.formatDuration(seconds)
+  if type(seconds) ~= "number" or seconds ~= seconds then return "?" end
+  seconds = math.max(0, math.floor(seconds))
+  if seconds < 60 then return seconds .. "s" end
+  if seconds < 3600 then
+    return ("%dm%02ds"):format(math.floor(seconds / 60), seconds % 60)
+  end
+  return ("%dh%02dm"):format(math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+end
+
 -- Sorted, de-duplicated keys across any number of tables - the
 -- "an entity might be known from live telemetry, the broker's registry,
 -- or both" merge every target with more than one entity cache needed at

@@ -131,7 +131,31 @@ local entMonScreen    = entMon and Monitor.new(entMon, { title = "cbus entities"
 -- updater module now (see nextCheckAt/scheduleNext in src/lib/updater.lua)
 -- - updater.tick(), called every main-loop iteration below, is the only
 -- thing needed to drive it.
-local updater = Updater.new({ scriptName = "broker.lua" })
+-- relayFor: the broker is the only computer in the fleet that checks
+-- GitHub's releases/latest directly on a routine schedule - every other
+-- target instead learns "vNN is out, here's your asset URL + checksum"
+-- from the broker's announce/subscribe ack (see relayInfoForKind() and
+-- its two call sites below) and suppresses its own direct polling while
+-- that keeps arriving (src/lib/updater.lua's RELAY_GRACE). This is what
+-- keeps the fleet under GitHub's 60-req/hour-per-IP limit regardless of
+-- how many providers/subscribers/controllers are running - they all share
+-- this server's one outbound IP.
+local RELAY_SCRIPTS = { "broker.lua", "provider.lua", "subscriber.lua", "controller.lua", "tablet.lua" }
+local updater = Updater.new({ scriptName = "broker.lua", relayFor = RELAY_SCRIPTS })
+
+-- Every entity kind maps 1:1 onto the script that produces it (see
+-- handle()'s "announce"/"subscribe" branches below for where kind comes
+-- from) - so the broker can look up relay info by kind without needing a
+-- separate scriptName field on the wire.
+local KIND_TO_SCRIPT = {
+  provider = "provider.lua", subscriber = "subscriber.lua",
+  controller = "controller.lua", tablet = "tablet.lua",
+}
+
+local function relayInfoForKind(kind)
+  local scriptName = KIND_TO_SCRIPT[kind]
+  return scriptName and updater.getRelayInfo(scriptName) or nil
+end
 
 local function now() return os.clock() end
 local bootTime = now()
@@ -761,7 +785,7 @@ local function handle(id, msg)
       lastSeen = now(),
       online = true,
     }
-    send(id, { type = "ack", of = "announce" })
+    send(id, { type = "ack", of = "announce", update = relayInfoForKind(msg.kind or "provider") })
 
   elseif msg.type == "publish" then
     if msg.entity then
@@ -803,7 +827,7 @@ local function handle(id, msg)
     -- which all send this same message shape - "subscriber" is only a
     -- fallback for an older client that predates the field existing.
     entities[name] = { id = id, kind = msg.kind or "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
-    send(id, { type = "ack", of = "subscribe" })
+    send(id, { type = "ack", of = "subscribe", update = relayInfoForKind(msg.kind or "subscriber") })
     for topic, m in pairs(retained) do
       for _, pat in ipairs(subs[id].patterns) do
         if topicMatches(pat, topic) then send(id, m) break end
