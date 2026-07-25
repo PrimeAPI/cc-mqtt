@@ -88,6 +88,7 @@ local stats = {
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 --[[@include lib/screen.lua as Screen]]
+--[[@include lib/util.lua as Util]]
 
 -- Each connected monitor gets its own double-buffered Screen (see
 -- src/lib/screen.lua) - views registered further down, once their draw
@@ -106,14 +107,6 @@ local debugMonScreen = debugMon and Screen.new(debugMon, {})
 -- - updater.tick(), called every main-loop iteration below, is the only
 -- thing needed to drive it.
 local updater = Updater.new({ scriptName = "broker.lua" })
-
--- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
--- inside the updater would fail with literally no visible trace, making it
--- indistinguishable from "nothing to do yet". This surfaces it instead.
-local function safeUpdaterCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then print("[Updater] internal error: " .. tostring(err)) end
-end
 
 local function now() return os.clock() end
 local bootTime = now()
@@ -197,15 +190,7 @@ local function sendCommand(entName, actionName, rawArgs)
   if not e.online then
     return false, "Entity '" .. tostring(entName) .. "' is offline"
   end
-  local parsedArgs = rawArgs
-  if rawArgs and rawArgs ~= "" then
-    if tonumber(rawArgs) then parsedArgs = tonumber(rawArgs)
-    elseif rawArgs:lower() == "true" then parsedArgs = true
-    elseif rawArgs:lower() == "false" then parsedArgs = false
-    end
-  else
-    parsedArgs = nil
-  end
+  local parsedArgs = Util.parseArg(rawArgs)
 
   send(e.id, {
     type = "command",
@@ -422,10 +407,7 @@ end
 --------------------------------------------------------------------
 
 local function sortedEntityNames()
-  local names = {}
-  for n in pairs(entities) do names[#names + 1] = n end
-  table.sort(names)
-  return names
+  return Util.sortedKeys(entities)
 end
 
 local function drawList(screen)
@@ -810,7 +792,7 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
-safeUpdaterCall(updater.checkNow)
+updater.safeCall(updater.checkNow)
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 
 termScreen.show("list")
@@ -853,12 +835,12 @@ while true do
     termScreen.handleEvent(ev)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
+    updater.safeCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
   -- Drives all update-check scheduling (routine checks, failure retries,
   -- stuck-request recovery) - see updater.tick()'s own comment.
-  safeUpdaterCall(updater.tick)
+  updater.safeCall(updater.tick)
 
   local t = now()
   if t >= nextTick then

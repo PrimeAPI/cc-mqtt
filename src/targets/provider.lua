@@ -980,6 +980,7 @@ end
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 --[[@include lib/screen.lua as Screen]]
+--[[@include lib/util.lua as Util]]
 
 -- Routine re-check cadence, retry-after-failure backoff, and the
 -- computer-ID stagger that keeps a whole fleet of computers from bursting
@@ -988,14 +989,6 @@ end
 -- - updater.tick(), called every main-loop iteration below, is the only
 -- thing needed to drive it.
 local updater = Updater.new({ scriptName = "provider.lua" })
-
--- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
--- inside the updater would fail with literally no visible trace, making it
--- indistinguishable from "nothing to do yet". This surfaces it instead.
-local function safeUpdaterCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then print("[Updater] internal error: " .. tostring(err)) end
-end
 
 -- Forward-declared: created below in the "interactive provider TUI"
 -- section, but handleCommand() (defined before that section) already
@@ -1155,15 +1148,7 @@ local function simulateAction(dev, actionName, rawArgs)
   local fn = dev.actions[actionName]
   if not fn then return false, "Action not found: " .. tostring(actionName) end
 
-  local parsedArgs = rawArgs
-  if rawArgs and rawArgs ~= "" then
-    if tonumber(rawArgs) then parsedArgs = tonumber(rawArgs)
-    elseif rawArgs:lower() == "true" then parsedArgs = true
-    elseif rawArgs:lower() == "false" then parsedArgs = false
-    end
-  else
-    parsedArgs = nil
-  end
+  local parsedArgs = Util.parseArg(rawArgs)
 
   local ok, res, err = pcall(fn, parsedArgs)
   if not ok then
@@ -1517,7 +1502,7 @@ end
 -- "broker_online" rednet handler), which already tolerates broker == nil
 -- throughout (see send()) - so nothing here blocks, and this fires
 -- unconditionally, broker or no broker.
-safeUpdaterCall(updater.checkNow)
+updater.safeCall(updater.checkNow)
 
 screen.show("list")
 screen.enterScreensaver()
@@ -1558,12 +1543,12 @@ while true do
     screen.banner("Peripheral change detected - reboot to rescan", true)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
+    updater.safeCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
   -- Drives all update-check scheduling (routine checks, failure retries,
   -- stuck-request recovery) - see updater.tick()'s own comment.
-  safeUpdaterCall(updater.tick)
+  updater.safeCall(updater.tick)
 
   local t = os.clock()
   if #devices > 0 and t >= nextPub then

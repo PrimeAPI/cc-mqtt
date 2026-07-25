@@ -10,6 +10,7 @@ local STALE_AFTER  = 8 -- s without update -> stale
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 --[[@include lib/screen.lua as Screen]]
+--[[@include lib/util.lua as Util]]
 
 local updater = Updater.new({ scriptName = "tablet.lua" })
 -- checkAndApplySync() reuses the exact same URL building / parsing /
@@ -146,17 +147,7 @@ local function getEntityActions(name)
 end
 
 local function getSortedEntities()
-  local sorted = {}
-  for n in pairs(registry) do sorted[#sorted + 1] = n end
-  for n in pairs(ents) do
-    if not registry[n] then
-      local found = false
-      for _, x in ipairs(sorted) do if x == n then found = true break end end
-      if not found then sorted[#sorted + 1] = n end
-    end
-  end
-  table.sort(sorted)
-  return sorted
+  return Util.sortedKeysMerged(registry, ents)
 end
 
 local function getEntityFields(name)
@@ -177,28 +168,6 @@ end
 --------------------------------------------------------------------
 -- formatting helpers
 --------------------------------------------------------------------
-local function si(n)
-  if type(n) ~= "number" then return tostring(n or "?") end
-  local a = math.abs(n)
-  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
-  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
-  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
-  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
-  return string.format("%.0f", n)
-end
-
-local function fmtUnit(n, unit)
-  if type(n) ~= "number" then return tostring(n or "?") end
-  local a, prefix = math.abs(n), ""
-  local v = n
-  if a >= 1e12 then v, prefix = n / 1e12, "T"
-  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
-  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
-  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
-  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
-  return num .. " " .. prefix .. (unit or "")
-end
-
 local function formatSmartValue(key, val)
   if type(val) == "number" then
     local kLower = key:lower()
@@ -209,18 +178,18 @@ local function formatSmartValue(key, val)
       local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
       return bar .. string.format(" %2d%%", pct), isDanger and colors.red or colors.lime
     elseif kLower:find("energy") or kLower:find("maxenergy") then
-      return fmtUnit(val, "FE"), colors.lime
+      return Util.fmtUnit(val, "FE"), colors.lime
     elseif kLower:find("input") or kLower:find("output") or kLower:find("net") or kLower:find("prod") then
       local s = val >= 0 and "+" or ""
-      return s .. fmtUnit(val, "FE/t"), (val >= 0 and colors.lime or colors.red)
+      return s .. Util.fmtUnit(val, "FE/t"), (val >= 0 and colors.lime or colors.red)
     elseif kLower:find("flow") or kLower:find("burn") or kLower:find("rate") then
-      return fmtUnit(val, "mB/t"), colors.yellow
+      return Util.fmtUnit(val, "mB/t"), colors.yellow
     elseif kLower:find("fluid") or kLower:find("steam") or kLower:find("coolant") or kLower:find("waste") or kLower:find("amount") then
-      return fmtUnit(val, "mB"), colors.cyan
+      return Util.fmtUnit(val, "mB"), colors.cyan
     elseif kLower:find("temp") then
       return string.format("%.1f K", val), (val > 1000 and colors.red or colors.yellow)
     else
-      return si(val), colors.white
+      return Util.si(val), colors.white
     end
   else
     local sVal = tostring(val or "?")
@@ -255,11 +224,9 @@ local wizardCustomAction = false -- true while INPUT_ARG is collecting args for 
 local animFrames      = { "O", "o", ".", "o" }
 local animIdx         = 1
 
-local function padLine(str, w)
-  str = tostring(str or "")
-  if #str > w then return str:sub(1, w) end
-  return str .. string.rep(" ", w - #str)
-end
+-- Identical to Screen.clipPad - kept under this target's own established
+-- name rather than rewriting its 18 call sites to Screen.clipPad.
+local padLine = Screen.clipPad
 
 -- Single source of truth for Inspect-screen row positions, shared by
 -- renderScreen and handleTouch so the two can never drift apart.
@@ -484,10 +451,7 @@ local function entitiesOnClick(screen, ev)
   local x, y = ev[3], ev[4]
   if tabBarClick(screen, x, y) then return end
 
-  local sorted = {}
-  for n in pairs(registry) do sorted[#sorted + 1] = n end
-  for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
-  table.sort(sorted)
+  local sorted = getSortedEntities()
   local rowIdx = y - 2
   if rowIdx >= 1 and rowIdx <= #sorted then
     inspectEntity = sorted[rowIdx]
@@ -619,11 +583,7 @@ local function inspectOnClick(screen, ev)
       term.setTextColor(colors.white)
       term.write("> ")
       local input = read()
-      local parsed = input
-      if not input or input == "" then parsed = nil
-      elseif tonumber(input) then parsed = tonumber(input)
-      elseif input:lower() == "true" then parsed = true
-      elseif input:lower() == "false" then parsed = false end
+      local parsed = Util.parseArg(input)
 
       sendCommand(inspectEntity, actName, parsed)
       screen.banner(("Sent '%s' to %s"):format(actName, inspectEntity), false)
@@ -1027,11 +987,7 @@ local function inputArgOnKey(screen, ev)
     inputBuffer = inputBuffer:sub(1, -2)
 
   elseif key == keys.enter then
-    local parsed = inputBuffer
-    if inputBuffer == "" then parsed = nil
-    elseif tonumber(inputBuffer) then parsed = tonumber(inputBuffer)
-    elseif inputBuffer:lower() == "true" then parsed = true
-    elseif inputBuffer:lower() == "false" then parsed = false end
+    local parsed = Util.parseArg(inputBuffer)
 
     if wizardCustomAction then
       cfg.quickActions[#cfg.quickActions + 1] = {

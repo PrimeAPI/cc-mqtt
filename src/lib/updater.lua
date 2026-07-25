@@ -152,6 +152,17 @@ end
 function Updater.new(opts)
   local self = {}
   self.getShortVer = getShortVer
+
+  -- Every caller wraps its own checkNow()/tick()/handleHttp() calls in
+  -- exactly this pcall - a bug inside the updater failing with literally
+  -- no visible trace (a bare pcall silently discards its error result)
+  -- is indistinguishable from "nothing to do yet". Centralized here
+  -- instead of copy-pasted once per target.
+  function self.safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then print("[Updater] internal error: " .. tostring(err)) end
+  end
+
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"

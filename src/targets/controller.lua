@@ -45,16 +45,9 @@ local termScreen
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 --[[@include lib/screen.lua as Screen]]
+--[[@include lib/util.lua as Util]]
 
 local updater = Updater.new({ scriptName = "controller.lua" })
-
--- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
--- inside the updater would fail with literally no visible trace, making it
--- indistinguishable from "nothing to do yet". This surfaces it instead.
-local function safeUpdaterCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then print("[Updater] internal error: " .. tostring(err)) end
-end
 
 --------------------------------------------------------------------
 -- helper utilities & formatting
@@ -194,15 +187,7 @@ end
 -- references even when the entity name itself isn't a valid Lua
 -- identifier (e.g. contains hyphens, like "fission-reactor")
 local function getKnownEntityNamesForEval()
-  local seen = {}
-  local list = {}
-  for n in pairs(state) do
-    if not seen[n] then list[#list + 1] = n; seen[n] = true end
-  end
-  for n in pairs(entities) do
-    if not seen[n] then list[#list + 1] = n; seen[n] = true end
-  end
-  return list
+  return Util.sortedKeysMerged(state, entities)
 end
 
 local function preprocessExpression(expr)
@@ -597,24 +582,7 @@ end
 -- interactive rule wizard logic
 --------------------------------------------------------------------
 local function getDiscoveredEntitiesList()
-  local list = {}
-  local seen = {}
-
-  for n in pairs(state) do
-    if not seen[n] then
-      list[#list + 1] = n
-      seen[n] = true
-    end
-  end
-  for n in pairs(entities) do
-    if not seen[n] then
-      list[#list + 1] = n
-      seen[n] = true
-    end
-  end
-
-  table.sort(list)
-  return list
+  return Util.sortedKeysMerged(state, entities)
 end
 
 local function getDiscoveredPropertiesFor(entName)
@@ -1627,7 +1595,7 @@ loadConfig()
 -- below (nextSync, initialized already due, plus the "broker_online"
 -- rednet handler in handleMessage()) - so nothing here blocks, and this
 -- fires unconditionally, broker or no broker.
-safeUpdaterCall(updater.checkNow)
+updater.safeCall(updater.checkNow)
 
 termScreen.show("rules")
 termScreen.enterScreensaver()
@@ -1663,12 +1631,12 @@ while true do
     termScreen.handleEvent(ev)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
+    updater.safeCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
   -- Drives all update-check scheduling (routine checks, failure retries,
   -- stuck-request recovery) - see updater.tick()'s own comment.
-  safeUpdaterCall(updater.tick)
+  updater.safeCall(updater.tick)
 
   local t = now()
   if t >= nextEval then

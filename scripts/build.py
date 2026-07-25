@@ -3,23 +3,33 @@
 Compiles src/targets/*.lua into the flat, single-file scripts CC:Tweaked
 computers actually download (repo root: broker.lua, provider.lua, ...).
 
-Each target may reference a shared module from src/lib/ with a directive on
-its own line:
+Each target (or lib file - includes resolve recursively, so a lib may
+itself @include another lib) may reference a shared module from src/lib/
+with a directive on its own line:
 
     --[[@include lib/updater.lua as updater]]
 
-which is replaced with that module's full contents wrapped as an IIFE bound
-to the given local name:
+which resolves to that module's full contents wrapped as an IIFE, with the
+given local name aliased to it at the point of the @include:
 
-    local updater = (function()
-    <contents of src/lib/updater.lua>
-    end)()
+    local updater = __inc_lib_updater_lua
 
-This is a plain textual splice, not a real Lua module system - CC:Tweaked
-computers download one flat file with wget and have no way to `require`
-across multiple fetched files, so multi-file source has to be flattened at
-build time. Each include's internals stay scoped inside its own IIFE, so
-this is safe to do even though there's no real namespacing.
+Every lib file reachable from a target's @include graph is hoisted to its
+own top-level IIFE binding, in dependency order, ONCE - `#pragma once`
+semantics - before any of the requesting file's own code runs; every
+@include site (however many there are, wherever they sit, including a lib
+that's reachable more than one way) becomes a plain local alias to that
+one hoisted binding rather than a fresh copy. This is what makes a diamond
+safe: two libs that both @include a third get the exact same table back,
+not two independent copies of what's meant to be a single module-level
+state. It's still not a real Lua module system - CC:Tweaked computers
+download one flat file with wget and have no way to `require` across
+multiple fetched files, so multi-file source has to be flattened at build
+time - but it behaves like one: each lib's internals stay scoped inside
+its own IIFE, and a naive in-place splice can't give correct aliasing
+(a later @include site can't see an earlier site's IIFE-local variable at
+all - hoisting to a shared top-level scope is what makes referencing the
+same already-built module from two different places actually work).
 
 Every compiled file gets a banner stamped on top (release tag, commit, build
 time) - the "what am I actually running" marker - and this script also
@@ -58,7 +68,20 @@ def fallback_hash(data: bytes) -> str:
     return format(h, "08x")
 
 
-def resolve_includes(text: str, target_name: str) -> str:
+def _internal_name(rel_path: str) -> str:
+    # A stable, collision-resistant Lua identifier for a lib's hoisted
+    # top-level binding - distinct from whatever local name any given
+    # @include site requests, since two sites can (and do) ask for the
+    # same file under different names.
+    return "__inc_" + re.sub(r"[^A-Za-z0-9_]", "_", rel_path)
+
+
+def _rewrite_includes(text: str, target_name: str) -> str:
+    # Replaces every @include line with a plain alias to that file's
+    # hoisted top-level binding (see resolve_includes). Assumes the
+    # binding already exists by the time this code runs - true for every
+    # site because resolve_includes emits all hoisted bindings, in
+    # dependency order, before the requesting file's own body.
     out_lines = []
     for line in text.split("\n"):
         m = INCLUDE_RE.match(line)
@@ -66,15 +89,55 @@ def resolve_includes(text: str, target_name: str) -> str:
             out_lines.append(line)
             continue
         rel_path, local_name = m.group(1), m.group(2)
+        if not os.path.isfile(os.path.join(SRC_ROOT, rel_path)):
+            raise SystemExit(f"{target_name}: @include references missing file {rel_path}")
+        out_lines.append(f"local {local_name} = {_internal_name(rel_path)}")
+    return "\n".join(out_lines)
+
+
+def _collect_includes(text: str, target_name: str, order: list, visiting: set, chain: tuple) -> None:
+    # DFS over the @include graph, appending each newly-discovered lib to
+    # `order` AFTER its own dependencies (so `order` ends up dependency-
+    # first - safe to emit top to bottom). `visiting` is every rel_path
+    # already discovered on ANY path so far, target-wide - the actual
+    # #pragma once guard: a lib reached a second time (straight-line
+    # repeat, or via a different branch of the include graph entirely)
+    # is simply skipped instead of walked and hoisted again.
+    for line in text.split("\n"):
+        m = INCLUDE_RE.match(line)
+        if not m:
+            continue
+        rel_path = m.group(1)
         lib_path = os.path.join(SRC_ROOT, rel_path)
         if not os.path.isfile(lib_path):
             raise SystemExit(f"{target_name}: @include references missing file {rel_path}")
+        if rel_path in chain:
+            cycle = " -> ".join(list(chain) + [rel_path])
+            raise SystemExit(f"{target_name}: circular @include: {cycle}")
+        if rel_path in visiting:
+            continue
+        visiting.add(rel_path)
         with open(lib_path, "r") as fh:
             lib_src = fh.read().rstrip("\n")
-        out_lines.append(f"local {local_name} = (function()")
-        out_lines.append(lib_src)
-        out_lines.append("end)()")
-    return "\n".join(out_lines)
+        _collect_includes(lib_src, rel_path, order, visiting, chain + (rel_path,))
+        order.append(rel_path)
+
+
+def resolve_includes(text: str, target_name: str) -> str:
+    order = []
+    _collect_includes(text, target_name, order, set(), ())
+
+    parts = []
+    for rel_path in order:
+        with open(os.path.join(SRC_ROOT, rel_path), "r") as fh:
+            lib_src = fh.read().rstrip("\n")
+        lib_body = _rewrite_includes(lib_src, rel_path)
+        parts.append(f"local {_internal_name(rel_path)} = (function()")
+        parts.append(lib_body)
+        parts.append("end)()")
+
+    parts.append(_rewrite_includes(text, target_name))
+    return "\n".join(parts)
 
 
 def build_target(target_path: str, tag: str, sha: str, built_at: str) -> bytes:
