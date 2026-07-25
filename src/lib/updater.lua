@@ -29,10 +29,30 @@
 
 local Updater = {}
 
-local HTTP_HEADERS = {
+-- Used only for the small releases/latest JSON call, which needs to bypass
+-- caching to actually see a just-published release promptly - GitHub's API
+-- requires SOME User-Agent or it 403s.
+local API_HEADERS = {
   ["Cache-Control"] = "no-cache, no-store, must-revalidate",
   ["Pragma"]        = "no-cache",
   ["User-Agent"]    = "CC-Tweaked",
+}
+
+-- Used for the actual file downloads (release asset + raw-content
+-- fallback) - deliberately WITHOUT Cache-Control/Pragma. A manual `wget`
+-- of the exact same large files (which sends no such headers) has been
+-- confirmed working on setups where this updater's own downloads of them
+-- hung indefinitely with literally no response. GitHub's raw/release
+-- content is served through a CDN (Fastly); forcing no-store on a large
+-- object can push a request onto an uncached origin-passthrough path
+-- instead of the normal cached one, which can be slow or flaky in exactly
+-- this "small requests fine, large ones hang" pattern - and it buys
+-- nothing here anyway: the release asset URL is uniquely tagged per
+-- release already (nothing to invalidate), and the fallback URL's own
+-- cache-busting query parameter (see fallbackUrl()) already forces
+-- freshness without needing explicit cache-control headers on top.
+local DOWNLOAD_HEADERS = {
+  ["User-Agent"] = "CC-Tweaked",
 }
 
 local function cacheBust()
@@ -197,7 +217,7 @@ function Updater.new(opts)
   local function startFallback()
     state = { stage = "fallback", url = fallbackUrl() }
     stateStartedAt = os.clock()
-    http.request(state.url, nil, HTTP_HEADERS)
+    http.request(state.url, nil, DOWNLOAD_HEADERS)
   end
 
   -- Shared by an explicit http_failure event AND by tick()'s timeout below -
@@ -240,7 +260,7 @@ function Updater.new(opts)
     self.status = "checking"
     state = { stage = "release", url = releaseUrl() }
     stateStartedAt = os.clock()
-    http.request(state.url, nil, HTTP_HEADERS)
+    http.request(state.url, nil, API_HEADERS)
   end
 
   -- Cheap enough to call on every single main-loop iteration (a clock read
@@ -291,7 +311,7 @@ function Updater.new(opts)
       print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(self.currentVersion), getShortVer(tagName)))
       state = { stage = "asset", url = assetUrl, tagName = tagName, checksum = checksum }
       stateStartedAt = os.clock()
-      http.request(state.url, nil, HTTP_HEADERS)
+      http.request(state.url, nil, DOWNLOAD_HEADERS)
 
     elseif state.stage == "asset" then
       local code = handle.readAll()
@@ -357,8 +377,8 @@ function Updater.new(opts)
     -- than a short timeout allows on a slow/throttled connection.
     timeoutSec = timeoutSec or 60
 
-    local function awaitHttp(url)
-      http.request(url, nil, HTTP_HEADERS)
+    local function awaitHttp(url, headers)
+      http.request(url, nil, headers or DOWNLOAD_HEADERS)
       local timer = os.startTimer(timeoutSec)
       while true do
         local ev = { os.pullEvent() }
@@ -372,7 +392,7 @@ function Updater.new(opts)
       end
     end
 
-    local relOk, relRes = awaitHttp(releaseUrl())
+    local relOk, relRes = awaitHttp(releaseUrl(), API_HEADERS)
     local tagName, assetUrl, checksum
     if relOk then
       local raw = relRes.readAll()
