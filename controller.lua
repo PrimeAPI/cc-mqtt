@@ -1,4 +1,4 @@
--- cc-mqtt controller.lua | release v14 | commit a5fbbe1 | built 2026-07-25T02:17:39Z
+-- cc-mqtt controller.lua | release dev | commit 33846fd | built 2026-07-25T02:24:19Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus controller  --  automation & control server for CC:Tweaked
@@ -174,6 +174,27 @@ local function parseReleaseResponse(raw, scriptName)
     checksum = data.body:match(escapePattern(scriptName) .. ":%s*(%x+)")
   end
   return data.tag_name, assetUrl, checksum
+end
+
+-- GitHub's unauthenticated REST API allows 60 requests/hour PER SOURCE
+-- IP - shared across every CC:Tweaked computer on this Minecraft server,
+-- since they all share the server's one outbound IP (only the small
+-- releases/latest JSON call counts against this; raw.githubusercontent.com
+-- and release asset downloads are CDN content, a separate and much more
+-- generous budget). A 403/429 with X-RateLimit-Remaining: 0 means that
+-- budget is exhausted - GitHub also sends X-RateLimit-Reset, a Unix
+-- timestamp for when it refills, letting this wait exactly that long
+-- instead of guessing. Returns seconds to wait, or nil if this wasn't a
+-- rate-limit response at all.
+local function rateLimitBackoff(code, headers)
+  if code ~= 403 and code ~= 429 then return nil end
+  if not headers then return nil end
+  local remaining = headers["X-RateLimit-Remaining"] or headers["x-ratelimit-remaining"]
+  if remaining ~= "0" then return nil end
+  local reset = tonumber(headers["X-RateLimit-Reset"] or headers["x-ratelimit-reset"])
+  if not reset then return 900 end -- no reset header to go on - a conservative flat wait
+  local nowEpoch = (os.epoch and os.epoch("utc") or 0) / 1000
+  return math.max(60, math.ceil(reset - nowEpoch) + 5) -- +5s safety margin past the reset instant
 end
 
 -- opts = { scriptName, repoOwner, repoName, repoBranch, versionFile, updateTick }
@@ -434,9 +455,25 @@ function Updater.new(opts)
     end
 
     if state.stage == "release" then
+      local headersOk, respHeaders = pcall(function() return handle.getResponseHeaders() end)
+      if not headersOk then respHeaders = nil end
       local raw = handle.readAll()
       handle.close()
       debugPrint("release body: %d bytes", raw and #raw or 0)
+      local waitSec = codeOk and rateLimitBackoff(code, respHeaders)
+      if waitSec then
+        -- Deliberately does NOT fall through to the raw-content fallback
+        -- (pointless - that host isn't rate-limited, but there's still
+        -- nothing new to learn without knowing the real release tag) and
+        -- does NOT count toward consecutiveFailures/the reboot threshold
+        -- (a reboot doesn't free up rate-limit budget - only time does,
+        -- and retrying sooner via a reboot would only make this worse).
+        debugPrint("GitHub API rate limit hit - waiting %ds for it to reset instead of retrying sooner", waitSec)
+        self.status = "check failed"
+        state = nil
+        nextCheckAt = os.clock() + waitSec
+        return
+      end
       local tagName, assetUrl, checksum = parseReleaseResponse(raw, scriptName)
       if not tagName then
         debugPrint("release response didn't parse as expected (bad JSON, or no matching asset for %s)", scriptName)
@@ -566,9 +603,16 @@ function Updater.new(opts)
     debugPrint("release: %s", relOk and "success" or ("failed (" .. tostring(relRes) .. ")"))
     local tagName, assetUrl, checksum
     if relOk then
+      local headersOk, respHeaders = pcall(function() return relRes.getResponseHeaders() end)
+      if not headersOk then respHeaders = nil end
+      local codeOk, code = pcall(function() return relRes.getResponseCode() end)
       local raw = relRes.readAll()
       relRes.close()
       debugPrint("release body: %d bytes", raw and #raw or 0)
+      if codeOk and rateLimitBackoff(code, respHeaders) then
+        debugPrint("GitHub API rate limit hit - not retrying further this boot")
+        return false, "rate limited"
+      end
       tagName, assetUrl, checksum = parseReleaseResponse(raw, scriptName)
     end
 
