@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v3 | commit c7431d4 | built 2026-07-25T00:00:05Z
+-- cc-mqtt provider.lua | release dev | commit 4581947 | built 2026-07-25T00:07:40Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
@@ -1146,6 +1146,22 @@ function Updater.new(opts)
     http.request(state.url, nil, HTTP_HEADERS)
   end
 
+  -- Cheap enough to call on every single main-loop iteration (a clock read
+  -- and maybe a comparison) - and needs to be, since checkNow() itself is
+  -- only invoked every UPDATE_TICK by the caller's own periodic timer
+  -- (up to 300s). Without a separate, frequently-polled watchdog, a stuck
+  -- state would only ever get noticed - and cleared - the next time
+  -- checkNow() happened to run, which could be minutes away. Calling this
+  -- every iteration instead means a hang is noticed within STATE_TIMEOUT
+  -- regardless of how far off the next scheduled check is.
+  function self.tick()
+    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
+      print(("[Updater] previous %s check never resolved - abandoning it"):format(state.stage))
+      state = nil
+      self.status = "check failed"
+    end
+  end
+
   function self.checkNow()
     if not http then
       self.status = "http disabled"
@@ -1159,10 +1175,7 @@ function Updater.new(opts)
       end
       return
     end
-    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
-      print(("[Updater] previous %s check never resolved - abandoning it and starting over"):format(state.stage))
-      state = nil
-    end
+    self.tick()
     if state then return end -- already checking
     self.status = "checking"
     state = { stage = "release", url = releaseUrl() }
@@ -1217,6 +1230,17 @@ function Updater.new(opts)
     elseif state.stage == "asset" then
       local code = handle.readAll()
       handle.close()
+      -- readAll() can come back nil/empty on a truncated or otherwise bad
+      -- response even when CC:Tweaked still calls it "http_success" - and
+      -- rollingHash(nil) would throw ("attempt to get length of a nil
+      -- value"), which - since every caller of handleHttp wraps it in a
+      -- bare pcall - would silently swallow the error and leave `state`
+      -- stuck here forever. Treat it as a failure and fall back instead.
+      if type(code) ~= "string" or #code < 100 then
+        print("[Updater] asset response looked invalid, falling back to raw content")
+        startFallback()
+        return
+      end
       if state.checksum and rollingHash(code) ~= state.checksum then
         print("[Updater] asset checksum mismatch, falling back to raw content")
         startFallback()
@@ -1230,6 +1254,12 @@ function Updater.new(opts)
       local code = handle.readAll()
       local headers = handle.getResponseHeaders()
       handle.close()
+      if type(code) ~= "string" or #code < 100 then
+        self.status = "check failed"
+        print("[Updater] fallback response looked invalid")
+        state = nil
+        return
+      end
       local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
       local version = etag and etag:match("(%x%x%x%x%x%x%x+)")
       if not version then version = rollingHash(code) end
@@ -1284,11 +1314,11 @@ function Updater.new(opts)
       if assetOk then
         local code = assetRes.readAll()
         assetRes.close()
-        if not checksum or rollingHash(code) == checksum then
+        if type(code) == "string" and #code >= 100 and (not checksum or rollingHash(code) == checksum) then
           applyUpdate(tagName, code) -- reboots, does not return
         end
       end
-      -- asset fetch failed or checksum mismatch -> fall through to fallback
+      -- asset fetch failed, invalid, or checksum mismatch -> fall through to fallback
     end
 
     local fbOk, fbRes = awaitHttp(fallbackUrl())
@@ -1296,6 +1326,7 @@ function Updater.new(opts)
     local code = fbRes.readAll()
     local headers = fbRes.getResponseHeaders()
     fbRes.close()
+    if type(code) ~= "string" or #code < 100 then return false, "check failed" end
     local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
     local version = etag and etag:match("(%x%x%x%x%x%x%x+)") or rollingHash(code)
     if version == self.currentVersion then return false, "up to date" end
@@ -1320,6 +1351,14 @@ end)()
 local UPDATE_TICK = 300
 
 local updater = Updater.new({ scriptName = "provider.lua" })
+
+-- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
+-- inside the updater would fail with literally no visible trace, making it
+-- indistinguishable from "nothing to do yet". This surfaces it instead.
+local function safeUpdaterCall(fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then print("[Updater] internal error: " .. tostring(err)) end
+end
 
 peripheral.find("modem", function(n) rednet.open(n) end)
 
@@ -1925,7 +1964,7 @@ end
 -- "broker_online" rednet handler), which already tolerates broker == nil
 -- throughout (see send()) - so nothing here blocks, and this fires
 -- unconditionally, broker or no broker.
-pcall(updater.checkNow)
+safeUpdaterCall(updater.checkNow)
 
 showIdleScreen()
 
@@ -1981,8 +2020,15 @@ while true do
     dirty = true
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    pcall(updater.handleHttp, ev[1], ev[2], ev[3])
+    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
+
+  -- Runs every iteration (cheap - a clock read, maybe a comparison),
+  -- unlike checkNow() itself which only fires every UPDATE_TICK. Without
+  -- this, a check that gets stuck (see updater.tick()'s own comment)
+  -- would only be noticed - and cleared - the next time checkNow()
+  -- happened to run, which could be minutes away.
+  safeUpdaterCall(updater.tick)
 
   local t = os.clock()
   if #devices > 0 and t >= nextPub then
@@ -2006,7 +2052,7 @@ while true do
   end
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
-    pcall(updater.checkNow)
+    safeUpdaterCall(updater.checkNow)
     dirty = true
   end
 

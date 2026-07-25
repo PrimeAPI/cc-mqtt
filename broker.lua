@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release v3 | commit c7431d4 | built 2026-07-25T00:00:05Z
+-- cc-mqtt broker.lua | release dev | commit 4581947 | built 2026-07-25T00:07:40Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
@@ -258,6 +258,22 @@ function Updater.new(opts)
     http.request(state.url, nil, HTTP_HEADERS)
   end
 
+  -- Cheap enough to call on every single main-loop iteration (a clock read
+  -- and maybe a comparison) - and needs to be, since checkNow() itself is
+  -- only invoked every UPDATE_TICK by the caller's own periodic timer
+  -- (up to 300s). Without a separate, frequently-polled watchdog, a stuck
+  -- state would only ever get noticed - and cleared - the next time
+  -- checkNow() happened to run, which could be minutes away. Calling this
+  -- every iteration instead means a hang is noticed within STATE_TIMEOUT
+  -- regardless of how far off the next scheduled check is.
+  function self.tick()
+    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
+      print(("[Updater] previous %s check never resolved - abandoning it"):format(state.stage))
+      state = nil
+      self.status = "check failed"
+    end
+  end
+
   function self.checkNow()
     if not http then
       self.status = "http disabled"
@@ -271,10 +287,7 @@ function Updater.new(opts)
       end
       return
     end
-    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
-      print(("[Updater] previous %s check never resolved - abandoning it and starting over"):format(state.stage))
-      state = nil
-    end
+    self.tick()
     if state then return end -- already checking
     self.status = "checking"
     state = { stage = "release", url = releaseUrl() }
@@ -329,6 +342,17 @@ function Updater.new(opts)
     elseif state.stage == "asset" then
       local code = handle.readAll()
       handle.close()
+      -- readAll() can come back nil/empty on a truncated or otherwise bad
+      -- response even when CC:Tweaked still calls it "http_success" - and
+      -- rollingHash(nil) would throw ("attempt to get length of a nil
+      -- value"), which - since every caller of handleHttp wraps it in a
+      -- bare pcall - would silently swallow the error and leave `state`
+      -- stuck here forever. Treat it as a failure and fall back instead.
+      if type(code) ~= "string" or #code < 100 then
+        print("[Updater] asset response looked invalid, falling back to raw content")
+        startFallback()
+        return
+      end
       if state.checksum and rollingHash(code) ~= state.checksum then
         print("[Updater] asset checksum mismatch, falling back to raw content")
         startFallback()
@@ -342,6 +366,12 @@ function Updater.new(opts)
       local code = handle.readAll()
       local headers = handle.getResponseHeaders()
       handle.close()
+      if type(code) ~= "string" or #code < 100 then
+        self.status = "check failed"
+        print("[Updater] fallback response looked invalid")
+        state = nil
+        return
+      end
       local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
       local version = etag and etag:match("(%x%x%x%x%x%x%x+)")
       if not version then version = rollingHash(code) end
@@ -396,11 +426,11 @@ function Updater.new(opts)
       if assetOk then
         local code = assetRes.readAll()
         assetRes.close()
-        if not checksum or rollingHash(code) == checksum then
+        if type(code) == "string" and #code >= 100 and (not checksum or rollingHash(code) == checksum) then
           applyUpdate(tagName, code) -- reboots, does not return
         end
       end
-      -- asset fetch failed or checksum mismatch -> fall through to fallback
+      -- asset fetch failed, invalid, or checksum mismatch -> fall through to fallback
     end
 
     local fbOk, fbRes = awaitHttp(fallbackUrl())
@@ -408,6 +438,7 @@ function Updater.new(opts)
     local code = fbRes.readAll()
     local headers = fbRes.getResponseHeaders()
     fbRes.close()
+    if type(code) ~= "string" or #code < 100 then return false, "check failed" end
     local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
     local version = etag and etag:match("(%x%x%x%x%x%x%x+)") or rollingHash(code)
     if version == self.currentVersion then return false, "up to date" end
@@ -432,6 +463,14 @@ end)()
 local UPDATE_TICK = 300
 
 local updater = Updater.new({ scriptName = "broker.lua" })
+
+-- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
+-- inside the updater would fail with literally no visible trace, making it
+-- indistinguishable from "nothing to do yet". This surfaces it instead.
+local function safeUpdaterCall(fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then print("[Updater] internal error: " .. tostring(err)) end
+end
 
 local function now() return os.clock() end
 local bootTime = now()
@@ -1247,7 +1286,7 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
-pcall(updater.checkNow)
+safeUpdaterCall(updater.checkNow)
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawLogMonitor()
@@ -1307,8 +1346,13 @@ while true do
     end
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    pcall(updater.handleHttp, ev[1], ev[2], ev[3])
+    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
+
+  -- Runs every iteration (cheap), unlike checkNow() itself which only
+  -- fires every UPDATE_TICK - see updater.tick()'s own comment for why
+  -- that matters.
+  safeUpdaterCall(updater.tick)
 
   local t = now()
   if t >= nextTick then
@@ -1336,7 +1380,7 @@ while true do
 
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
-    pcall(updater.checkNow)
+    safeUpdaterCall(updater.checkNow)
   end
 
   local iterMs = (now() - iterT0) * 1000
