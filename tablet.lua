@@ -1,16 +1,6 @@
--- cc-mqtt tablet.lua | release v18 | commit 07668c7 | built 2026-07-25T18:27:28Z
+-- cc-mqtt tablet.lua | release v19 | commit 7fae102 | built 2026-07-25T19:06:17Z
 -- Generated from src/targets/tablet.lua + src/lib/*.lua - do not edit directly.
---------------------------------------------------------------------
--- cc-mqtt tablet controller & dashboard for pocket computers
---------------------------------------------------------------------
-local PROTOCOL     = "cbus"
-local CONFIG_FILE  = "tablet.cfg"
-local STALE_AFTER  = 8 -- s without update -> stale
-
---------------------------------------------------------------------
--- auto updater (runs ONLY on startup as requested)
---------------------------------------------------------------------
-local Updater = (function()
+local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
 -- shared auto-updater
 --
@@ -165,6 +155,17 @@ end
 function Updater.new(opts)
   local self = {}
   self.getShortVer = getShortVer
+
+  -- Every caller wraps its own checkNow()/tick()/handleHttp() calls in
+  -- exactly this pcall - a bug inside the updater failing with literally
+  -- no visible trace (a bare pcall silently discards its error result)
+  -- is indistinguishable from "nothing to do yet". Centralized here
+  -- instead of copy-pasted once per target.
+  function self.safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then print("[Updater] internal error: " .. tostring(err)) end
+  end
+
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"
@@ -620,7 +621,7 @@ end
 
 return Updater
 end)()
-local Screen = (function()
+local __inc_lib_screen_lua = (function()
 --------------------------------------------------------------------
 -- shared console-screen framework
 --
@@ -1050,6 +1051,94 @@ end
 
 return Screen
 end)()
+local __inc_lib_util_lua = (function()
+--------------------------------------------------------------------
+-- small stateless helpers duplicated (in some cases four or five times,
+-- byte-for-byte) across the targets before being centralized here:
+-- coercing a raw typed console argument, formatting a number/telemetry
+-- unit for display, and collecting a table's keys into a sorted list.
+--------------------------------------------------------------------
+
+local Util = {}
+
+-- Turns a raw typed string into a number/boolean/string, the rule every
+-- target's "simulate/trigger an action" input uses: "40" -> 40,
+-- "true"/"false" -> booleans (case-insensitive), blank/nil -> nil,
+-- anything else -> the string as-is.
+function Util.parseArg(raw)
+  if not raw or raw == "" then return nil end
+  if tonumber(raw) then return tonumber(raw) end
+  if raw:lower() == "true" then return true end
+  if raw:lower() == "false" then return false end
+  return raw
+end
+
+-- Compact SI-prefixed number: 12345 -> "12.3k", 4200000 -> "4.20M".
+function Util.si(n)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a = math.abs(n)
+  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
+  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
+  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
+  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
+  return string.format("%.0f", n)
+end
+
+-- Same SI-prefix scaling as si(), with a unit suffix attached:
+-- fmtUnit(6830000000, "FE") -> "6.83 GFE", fmtUnit(3870000, "FE/t") ->
+-- "3.87 MFE/t". forceSign prefixes a "+" on positive values, for
+-- input/output rates where the sign itself is the interesting part.
+function Util.fmtUnit(n, unit, forceSign)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a, prefix = math.abs(n), ""
+  local v = n
+  if a >= 1e12 then v, prefix = n / 1e12, "T"
+  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
+  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
+  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
+  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
+  local sign = (forceSign and n > 0) and "+" or ""
+  return sign .. num .. " " .. prefix .. (unit or "")
+end
+
+-- Sorted, de-duplicated keys across any number of tables - the
+-- "an entity might be known from live telemetry, the broker's registry,
+-- or both" merge every target with more than one entity cache needed at
+-- least once. A single table works too (Util.sortedKeys below is just
+-- this with one argument).
+function Util.sortedKeysMerged(...)
+  local seen, out = {}, {}
+  for _, t in ipairs({ ... }) do
+    for k in pairs(t) do
+      if not seen[k] then
+        out[#out + 1] = k
+        seen[k] = true
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+function Util.sortedKeys(t)
+  return Util.sortedKeysMerged(t)
+end
+
+return Util
+end)()
+--------------------------------------------------------------------
+-- cc-mqtt tablet controller & dashboard for pocket computers
+--------------------------------------------------------------------
+local PROTOCOL     = "cbus"
+local CONFIG_FILE  = "tablet.cfg"
+local STALE_AFTER  = 8 -- s without update -> stale
+
+--------------------------------------------------------------------
+-- auto updater (runs ONLY on startup as requested)
+--------------------------------------------------------------------
+local Updater = __inc_lib_updater_lua
+local Screen = __inc_lib_screen_lua
+local Util = __inc_lib_util_lua
 
 local updater = Updater.new({ scriptName = "tablet.lua" })
 -- checkAndApplySync() reuses the exact same URL building / parsing /
@@ -1186,17 +1275,7 @@ local function getEntityActions(name)
 end
 
 local function getSortedEntities()
-  local sorted = {}
-  for n in pairs(registry) do sorted[#sorted + 1] = n end
-  for n in pairs(ents) do
-    if not registry[n] then
-      local found = false
-      for _, x in ipairs(sorted) do if x == n then found = true break end end
-      if not found then sorted[#sorted + 1] = n end
-    end
-  end
-  table.sort(sorted)
-  return sorted
+  return Util.sortedKeysMerged(registry, ents)
 end
 
 local function getEntityFields(name)
@@ -1217,28 +1296,6 @@ end
 --------------------------------------------------------------------
 -- formatting helpers
 --------------------------------------------------------------------
-local function si(n)
-  if type(n) ~= "number" then return tostring(n or "?") end
-  local a = math.abs(n)
-  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
-  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
-  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
-  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
-  return string.format("%.0f", n)
-end
-
-local function fmtUnit(n, unit)
-  if type(n) ~= "number" then return tostring(n or "?") end
-  local a, prefix = math.abs(n), ""
-  local v = n
-  if a >= 1e12 then v, prefix = n / 1e12, "T"
-  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
-  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
-  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
-  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
-  return num .. " " .. prefix .. (unit or "")
-end
-
 local function formatSmartValue(key, val)
   if type(val) == "number" then
     local kLower = key:lower()
@@ -1249,18 +1306,18 @@ local function formatSmartValue(key, val)
       local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
       return bar .. string.format(" %2d%%", pct), isDanger and colors.red or colors.lime
     elseif kLower:find("energy") or kLower:find("maxenergy") then
-      return fmtUnit(val, "FE"), colors.lime
+      return Util.fmtUnit(val, "FE"), colors.lime
     elseif kLower:find("input") or kLower:find("output") or kLower:find("net") or kLower:find("prod") then
       local s = val >= 0 and "+" or ""
-      return s .. fmtUnit(val, "FE/t"), (val >= 0 and colors.lime or colors.red)
+      return s .. Util.fmtUnit(val, "FE/t"), (val >= 0 and colors.lime or colors.red)
     elseif kLower:find("flow") or kLower:find("burn") or kLower:find("rate") then
-      return fmtUnit(val, "mB/t"), colors.yellow
+      return Util.fmtUnit(val, "mB/t"), colors.yellow
     elseif kLower:find("fluid") or kLower:find("steam") or kLower:find("coolant") or kLower:find("waste") or kLower:find("amount") then
-      return fmtUnit(val, "mB"), colors.cyan
+      return Util.fmtUnit(val, "mB"), colors.cyan
     elseif kLower:find("temp") then
       return string.format("%.1f K", val), (val > 1000 and colors.red or colors.yellow)
     else
-      return si(val), colors.white
+      return Util.si(val), colors.white
     end
   else
     local sVal = tostring(val or "?")
@@ -1295,11 +1352,9 @@ local wizardCustomAction = false -- true while INPUT_ARG is collecting args for 
 local animFrames      = { "O", "o", ".", "o" }
 local animIdx         = 1
 
-local function padLine(str, w)
-  str = tostring(str or "")
-  if #str > w then return str:sub(1, w) end
-  return str .. string.rep(" ", w - #str)
-end
+-- Identical to Screen.clipPad - kept under this target's own established
+-- name rather than rewriting its 18 call sites to Screen.clipPad.
+local padLine = Screen.clipPad
 
 -- Single source of truth for Inspect-screen row positions, shared by
 -- renderScreen and handleTouch so the two can never drift apart.
@@ -1524,10 +1579,7 @@ local function entitiesOnClick(screen, ev)
   local x, y = ev[3], ev[4]
   if tabBarClick(screen, x, y) then return end
 
-  local sorted = {}
-  for n in pairs(registry) do sorted[#sorted + 1] = n end
-  for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
-  table.sort(sorted)
+  local sorted = getSortedEntities()
   local rowIdx = y - 2
   if rowIdx >= 1 and rowIdx <= #sorted then
     inspectEntity = sorted[rowIdx]
@@ -1659,11 +1711,7 @@ local function inspectOnClick(screen, ev)
       term.setTextColor(colors.white)
       term.write("> ")
       local input = read()
-      local parsed = input
-      if not input or input == "" then parsed = nil
-      elseif tonumber(input) then parsed = tonumber(input)
-      elseif input:lower() == "true" then parsed = true
-      elseif input:lower() == "false" then parsed = false end
+      local parsed = Util.parseArg(input)
 
       sendCommand(inspectEntity, actName, parsed)
       screen.banner(("Sent '%s' to %s"):format(actName, inspectEntity), false)
@@ -2067,11 +2115,7 @@ local function inputArgOnKey(screen, ev)
     inputBuffer = inputBuffer:sub(1, -2)
 
   elseif key == keys.enter then
-    local parsed = inputBuffer
-    if inputBuffer == "" then parsed = nil
-    elseif tonumber(inputBuffer) then parsed = tonumber(inputBuffer)
-    elseif inputBuffer:lower() == "true" then parsed = true
-    elseif inputBuffer:lower() == "false" then parsed = false end
+    local parsed = Util.parseArg(inputBuffer)
 
     if wizardCustomAction then
       cfg.quickActions[#cfg.quickActions + 1] = {

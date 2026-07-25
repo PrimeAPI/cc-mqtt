@@ -1,125 +1,6 @@
--- cc-mqtt subscriber.lua | release v18 | commit 07668c7 | built 2026-07-25T18:27:28Z
+-- cc-mqtt subscriber.lua | release v19 | commit 7fae102 | built 2026-07-25T19:06:17Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
---------------------------------------------------------------------
--- cbus subscriber  --  dashboard edition
---
--- Run modes:
---   subscriber          -> normal display mode
---   subscriber setup    -> interactive setup
---
--- Setup mode (terminal + live monitor preview):
---   Screen 1 - Entities: every provider entity the broker knows,
---     toggle on/off, set display names (aliases). New entities that
---     appear later just need a quick toggle here.
---   Screen 2 - Layout editor: move & resize each panel directly on
---     the monitor with arrow keys / WASD, add group titles, separator
---     lines and action buttons (k), edit which properties/calculated
---     properties a panel shows (f), or generate a whole dashboard at
---     once with auto-layout (g), which groups entities by
---     provider/topic kind (falling back to a name-prefix guess) and
---     sizes each panel from its actual field count.
---
--- Action buttons run entity.action (with a fixed args value) on tap,
--- confirmed in the monitor's top status bar for a few seconds.
---
--- In display mode, newly announced entities are added to the config
--- automatically (disabled) and a hint is printed.
---
--- Save as startup.lua. Needs: modem + monitor.
---------------------------------------------------------------------
-
-local PROTOCOL     = "cbus"
-local CONFIG_FILE  = "display.cfg"
-local STALE_AFTER  = 8    -- s without data -> panel shows an error
-local STATUS_ROWS  = 1    -- top row(s) reserved for the status bar
-local REG_INTERVAL = 10
-local SUB_INTERVAL = 15
-
-local args = { ... }
-
-peripheral.find("modem", function(n) rednet.open(n) end)
-local mon = peripheral.find("monitor")
-if not mon then error("No monitor found!", 0) end
-
--- The real peripheral - clearMonitor() below reassigns `mon` itself to a
--- double-buffered window over this every redraw pass, but setTextScale/
--- setPaletteColour and the buffer's own creation need the real device,
--- not whatever window currently wraps it.
-local realMon = mon
-
---------------------------------------------------------------------
--- config
---------------------------------------------------------------------
-local cfg
-
-local function saveConfig()
-  -- strip runtime data (keys starting with "_", e.g. the _win window
-  -- objects attached to layout items) and anything that cannot be
-  -- serialized (functions, coroutines, ...) before writing
-  local function sanitize(v, seen)
-    local t = type(v)
-    if t == "table" then
-      seen = seen or {}
-      if seen[v] then return nil end
-      seen[v] = true
-      local out = {}
-      for k, val in pairs(v) do
-        local kt = type(k)
-        if (kt == "string" or kt == "number")
-           and not (kt == "string" and k:sub(1, 1) == "_") then
-          local sv = sanitize(val, seen)
-          if sv ~= nil then out[k] = sv end
-        end
-      end
-      seen[v] = nil
-      return out
-    elseif t == "number" or t == "string" or t == "boolean" then
-      return v
-    end
-    return nil
-  end
-
-  local ok, err = pcall(function()
-    local data = textutils.serialize(sanitize(cfg))
-    -- atomic-ish write: temp file first, then swap, so a crash
-    -- mid-write can never corrupt the existing config
-    local f = fs.open(CONFIG_FILE .. ".tmp", "w")
-    f.write(data)
-    f.close()
-    if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
-    fs.move(CONFIG_FILE .. ".tmp", CONFIG_FILE)
-  end)
-  if not ok then
-    printError("config save failed: " .. tostring(err))
-  end
-end
-
-local function loadConfig()
-  -- leftover temp file from a crashed save -> discard it
-  if fs.exists(CONFIG_FILE .. ".tmp") then fs.delete(CONFIG_FILE .. ".tmp") end
-  if fs.exists(CONFIG_FILE) then
-    local f = fs.open(CONFIG_FILE, "r")
-    local raw = f.readAll()
-    f.close()
-    cfg = textutils.unserialize(raw)
-    if not cfg then
-      -- old (Lua-source) config format -> back it up and start fresh
-      fs.move(CONFIG_FILE, CONFIG_FILE .. ".old")
-      print("old config format detected -> backed up as " .. CONFIG_FILE .. ".old")
-      cfg = nil
-    end
-  end
-  cfg = cfg or {}
-  cfg.name = cfg.name or "display1"
-  cfg.textScale = cfg.textScale or 0.5
-  cfg.entities = cfg.entities or {}   -- name -> {enabled, alias}
-  cfg.layout = cfg.layout or {}       -- {type="panel"|"title"|"line", ...}
-end
-
---------------------------------------------------------------------
--- auto updater
---------------------------------------------------------------------
-local Updater = (function()
+local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
 -- shared auto-updater
 --
@@ -274,6 +155,17 @@ end
 function Updater.new(opts)
   local self = {}
   self.getShortVer = getShortVer
+
+  -- Every caller wraps its own checkNow()/tick()/handleHttp() calls in
+  -- exactly this pcall - a bug inside the updater failing with literally
+  -- no visible trace (a bare pcall silently discards its error result)
+  -- is indistinguishable from "nothing to do yet". Centralized here
+  -- instead of copy-pasted once per target.
+  function self.safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then print("[Updater] internal error: " .. tostring(err)) end
+  end
+
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"
@@ -729,7 +621,7 @@ end
 
 return Updater
 end)()
-local Screen = (function()
+local __inc_lib_screen_lua = (function()
 --------------------------------------------------------------------
 -- shared console-screen framework
 --
@@ -1159,6 +1051,203 @@ end
 
 return Screen
 end)()
+local __inc_lib_util_lua = (function()
+--------------------------------------------------------------------
+-- small stateless helpers duplicated (in some cases four or five times,
+-- byte-for-byte) across the targets before being centralized here:
+-- coercing a raw typed console argument, formatting a number/telemetry
+-- unit for display, and collecting a table's keys into a sorted list.
+--------------------------------------------------------------------
+
+local Util = {}
+
+-- Turns a raw typed string into a number/boolean/string, the rule every
+-- target's "simulate/trigger an action" input uses: "40" -> 40,
+-- "true"/"false" -> booleans (case-insensitive), blank/nil -> nil,
+-- anything else -> the string as-is.
+function Util.parseArg(raw)
+  if not raw or raw == "" then return nil end
+  if tonumber(raw) then return tonumber(raw) end
+  if raw:lower() == "true" then return true end
+  if raw:lower() == "false" then return false end
+  return raw
+end
+
+-- Compact SI-prefixed number: 12345 -> "12.3k", 4200000 -> "4.20M".
+function Util.si(n)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a = math.abs(n)
+  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
+  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
+  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
+  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
+  return string.format("%.0f", n)
+end
+
+-- Same SI-prefix scaling as si(), with a unit suffix attached:
+-- fmtUnit(6830000000, "FE") -> "6.83 GFE", fmtUnit(3870000, "FE/t") ->
+-- "3.87 MFE/t". forceSign prefixes a "+" on positive values, for
+-- input/output rates where the sign itself is the interesting part.
+function Util.fmtUnit(n, unit, forceSign)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a, prefix = math.abs(n), ""
+  local v = n
+  if a >= 1e12 then v, prefix = n / 1e12, "T"
+  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
+  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
+  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
+  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
+  local sign = (forceSign and n > 0) and "+" or ""
+  return sign .. num .. " " .. prefix .. (unit or "")
+end
+
+-- Sorted, de-duplicated keys across any number of tables - the
+-- "an entity might be known from live telemetry, the broker's registry,
+-- or both" merge every target with more than one entity cache needed at
+-- least once. A single table works too (Util.sortedKeys below is just
+-- this with one argument).
+function Util.sortedKeysMerged(...)
+  local seen, out = {}, {}
+  for _, t in ipairs({ ... }) do
+    for k in pairs(t) do
+      if not seen[k] then
+        out[#out + 1] = k
+        seen[k] = true
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+function Util.sortedKeys(t)
+  return Util.sortedKeysMerged(t)
+end
+
+return Util
+end)()
+--------------------------------------------------------------------
+-- cbus subscriber  --  dashboard edition
+--
+-- Run modes:
+--   subscriber          -> normal display mode
+--   subscriber setup    -> interactive setup
+--
+-- Setup mode (terminal + live monitor preview):
+--   Screen 1 - Entities: every provider entity the broker knows,
+--     toggle on/off, set display names (aliases). New entities that
+--     appear later just need a quick toggle here.
+--   Screen 2 - Layout editor: move & resize each panel directly on
+--     the monitor with arrow keys / WASD, add group titles, separator
+--     lines and action buttons (k), edit which properties/calculated
+--     properties a panel shows (f), or generate a whole dashboard at
+--     once with auto-layout (g), which groups entities by
+--     provider/topic kind (falling back to a name-prefix guess) and
+--     sizes each panel from its actual field count.
+--
+-- Action buttons run entity.action (with a fixed args value) on tap,
+-- confirmed in the monitor's top status bar for a few seconds.
+--
+-- In display mode, newly announced entities are added to the config
+-- automatically (disabled) and a hint is printed.
+--
+-- Save as startup.lua. Needs: modem + monitor.
+--------------------------------------------------------------------
+
+local PROTOCOL     = "cbus"
+local CONFIG_FILE  = "display.cfg"
+local STALE_AFTER  = 8    -- s without data -> panel shows an error
+local STATUS_ROWS  = 1    -- top row(s) reserved for the status bar
+local REG_INTERVAL = 10
+local SUB_INTERVAL = 15
+
+local args = { ... }
+
+peripheral.find("modem", function(n) rednet.open(n) end)
+local mon = peripheral.find("monitor")
+if not mon then error("No monitor found!", 0) end
+
+-- The real peripheral - clearMonitor() below reassigns `mon` itself to a
+-- double-buffered window over this every redraw pass, but setTextScale/
+-- setPaletteColour and the buffer's own creation need the real device,
+-- not whatever window currently wraps it.
+local realMon = mon
+
+--------------------------------------------------------------------
+-- config
+--------------------------------------------------------------------
+local cfg
+
+local function saveConfig()
+  -- strip runtime data (keys starting with "_", e.g. the _win window
+  -- objects attached to layout items) and anything that cannot be
+  -- serialized (functions, coroutines, ...) before writing
+  local function sanitize(v, seen)
+    local t = type(v)
+    if t == "table" then
+      seen = seen or {}
+      if seen[v] then return nil end
+      seen[v] = true
+      local out = {}
+      for k, val in pairs(v) do
+        local kt = type(k)
+        if (kt == "string" or kt == "number")
+           and not (kt == "string" and k:sub(1, 1) == "_") then
+          local sv = sanitize(val, seen)
+          if sv ~= nil then out[k] = sv end
+        end
+      end
+      seen[v] = nil
+      return out
+    elseif t == "number" or t == "string" or t == "boolean" then
+      return v
+    end
+    return nil
+  end
+
+  local ok, err = pcall(function()
+    local data = textutils.serialize(sanitize(cfg))
+    -- atomic-ish write: temp file first, then swap, so a crash
+    -- mid-write can never corrupt the existing config
+    local f = fs.open(CONFIG_FILE .. ".tmp", "w")
+    f.write(data)
+    f.close()
+    if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
+    fs.move(CONFIG_FILE .. ".tmp", CONFIG_FILE)
+  end)
+  if not ok then
+    printError("config save failed: " .. tostring(err))
+  end
+end
+
+local function loadConfig()
+  -- leftover temp file from a crashed save -> discard it
+  if fs.exists(CONFIG_FILE .. ".tmp") then fs.delete(CONFIG_FILE .. ".tmp") end
+  if fs.exists(CONFIG_FILE) then
+    local f = fs.open(CONFIG_FILE, "r")
+    local raw = f.readAll()
+    f.close()
+    cfg = textutils.unserialize(raw)
+    if not cfg then
+      -- old (Lua-source) config format -> back it up and start fresh
+      fs.move(CONFIG_FILE, CONFIG_FILE .. ".old")
+      print("old config format detected -> backed up as " .. CONFIG_FILE .. ".old")
+      cfg = nil
+    end
+  end
+  cfg = cfg or {}
+  cfg.name = cfg.name or "display1"
+  cfg.textScale = cfg.textScale or 0.5
+  cfg.entities = cfg.entities or {}   -- name -> {enabled, alias}
+  cfg.layout = cfg.layout or {}       -- {type="panel"|"title"|"line", ...}
+end
+
+--------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+local Updater = __inc_lib_updater_lua
+local Screen = __inc_lib_screen_lua
+local Util = __inc_lib_util_lua
 
 -- Routine re-check cadence, retry-after-failure backoff, and the
 -- computer-ID stagger that keeps a whole fleet of computers from bursting
@@ -1167,14 +1256,6 @@ end)()
 -- - updater.tick(), called every iteration from tick() below, is the only
 -- thing needed to drive it.
 local updater = Updater.new({ scriptName = "subscriber.lua" })
-
--- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
--- inside the updater would fail with literally no visible trace, making it
--- indistinguishable from "nothing to do yet". This surfaces it instead.
-local function safeUpdaterCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then print("[Updater] internal error: " .. tostring(err)) end
-end
 
 --------------------------------------------------------------------
 -- broker communication + state
@@ -1215,16 +1296,6 @@ local function requestRegistry() send({ type = "registry" }) end
 
 local function sendCommand(entity, action, cmdArgs)
   send({ type = "command", entity = entity, action = action, args = cmdArgs })
-end
-
--- turns a raw typed string into a number/boolean/string, same rule the
--- broker's own terminal browser uses, so buttons behave consistently
-local function parseArg(raw)
-  if not raw or raw == "" then return nil end
-  if tonumber(raw) then return tonumber(raw) end
-  if raw:lower() == "true" then return true end
-  if raw:lower() == "false" then return false end
-  return raw
 end
 
 -- returns true if a NEW provider entity was added to the config
@@ -1271,30 +1342,6 @@ end
 --------------------------------------------------------------------
 -- formatting
 --------------------------------------------------------------------
-local function si(n)
-  if type(n) ~= "number" then return tostring(n or "?") end
-  local a = math.abs(n)
-  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
-  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
-  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
-  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
-  return string.format("%.0f", n)
-end
-
--- prefix attached to the unit: "6.83 TFE", "3.87 MFE/t"
-local function fmtUnit(n, unit, forceSign)
-  if type(n) ~= "number" then return tostring(n or "?") end
-  local a, prefix = math.abs(n), ""
-  local v = n
-  if a >= 1e12 then v, prefix = n / 1e12, "T"
-  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
-  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
-  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
-  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
-  local sign = (forceSign and n > 0) and "+" or ""
-  return sign .. num .. " " .. prefix .. unit
-end
-
 local function autoFields(data)
   local keys = {}
   for k, v in pairs(data) do
@@ -1529,16 +1576,16 @@ local function renderPanel(win, item)
       else
         local text, col = nil, colors.white
         if f.type == "energy" then
-          text = fmtUnit(v, "FE")
+          text = Util.fmtUnit(v, "FE")
         elseif f.type == "rate" then
           if f.signed and type(v) == "number" then
             col = v >= 0 and colors.lime or colors.red
-            text = fmtUnit(v, "FE/t", true)
+            text = Util.fmtUnit(v, "FE/t", true)
           else
-            text = fmtUnit(v, "FE/t")
+            text = Util.fmtUnit(v, "FE/t")
           end
         else
-          text = type(v) == "number" and si(v) or tostring(v)
+          text = type(v) == "number" and Util.si(v) or tostring(v)
           local sUpper = text:upper()
           if sUpper:find("RUNNING") or sUpper:find("ACTIVE") or sUpper:find("ONLINE") then
             col = colors.lime
@@ -2068,10 +2115,7 @@ end
 -- setup screen 1: entities
 --------------------------------------------------------------------
 local function sortedEntityNames()
-  local names = {}
-  for n in pairs(cfg.entities) do names[#names + 1] = n end
-  table.sort(names)
-  return names
+  return Util.sortedKeys(cfg.entities)
 end
 
 local function entityScreen()
@@ -2398,7 +2442,7 @@ local function editItemProperties(item)
         local argsRaw = prompt("args (blank = none): ", item.args ~= nil and tostring(item.args) or "")
         local fg = pickList("text color:", COLOR_NAMES, false, function(n) return colors[n] end, item.fg) or item.fg or "white"
         local bg = pickList("button color:", COLOR_NAMES, false, function(n) return colors[n] end, item.bg) or item.bg or "blue"
-        item.entity, item.action, item.args = entity, action, parseArg(argsRaw)
+        item.entity, item.action, item.args = entity, action, Util.parseArg(argsRaw)
         item.label = label ~= "" and label or action:upper()
         item.fg, item.bg = fg, bg
         saveConfig()
@@ -2506,7 +2550,7 @@ local function layoutScreen()
             local fg = pickList("text color:", COLOR_NAMES, false, function(n) return colors[n] end) or "white"
             local bg = pickList("button color:", COLOR_NAMES, false, function(n) return colors[n] end) or "blue"
             local item = {
-              type = "button", entity = entity, action = action, args = parseArg(argsRaw),
+              type = "button", entity = entity, action = action, args = Util.parseArg(argsRaw),
               label = label ~= "" and label or action:upper(), fg = fg, bg = bg,
               x = 1, y = 1, w = math.max(10, #(label ~= "" and label or action) + 4), h = 3,
             }
@@ -2710,7 +2754,7 @@ local function runDisplay()
   local function tick()
     -- Drives all update-check scheduling (routine checks, failure
     -- retries, stuck-request recovery) - see updater.tick()'s own comment.
-    safeUpdaterCall(updater.tick)
+    updater.safeCall(updater.tick)
 
     local t = os.clock()
     if t >= nextDraw then
@@ -2770,7 +2814,7 @@ local function runDisplay()
       end
 
     elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-      safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
+      updater.safeCall(updater.handleHttp, ev[1], ev[2], ev[3])
     end
 
     local ok, err = pcall(tick)
@@ -2782,7 +2826,7 @@ end
 -- main
 --------------------------------------------------------------------
 loadConfig()
-safeUpdaterCall(updater.checkNow)
+updater.safeCall(updater.checkNow)
 if args[1] == "setup" then
   runSetup()
 else

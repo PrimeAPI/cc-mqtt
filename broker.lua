@@ -1,94 +1,6 @@
--- cc-mqtt broker.lua | release v18 | commit 07668c7 | built 2026-07-25T18:27:28Z
+-- cc-mqtt broker.lua | release v19 | commit 7fae102 | built 2026-07-25T19:06:17Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
---------------------------------------------------------------------
--- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
---
--- * Providers ANNOUNCE themselves and PUBLISH data on topics
--- * Subscribers SUBSCRIBE with topic patterns (MQTT style: +, #)
--- * Commands are routed broker -> provider ("command" messages)
--- * Terminal runs interactive Entity Browser (inspect telemetry, purge offline, trigger actions)
--- * First connected monitor (if present) lists all known entities;
---   a second monitor (if present) shows a timestamped rolling log of
---   every action triggered, newest at the bottom
---
--- Save as startup.lua on the broker computer. Needs a modem.
---------------------------------------------------------------------
-
-local PROTOCOL      = "cbus"
-local HOSTNAME      = "broker"
-local OFFLINE_AFTER = 15   -- seconds without a message => shown offline
-local TICK          = 2    -- monitor refresh / prune interval
-
-peripheral.find("modem", function(n) rednet.open(n) end)
-rednet.host(PROTOCOL, HOSTNAME)
-
--- discover every attached monitor by name (no assumptions about
--- peripheral.find's return order), sort so the assignment is stable
--- across reboots, then take the first for the entity list and the
--- second (if any) for the action log
-local monitorNames = {}
-for _, name in ipairs(peripheral.getNames()) do
-  if peripheral.getType(name) == "monitor" then
-    monitorNames[#monitorNames + 1] = name
-  end
-end
-table.sort(monitorNames)
-
-local mon      = monitorNames[1] and peripheral.wrap(monitorNames[1])
-local logMon   = monitorNames[2] and peripheral.wrap(monitorNames[2])
-local debugMon = monitorNames[3] and peripheral.wrap(monitorNames[3])
-if mon then mon.setTextScale(0.5) end
-if logMon then logMon.setTextScale(0.5) end
-if debugMon then debugMon.setTextScale(0.5) end
-
-print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
-if mon then print("  " .. monitorNames[1] .. " -> entity list") end
-if logMon then print("  " .. monitorNames[2] .. " -> action log") end
-if debugMon then
-  print("  " .. monitorNames[3] .. " -> diagnostics (msg/s, redraw & loop timing)")
-elseif mon and not logMon then
-  print("  (only one monitor found - action log & diagnostics disabled)")
-end
-
-local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
-local subs      = {}   -- computerId -> {patterns, name}
-local retained  = {}   -- topic -> last data message (sent to new subscribers)
-
-local actionLog = {}   -- { {time=os.date string, text=...}, ... }, oldest first
-local LOG_MAX   = 200  -- hard cap so a long-running broker doesn't grow forever
-
-local selectedIndex       = 1
-local selectedActionIndex = 1
-local inspectEntityName   = nil
-local inputActionName     = nil
-local inputBuffer         = ""
-
--- Forward-declared: logAction() (below) already wants to log into this,
--- but it's only actually created down in the "terminal interactive
--- browser" section. Same reasoning as provider.lua's identical forward
--- decl - a local assigned later is still the same upvalue every closure
--- defined in between sees.
-local termScreen
-
--- Lightweight self-instrumentation, so "is this slow" is something you can
--- read off a screen instead of guessing. lastIterMs/maxIterMs cover a full
--- while-loop pass (message handling + redraws); lastRedrawMs/maxRedrawMs
--- isolate just the redraw cost. If maxIterMs is high while maxRedrawMs and
--- msgPerSec both stay low, the loop itself has little to do - that points
--- at external (server-tick) lag rather than anything in this script, since
--- CC:Tweaked's own event delivery and peripheral/monitor calls slow down
--- proportionally when the server is struggling to keep up 20 TPS.
-local stats = {
-  msgTotal = 0, msgPerSec = 0, msgWindowCount = 0, msgWindowStart = 0,
-  lastRedrawMs = 0, maxRedrawMs = 0,
-  lastIterMs = 0, maxIterMs = 0,
-  statWindowStart = 0,
-}
-
---------------------------------------------------------------------
--- auto updater
---------------------------------------------------------------------
-local Updater = (function()
+local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
 -- shared auto-updater
 --
@@ -243,6 +155,17 @@ end
 function Updater.new(opts)
   local self = {}
   self.getShortVer = getShortVer
+
+  -- Every caller wraps its own checkNow()/tick()/handleHttp() calls in
+  -- exactly this pcall - a bug inside the updater failing with literally
+  -- no visible trace (a bare pcall silently discards its error result)
+  -- is indistinguishable from "nothing to do yet". Centralized here
+  -- instead of copy-pasted once per target.
+  function self.safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then print("[Updater] internal error: " .. tostring(err)) end
+  end
+
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"
@@ -698,7 +621,7 @@ end
 
 return Updater
 end)()
-local Screen = (function()
+local __inc_lib_screen_lua = (function()
 --------------------------------------------------------------------
 -- shared console-screen framework
 --
@@ -1128,6 +1051,172 @@ end
 
 return Screen
 end)()
+local __inc_lib_util_lua = (function()
+--------------------------------------------------------------------
+-- small stateless helpers duplicated (in some cases four or five times,
+-- byte-for-byte) across the targets before being centralized here:
+-- coercing a raw typed console argument, formatting a number/telemetry
+-- unit for display, and collecting a table's keys into a sorted list.
+--------------------------------------------------------------------
+
+local Util = {}
+
+-- Turns a raw typed string into a number/boolean/string, the rule every
+-- target's "simulate/trigger an action" input uses: "40" -> 40,
+-- "true"/"false" -> booleans (case-insensitive), blank/nil -> nil,
+-- anything else -> the string as-is.
+function Util.parseArg(raw)
+  if not raw or raw == "" then return nil end
+  if tonumber(raw) then return tonumber(raw) end
+  if raw:lower() == "true" then return true end
+  if raw:lower() == "false" then return false end
+  return raw
+end
+
+-- Compact SI-prefixed number: 12345 -> "12.3k", 4200000 -> "4.20M".
+function Util.si(n)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a = math.abs(n)
+  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
+  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
+  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
+  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
+  return string.format("%.0f", n)
+end
+
+-- Same SI-prefix scaling as si(), with a unit suffix attached:
+-- fmtUnit(6830000000, "FE") -> "6.83 GFE", fmtUnit(3870000, "FE/t") ->
+-- "3.87 MFE/t". forceSign prefixes a "+" on positive values, for
+-- input/output rates where the sign itself is the interesting part.
+function Util.fmtUnit(n, unit, forceSign)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a, prefix = math.abs(n), ""
+  local v = n
+  if a >= 1e12 then v, prefix = n / 1e12, "T"
+  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
+  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
+  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
+  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
+  local sign = (forceSign and n > 0) and "+" or ""
+  return sign .. num .. " " .. prefix .. (unit or "")
+end
+
+-- Sorted, de-duplicated keys across any number of tables - the
+-- "an entity might be known from live telemetry, the broker's registry,
+-- or both" merge every target with more than one entity cache needed at
+-- least once. A single table works too (Util.sortedKeys below is just
+-- this with one argument).
+function Util.sortedKeysMerged(...)
+  local seen, out = {}, {}
+  for _, t in ipairs({ ... }) do
+    for k in pairs(t) do
+      if not seen[k] then
+        out[#out + 1] = k
+        seen[k] = true
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+function Util.sortedKeys(t)
+  return Util.sortedKeysMerged(t)
+end
+
+return Util
+end)()
+--------------------------------------------------------------------
+-- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
+--
+-- * Providers ANNOUNCE themselves and PUBLISH data on topics
+-- * Subscribers SUBSCRIBE with topic patterns (MQTT style: +, #)
+-- * Commands are routed broker -> provider ("command" messages)
+-- * Terminal runs interactive Entity Browser (inspect telemetry, purge offline, trigger actions)
+-- * First connected monitor (if present) lists all known entities;
+--   a second monitor (if present) shows a timestamped rolling log of
+--   every action triggered, newest at the bottom
+--
+-- Save as startup.lua on the broker computer. Needs a modem.
+--------------------------------------------------------------------
+
+local PROTOCOL      = "cbus"
+local HOSTNAME      = "broker"
+local OFFLINE_AFTER = 15   -- seconds without a message => shown offline
+local TICK          = 2    -- monitor refresh / prune interval
+
+peripheral.find("modem", function(n) rednet.open(n) end)
+rednet.host(PROTOCOL, HOSTNAME)
+
+-- discover every attached monitor by name (no assumptions about
+-- peripheral.find's return order), sort so the assignment is stable
+-- across reboots, then take the first for the entity list and the
+-- second (if any) for the action log
+local monitorNames = {}
+for _, name in ipairs(peripheral.getNames()) do
+  if peripheral.getType(name) == "monitor" then
+    monitorNames[#monitorNames + 1] = name
+  end
+end
+table.sort(monitorNames)
+
+local mon      = monitorNames[1] and peripheral.wrap(monitorNames[1])
+local logMon   = monitorNames[2] and peripheral.wrap(monitorNames[2])
+local debugMon = monitorNames[3] and peripheral.wrap(monitorNames[3])
+if mon then mon.setTextScale(0.5) end
+if logMon then logMon.setTextScale(0.5) end
+if debugMon then debugMon.setTextScale(0.5) end
+
+print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
+if mon then print("  " .. monitorNames[1] .. " -> entity list") end
+if logMon then print("  " .. monitorNames[2] .. " -> action log") end
+if debugMon then
+  print("  " .. monitorNames[3] .. " -> diagnostics (msg/s, redraw & loop timing)")
+elseif mon and not logMon then
+  print("  (only one monitor found - action log & diagnostics disabled)")
+end
+
+local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
+local subs      = {}   -- computerId -> {patterns, name}
+local retained  = {}   -- topic -> last data message (sent to new subscribers)
+
+local actionLog = {}   -- { {time=os.date string, text=...}, ... }, oldest first
+local LOG_MAX   = 200  -- hard cap so a long-running broker doesn't grow forever
+
+local selectedIndex       = 1
+local selectedActionIndex = 1
+local inspectEntityName   = nil
+local inputActionName     = nil
+local inputBuffer         = ""
+
+-- Forward-declared: logAction() (below) already wants to log into this,
+-- but it's only actually created down in the "terminal interactive
+-- browser" section. Same reasoning as provider.lua's identical forward
+-- decl - a local assigned later is still the same upvalue every closure
+-- defined in between sees.
+local termScreen
+
+-- Lightweight self-instrumentation, so "is this slow" is something you can
+-- read off a screen instead of guessing. lastIterMs/maxIterMs cover a full
+-- while-loop pass (message handling + redraws); lastRedrawMs/maxRedrawMs
+-- isolate just the redraw cost. If maxIterMs is high while maxRedrawMs and
+-- msgPerSec both stay low, the loop itself has little to do - that points
+-- at external (server-tick) lag rather than anything in this script, since
+-- CC:Tweaked's own event delivery and peripheral/monitor calls slow down
+-- proportionally when the server is struggling to keep up 20 TPS.
+local stats = {
+  msgTotal = 0, msgPerSec = 0, msgWindowCount = 0, msgWindowStart = 0,
+  lastRedrawMs = 0, maxRedrawMs = 0,
+  lastIterMs = 0, maxIterMs = 0,
+  statWindowStart = 0,
+}
+
+--------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+local Updater = __inc_lib_updater_lua
+local Screen = __inc_lib_screen_lua
+local Util = __inc_lib_util_lua
 
 -- Each connected monitor gets its own double-buffered Screen (see
 -- src/lib/screen.lua) - views registered further down, once their draw
@@ -1146,14 +1235,6 @@ local debugMonScreen = debugMon and Screen.new(debugMon, {})
 -- - updater.tick(), called every main-loop iteration below, is the only
 -- thing needed to drive it.
 local updater = Updater.new({ scriptName = "broker.lua" })
-
--- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
--- inside the updater would fail with literally no visible trace, making it
--- indistinguishable from "nothing to do yet". This surfaces it instead.
-local function safeUpdaterCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then print("[Updater] internal error: " .. tostring(err)) end
-end
 
 local function now() return os.clock() end
 local bootTime = now()
@@ -1237,15 +1318,7 @@ local function sendCommand(entName, actionName, rawArgs)
   if not e.online then
     return false, "Entity '" .. tostring(entName) .. "' is offline"
   end
-  local parsedArgs = rawArgs
-  if rawArgs and rawArgs ~= "" then
-    if tonumber(rawArgs) then parsedArgs = tonumber(rawArgs)
-    elseif rawArgs:lower() == "true" then parsedArgs = true
-    elseif rawArgs:lower() == "false" then parsedArgs = false
-    end
-  else
-    parsedArgs = nil
-  end
+  local parsedArgs = Util.parseArg(rawArgs)
 
   send(e.id, {
     type = "command",
@@ -1462,10 +1535,7 @@ end
 --------------------------------------------------------------------
 
 local function sortedEntityNames()
-  local names = {}
-  for n in pairs(entities) do names[#names + 1] = n end
-  table.sort(names)
-  return names
+  return Util.sortedKeys(entities)
 end
 
 local function drawList(screen)
@@ -1850,7 +1920,7 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
-safeUpdaterCall(updater.checkNow)
+updater.safeCall(updater.checkNow)
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 
 termScreen.show("list")
@@ -1893,12 +1963,12 @@ while true do
     termScreen.handleEvent(ev)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
+    updater.safeCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
   -- Drives all update-check scheduling (routine checks, failure retries,
   -- stuck-request recovery) - see updater.tick()'s own comment.
-  safeUpdaterCall(updater.tick)
+  updater.safeCall(updater.tick)
 
   local t = now()
   if t >= nextTick then

@@ -1,51 +1,6 @@
--- cc-mqtt controller.lua | release v18 | commit 07668c7 | built 2026-07-25T18:27:28Z
+-- cc-mqtt controller.lua | release v19 | commit 7fae102 | built 2026-07-25T19:06:17Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
---------------------------------------------------------------------
--- cbus controller  --  automation & control server for CC:Tweaked
---
--- * Subscribes to telemetry streams across the cbus network
--- * Discovers actual connected network entities and their remote actions
--- * Interactive Rule Creator / Editor Wizard powered by real entities & actions!
--- * Evaluates user-defined rules and triggers automatic remote actions
--- * Supports dynamic expression scaling (e.g. fillPercent * 100MFE/t)
--- * Renders live automation status & audit logs on attached monitors
--- * Terminal runs interactive TUI (toggle rules, force-test, inspect state)
---
--- Save as startup.lua on a controller computer. Needs a modem.
---------------------------------------------------------------------
-
-local PROTOCOL     = "cbus"
-local CONFIG_FILE  = "automations.cfg"
-local EVAL_TICK    = 0.5   -- rule evaluation interval (s)
-local SYNC_TICK    = 10    -- broker re-sync interval (s)
-local MAX_AUDIT    = 15    -- max audit log history items
-
-peripheral.find("modem", function(n) rednet.open(n) end)
-local mon = peripheral.find("monitor")
-if mon then mon.setTextScale(0.5) end
-
-local broker        = nil
-local entities      = {}  -- entName -> { id, kind, topics, actions, lastSeen, online }
-local state         = {}  -- entName -> { propKey -> propVal }
-local auditLog      = {}  -- list of { time, ruleId, ruleName, entity, action, args, status }
-local rules         = {}  -- list of rule tables
-local selectedIndex = 1
-local pendingDelete = false
-
--- Wizard state for creating/editing rules
-local wizardData    = nil
-
--- Forward-declared: loadConfig() (below) already wants to log a banner
--- into this, but it's only actually created down in the "terminal
--- interactive TUI" section. Same reasoning as provider.lua's identical
--- forward decl - a local assigned later is still the same upvalue every
--- closure defined in between sees.
-local termScreen
-
---------------------------------------------------------------------
--- auto updater
---------------------------------------------------------------------
-local Updater = (function()
+local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
 -- shared auto-updater
 --
@@ -200,6 +155,17 @@ end
 function Updater.new(opts)
   local self = {}
   self.getShortVer = getShortVer
+
+  -- Every caller wraps its own checkNow()/tick()/handleHttp() calls in
+  -- exactly this pcall - a bug inside the updater failing with literally
+  -- no visible trace (a bare pcall silently discards its error result)
+  -- is indistinguishable from "nothing to do yet". Centralized here
+  -- instead of copy-pasted once per target.
+  function self.safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then print("[Updater] internal error: " .. tostring(err)) end
+  end
+
   local scriptName = opts.scriptName
   local repoOwner   = opts.repoOwner or "PrimeAPI"
   local repoName    = opts.repoName or "cc-mqtt"
@@ -655,7 +621,7 @@ end
 
 return Updater
 end)()
-local Screen = (function()
+local __inc_lib_screen_lua = (function()
 --------------------------------------------------------------------
 -- shared console-screen framework
 --
@@ -1085,16 +1051,131 @@ end
 
 return Screen
 end)()
+local __inc_lib_util_lua = (function()
+--------------------------------------------------------------------
+-- small stateless helpers duplicated (in some cases four or five times,
+-- byte-for-byte) across the targets before being centralized here:
+-- coercing a raw typed console argument, formatting a number/telemetry
+-- unit for display, and collecting a table's keys into a sorted list.
+--------------------------------------------------------------------
+
+local Util = {}
+
+-- Turns a raw typed string into a number/boolean/string, the rule every
+-- target's "simulate/trigger an action" input uses: "40" -> 40,
+-- "true"/"false" -> booleans (case-insensitive), blank/nil -> nil,
+-- anything else -> the string as-is.
+function Util.parseArg(raw)
+  if not raw or raw == "" then return nil end
+  if tonumber(raw) then return tonumber(raw) end
+  if raw:lower() == "true" then return true end
+  if raw:lower() == "false" then return false end
+  return raw
+end
+
+-- Compact SI-prefixed number: 12345 -> "12.3k", 4200000 -> "4.20M".
+function Util.si(n)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a = math.abs(n)
+  if a >= 1e12 then return string.format("%.2fT", n / 1e12) end
+  if a >= 1e9  then return string.format("%.2fG", n / 1e9)  end
+  if a >= 1e6  then return string.format("%.2fM", n / 1e6)  end
+  if a >= 1e3  then return string.format("%.1fk", n / 1e3)  end
+  return string.format("%.0f", n)
+end
+
+-- Same SI-prefix scaling as si(), with a unit suffix attached:
+-- fmtUnit(6830000000, "FE") -> "6.83 GFE", fmtUnit(3870000, "FE/t") ->
+-- "3.87 MFE/t". forceSign prefixes a "+" on positive values, for
+-- input/output rates where the sign itself is the interesting part.
+function Util.fmtUnit(n, unit, forceSign)
+  if type(n) ~= "number" then return tostring(n or "?") end
+  local a, prefix = math.abs(n), ""
+  local v = n
+  if a >= 1e12 then v, prefix = n / 1e12, "T"
+  elseif a >= 1e9 then v, prefix = n / 1e9, "G"
+  elseif a >= 1e6 then v, prefix = n / 1e6, "M"
+  elseif a >= 1e3 then v, prefix = n / 1e3, "k" end
+  local num = string.format(prefix == "" and "%.0f" or "%.2f", v)
+  local sign = (forceSign and n > 0) and "+" or ""
+  return sign .. num .. " " .. prefix .. (unit or "")
+end
+
+-- Sorted, de-duplicated keys across any number of tables - the
+-- "an entity might be known from live telemetry, the broker's registry,
+-- or both" merge every target with more than one entity cache needed at
+-- least once. A single table works too (Util.sortedKeys below is just
+-- this with one argument).
+function Util.sortedKeysMerged(...)
+  local seen, out = {}, {}
+  for _, t in ipairs({ ... }) do
+    for k in pairs(t) do
+      if not seen[k] then
+        out[#out + 1] = k
+        seen[k] = true
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+function Util.sortedKeys(t)
+  return Util.sortedKeysMerged(t)
+end
+
+return Util
+end)()
+--------------------------------------------------------------------
+-- cbus controller  --  automation & control server for CC:Tweaked
+--
+-- * Subscribes to telemetry streams across the cbus network
+-- * Discovers actual connected network entities and their remote actions
+-- * Interactive Rule Creator / Editor Wizard powered by real entities & actions!
+-- * Evaluates user-defined rules and triggers automatic remote actions
+-- * Supports dynamic expression scaling (e.g. fillPercent * 100MFE/t)
+-- * Renders live automation status & audit logs on attached monitors
+-- * Terminal runs interactive TUI (toggle rules, force-test, inspect state)
+--
+-- Save as startup.lua on a controller computer. Needs a modem.
+--------------------------------------------------------------------
+
+local PROTOCOL     = "cbus"
+local CONFIG_FILE  = "automations.cfg"
+local EVAL_TICK    = 0.5   -- rule evaluation interval (s)
+local SYNC_TICK    = 10    -- broker re-sync interval (s)
+local MAX_AUDIT    = 15    -- max audit log history items
+
+peripheral.find("modem", function(n) rednet.open(n) end)
+local mon = peripheral.find("monitor")
+if mon then mon.setTextScale(0.5) end
+
+local broker        = nil
+local entities      = {}  -- entName -> { id, kind, topics, actions, lastSeen, online }
+local state         = {}  -- entName -> { propKey -> propVal }
+local auditLog      = {}  -- list of { time, ruleId, ruleName, entity, action, args, status }
+local rules         = {}  -- list of rule tables
+local selectedIndex = 1
+local pendingDelete = false
+
+-- Wizard state for creating/editing rules
+local wizardData    = nil
+
+-- Forward-declared: loadConfig() (below) already wants to log a banner
+-- into this, but it's only actually created down in the "terminal
+-- interactive TUI" section. Same reasoning as provider.lua's identical
+-- forward decl - a local assigned later is still the same upvalue every
+-- closure defined in between sees.
+local termScreen
+
+--------------------------------------------------------------------
+-- auto updater
+--------------------------------------------------------------------
+local Updater = __inc_lib_updater_lua
+local Screen = __inc_lib_screen_lua
+local Util = __inc_lib_util_lua
 
 local updater = Updater.new({ scriptName = "controller.lua" })
-
--- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
--- inside the updater would fail with literally no visible trace, making it
--- indistinguishable from "nothing to do yet". This surfaces it instead.
-local function safeUpdaterCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  if not ok then print("[Updater] internal error: " .. tostring(err)) end
-end
 
 --------------------------------------------------------------------
 -- helper utilities & formatting
@@ -1234,15 +1315,7 @@ end
 -- references even when the entity name itself isn't a valid Lua
 -- identifier (e.g. contains hyphens, like "fission-reactor")
 local function getKnownEntityNamesForEval()
-  local seen = {}
-  local list = {}
-  for n in pairs(state) do
-    if not seen[n] then list[#list + 1] = n; seen[n] = true end
-  end
-  for n in pairs(entities) do
-    if not seen[n] then list[#list + 1] = n; seen[n] = true end
-  end
-  return list
+  return Util.sortedKeysMerged(state, entities)
 end
 
 local function preprocessExpression(expr)
@@ -1637,24 +1710,7 @@ end
 -- interactive rule wizard logic
 --------------------------------------------------------------------
 local function getDiscoveredEntitiesList()
-  local list = {}
-  local seen = {}
-
-  for n in pairs(state) do
-    if not seen[n] then
-      list[#list + 1] = n
-      seen[n] = true
-    end
-  end
-  for n in pairs(entities) do
-    if not seen[n] then
-      list[#list + 1] = n
-      seen[n] = true
-    end
-  end
-
-  table.sort(list)
-  return list
+  return Util.sortedKeysMerged(state, entities)
 end
 
 local function getDiscoveredPropertiesFor(entName)
@@ -2667,7 +2723,7 @@ loadConfig()
 -- below (nextSync, initialized already due, plus the "broker_online"
 -- rednet handler in handleMessage()) - so nothing here blocks, and this
 -- fires unconditionally, broker or no broker.
-safeUpdaterCall(updater.checkNow)
+updater.safeCall(updater.checkNow)
 
 termScreen.show("rules")
 termScreen.enterScreensaver()
@@ -2703,12 +2759,12 @@ while true do
     termScreen.handleEvent(ev)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
+    updater.safeCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
   -- Drives all update-check scheduling (routine checks, failure retries,
   -- stuck-request recovery) - see updater.tick()'s own comment.
-  safeUpdaterCall(updater.tick)
+  updater.safeCall(updater.tick)
 
   local t = now()
   if t >= nextEval then
