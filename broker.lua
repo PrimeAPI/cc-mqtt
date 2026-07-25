@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release v22 | commit 49ce801 | built 2026-07-25T21:07:56Z
+-- cc-mqtt broker.lua | release v23 | commit b64c20f | built 2026-07-25T21:14:52Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -1124,6 +1124,19 @@ function Util.sortedKeys(t)
   return Util.sortedKeysMerged(t)
 end
 
+-- Release versions are always "vNN" (see scripts/build.py's
+-- --tag "v${{ github.run_number }}"), a plain incrementing counter, so
+-- "newer than" is just a numeric comparison once the "v" is stripped -
+-- no semver, no dates. A local dev build's "dev" (or any other string
+-- that isn't exactly "v" + digits, e.g. a commit sha from before the
+-- updater switched to release-tag versioning) returns nil rather than 0,
+-- so it reads as "unknown", not "very old" - a dev build is often
+-- actually newer code that just isn't a numbered release yet.
+function Util.versionNum(v)
+  local digits = v and v:match("^v(%d+)$")
+  return digits and tonumber(digits) or nil
+end
+
 return Util
 end)()
 local __inc_lib_monitor_lua = (function()
@@ -1618,6 +1631,17 @@ local function drawEntities(screen)
     if not seenKind[k] then orderedKinds[#orderedKinds + 1] = k end
   end
 
+  -- Newest version anyone in the fleet is running (broker included, not
+  -- just entities) - not the broker's own version specifically, so a
+  -- broker that's itself fallen behind doesn't read as "everyone else is
+  -- up to date". Entities on an unnumbered build (e.g. "dev") don't
+  -- count toward this and are never flagged - see Util.versionNum.
+  local maxVerNum = Util.versionNum(updater.currentVersion)
+  for _, n in ipairs(names) do
+    local vn = Util.versionNum(entities[n].version)
+    if vn and (not maxVerNum or vn > maxVerNum) then maxVerNum = vn end
+  end
+
   local cols = math.max(1, math.floor(w / ENT_CELL_W))
   local t = now()
   local y = 2
@@ -1639,7 +1663,9 @@ local function drawEntities(screen)
       screen.write(x + 2, y, padName, colors.white)
 
       local verStr = "v:" .. updater.getShortVer(e.version)
-      screen.write(x + 16, y, verStr, colors.lightGray)
+      local eVerNum = Util.versionNum(e.version)
+      local verColor = (maxVerNum and eVerNum and eVerNum < maxVerNum) and colors.red or colors.lightGray
+      screen.write(x + 16, y, verStr, verColor)
 
       local ageStr = e.online and formatAge(t - e.lastSeen) or "offline"
       screen.write(x + 16 + #verStr + 1, y, ageStr, colors.gray)
