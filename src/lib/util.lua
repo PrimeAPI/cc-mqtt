@@ -70,4 +70,17 @@ function Util.sortedKeys(t)
   return Util.sortedKeysMerged(t)
 end
 
+-- Release versions are always "vNN" (see scripts/build.py's
+-- --tag "v${{ github.run_number }}"), a plain incrementing counter, so
+-- "newer than" is just a numeric comparison once the "v" is stripped -
+-- no semver, no dates. A local dev build's "dev" (or any other string
+-- that isn't exactly "v" + digits, e.g. a commit sha from before the
+-- updater switched to release-tag versioning) returns nil rather than 0,
+-- so it reads as "unknown", not "very old" - a dev build is often
+-- actually newer code that just isn't a numbered release yet.
+function Util.versionNum(v)
+  local digits = v and v:match("^v(%d+)$")
+  return digits and tonumber(digits) or nil
+end
+
 return Util
