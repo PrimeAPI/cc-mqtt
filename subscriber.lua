@@ -1,4 +1,4 @@
--- cc-mqtt subscriber.lua | release v8 | commit 778bc0f | built 2026-07-25T00:51:41Z
+-- cc-mqtt subscriber.lua | release dev | commit c380282 | built 2026-07-25T01:01:11Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus subscriber  --  dashboard edition
@@ -276,22 +276,21 @@ function Updater.new(opts)
   -- later periodic tick. This bounds how long an in-flight check is
   -- trusted before checkNow() treats it as abandoned and starts fresh.
   --
-  -- 60s, not the 20s this started at: the releases/latest API response is a
-  -- few KB of JSON and consistently resolves quickly, but both the release
-  -- asset AND the raw-content fallback - the two paths that actually
-  -- transfer a full ~50-80KB compiled script - have been observed timing
-  -- out with literally no response at all, on a server where the small
-  -- JSON request never has trouble. That pattern (small = fine, large =
-  -- hangs) looks like a slow/throttled connection to GitHub's content-CDN
-  -- hosts rather than either host being actively blocked (a real block
-  -- fails fast, it doesn't hang silently for 20+ seconds) - so it's worth
-  -- giving a genuinely-slow-but-succeeding transfer more room to finish
-  -- before this gives up on it.
-  local STATE_TIMEOUT = 60
-  -- Passed to http.request() itself (see httpRequest() above) - kept
-  -- under STATE_TIMEOUT so CC:Tweaked's own timeout, with a real reported
-  -- reason, fires before this module's own generic "abandoned" backstop.
-  local REQUEST_TIMEOUT = 45
+  -- 25s: verbose logging finally showed what "slow connection" would have
+  -- had to look like to explain the hangs, and it isn't that - a genuinely
+  -- succeeding request (release, fallback, matching what a manual wget of
+  -- the same content does) resolves in under a second, every time. A
+  -- request that's actually going to work was never going to need
+  -- anywhere near 60s, so a shorter timeout only speeds up recovery from
+  -- ones that were never going to resolve at all - it doesn't risk
+  -- cutting off a slow-but-real transfer, because there isn't one.
+  local STATE_TIMEOUT = 25
+  -- Passed to http.request() itself (see httpRequest() above). Kept under
+  -- STATE_TIMEOUT on the (unconfirmed - CC:Tweaked's own timeout hasn't
+  -- actually been observed firing yet, STATE_TIMEOUT's backstop has fired
+  -- first every time so far) chance it does eventually surface a real
+  -- reason before this module's own generic "abandoned" backstop does.
+  local REQUEST_TIMEOUT = 20
   -- A failed/timed-out check is quite possibly transient (exactly the kind
   -- of slow-connection hiccup STATE_TIMEOUT above is guarding against) -
   -- retrying soon costs nothing extra against GitHub's rate limit (still
@@ -333,7 +332,7 @@ function Updater.new(opts)
       end
     end
 
-    print("[Updater] Updating " .. target .. " and rebooting...")
+    print("[Updater] Updating " .. target .. "...")
     local f = fs.open(target .. ".tmp", "w")
     f.write(code)
     f.close()
@@ -344,7 +343,14 @@ function Updater.new(opts)
     vf.write(version)
     vf.close()
 
-    sleep(1)
+    -- Was a flat sleep(1) - long enough that the update itself was never
+    -- in doubt, but far too short to actually read the verbose log above
+    -- before the screen clears on reboot. Counts down out loud specifically
+    -- so it's obvious the computer hasn't just frozen during the pause.
+    for s = 8, 1, -1 do
+      print(("[Updater] Rebooting in %ds..."):format(s))
+      sleep(1)
+    end
     os.reboot()
   end
 
@@ -478,7 +484,18 @@ function Updater.new(opts)
       print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(self.currentVersion), getShortVer(tagName)))
       state = { stage = "asset", url = assetUrl, tagName = tagName, checksum = checksum }
       stateStartedAt = os.clock()
-      httpRequest(state.url, DOWNLOAD_HEADERS, REQUEST_TIMEOUT)
+      -- No headers at all here - not even DOWNLOAD_HEADERS's bare
+      -- User-Agent. A manual `wget` of this exact URL (which sends no
+      -- custom headers) has been confirmed working where this request,
+      -- sending a custom User-Agent, hung indefinitely - while the
+      -- fallback request below, using the SAME DOWNLOAD_HEADERS on a
+      -- non-redirecting host, succeeds instantly. The one thing that
+      -- differs between this URL and the fallback's is that this one
+      -- redirects (github.com -> objects.githubusercontent.com); a custom
+      -- header surviving across that redirect to a signed CDN URL is the
+      -- most likely explanation, so this now matches wget exactly: no
+      -- headers, nothing to interact badly with the redirect target.
+      httpRequest(state.url, nil, REQUEST_TIMEOUT)
 
     elseif state.stage == "asset" then
       local code = handle.readAll()
@@ -543,14 +560,13 @@ function Updater.new(opts)
     if not http then
       return false, "http disabled"
     end
-    -- Same 60s reasoning as STATE_TIMEOUT above: the release-metadata
-    -- request is small and fast, but the asset/fallback requests transfer
-    -- a full compiled script and have been observed needing much longer
-    -- than a short timeout allows on a slow/throttled connection.
-    timeoutSec = timeoutSec or 60
+    -- Same reasoning as STATE_TIMEOUT above: a request that's actually
+    -- going to succeed resolves in under a second, so this only needs to
+    -- be long enough to not cut off a real-but-slightly-slow response.
+    timeoutSec = timeoutSec or 25
 
     local function awaitHttp(url, headers)
-      httpRequest(url, headers or DOWNLOAD_HEADERS, math.max(1, timeoutSec - 5))
+      httpRequest(url, headers, math.max(1, timeoutSec - 5))
       local timer = os.startTimer(timeoutSec)
       while true do
         local ev = { os.pullEvent() }
@@ -576,7 +592,10 @@ function Updater.new(opts)
 
     if tagName then
       if tagName == self.currentVersion then return false, "up to date" end
-      local assetOk, assetRes = awaitHttp(assetUrl)
+      -- No headers - see the async path's identical comment on this exact
+      -- request for why (a redirect-crossing custom header is the
+      -- prime suspect for why this URL hangs while everything else works).
+      local assetOk, assetRes = awaitHttp(assetUrl, nil)
       debugPrint("asset: %s", assetOk and "success" or ("failed (" .. tostring(assetRes) .. ")"))
       if assetOk then
         local code = assetRes.readAll()
@@ -589,7 +608,7 @@ function Updater.new(opts)
       -- asset fetch failed, invalid, or checksum mismatch -> fall through to fallback
     end
 
-    local fbOk, fbRes = awaitHttp(fallbackUrl())
+    local fbOk, fbRes = awaitHttp(fallbackUrl(), DOWNLOAD_HEADERS)
     debugPrint("fallback: %s", fbOk and "success" or ("failed (" .. tostring(fbRes) .. ")"))
     if not fbOk then return false, "check failed" end
     local code = fbRes.readAll()
