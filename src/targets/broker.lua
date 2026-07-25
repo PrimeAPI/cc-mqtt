@@ -92,17 +92,12 @@ local stats = {
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 
--- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
--- every CC:Tweaked computer on this Minecraft server shares the server's
--- one outbound IP. At the old 60s tick, just 2 always-running scripts
--- checking in parallel already exceeds that budget, so most checks were
--- silently rate-limited and falling back to fetching main's raw file by
--- BRANCH name, which lags behind GitHub's raw-content CDN by several
--- minutes. 300s cuts total request volume 5x; the computer-ID-based
--- stagger applied to nextUpdate below spreads checks across that window
--- instead of every computer bursting at once.
-local UPDATE_TICK = 300
-
+-- Routine re-check cadence, retry-after-failure backoff, and the
+-- computer-ID stagger that keeps a whole fleet of computers from bursting
+-- GitHub requests in the same second are all handled internally by the
+-- updater module now (see nextCheckAt/scheduleNext in src/lib/updater.lua)
+-- - updater.tick(), called every main-loop iteration below, is the only
+-- thing needed to drive it.
 local updater = Updater.new({ scriptName = "broker.lua" })
 
 -- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
@@ -935,9 +930,6 @@ redrawDebugMonitor()
 showIdleScreen()
 
 local nextTick = now() + TICK
--- staggered by computer ID so a whole fleet of computers doesn't burst
--- its GitHub requests in the same second and blow the shared rate limit
-local nextUpdate = now() + (os.getComputerID() % UPDATE_TICK)
 
 -- Redraws are throttled separately from message handling. Forwarding a
 -- message (inside handle(), via forward()) is cheap - just rednet.send()
@@ -990,9 +982,8 @@ while true do
     safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
-  -- Runs every iteration (cheap), unlike checkNow() itself which only
-  -- fires every UPDATE_TICK - see updater.tick()'s own comment for why
-  -- that matters.
+  -- Drives all update-check scheduling (routine checks, failure retries,
+  -- stuck-request recovery) - see updater.tick()'s own comment.
   safeUpdaterCall(updater.tick)
 
   local t = now()
@@ -1017,11 +1008,6 @@ while true do
     if redrawMs > stats.maxRedrawMs then stats.maxRedrawMs = redrawMs end
     dirty = false
     nextRedraw = t + REDRAW_TICK
-  end
-
-  if t >= nextUpdate then
-    nextUpdate = t + UPDATE_TICK
-    safeUpdaterCall(updater.checkNow)
   end
 
   local iterMs = (now() - iterT0) * 1000

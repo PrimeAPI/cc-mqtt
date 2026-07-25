@@ -113,11 +113,12 @@ end
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 
-local UPDATE_TICK = 300 -- GitHub auto-update check interval (s), staggered
--- by computer ID (see nextUpdate below) so a whole fleet of computers
--- doesn't burst its GitHub requests in the same second and blow the
--- shared per-server-IP rate limit.
-
+-- Routine re-check cadence, retry-after-failure backoff, and the
+-- computer-ID stagger that keeps a whole fleet of computers from bursting
+-- GitHub requests in the same second are all handled internally by the
+-- updater module now (see nextCheckAt/scheduleNext in src/lib/updater.lua)
+-- - updater.tick(), called every iteration from tick() below, is the only
+-- thing needed to drive it.
 local updater = Updater.new({ scriptName = "subscriber.lua" })
 
 -- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
@@ -1596,11 +1597,8 @@ local function runDisplay()
     mon.write("no entities enabled - run: subscriber setup")
   end
 
-  -- nextUpdate is staggered by computer ID so a whole fleet of computers
-  -- doesn't burst its GitHub requests in the same second and blow the
-  -- shared per-server-IP rate limit
-  local nextDraw, nextReg, nextSub, nextUpdate, nextTermDraw =
-    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, os.clock() + (os.getComputerID() % UPDATE_TICK), 0
+  local nextDraw, nextReg, nextSub, nextTermDraw =
+    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, 0
 
   -- The terminal is a static status console while the dashboard is
   -- running - it used to mirror the entity list live (toggle/alias
@@ -1635,7 +1633,7 @@ local function runDisplay()
 
     term.setCursorPos(1, 5)
     term.setTextColor(colors.gray)
-    local updCd = math.max(0, math.floor(nextUpdate - os.clock()))
+    local updCd = updater.secondsUntilNextCheck()
     term.write((("Update: %s - next check in %ds"):format(updater.status, updCd)):sub(1, w))
 
     if subStatusBanner then
@@ -1678,9 +1676,8 @@ local function runDisplay()
   end
 
   local function tick()
-    -- Runs every iteration (cheap), unlike checkNow() itself which only
-    -- fires every UPDATE_TICK - see updater.tick()'s own comment for why
-    -- that matters.
+    -- Drives all update-check scheduling (routine checks, failure
+    -- retries, stuck-request recovery) - see updater.tick()'s own comment.
     safeUpdaterCall(updater.tick)
 
     local t = os.clock()
@@ -1706,10 +1703,6 @@ local function runDisplay()
       if not broker then findBroker(true) end
       subscribe()
       nextSub = t + SUB_INTERVAL
-    end
-    if t >= nextUpdate then
-      nextUpdate = t + UPDATE_TICK
-      safeUpdaterCall(updater.checkNow)
     end
     if consoleOn and t >= nextTermDraw then
       redrawSubscriberTerminal()

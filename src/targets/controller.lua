@@ -16,16 +16,6 @@ local PROTOCOL     = "cbus"
 local CONFIG_FILE  = "automations.cfg"
 local EVAL_TICK    = 0.5   -- rule evaluation interval (s)
 local SYNC_TICK    = 10    -- broker re-sync interval (s)
--- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
--- every CC:Tweaked computer on this Minecraft server shares the server's
--- one outbound IP. At the old 60s tick, just 2 always-running scripts
--- checking in parallel already exceeds that budget, so most checks were
--- silently rate-limited and falling back to fetching main's raw file by
--- BRANCH name, which lags behind GitHub's raw-content CDN by several
--- minutes. 300s cuts total request volume 5x; the computer-ID-based
--- stagger (see nextUpdate below) spreads checks across that window instead
--- of every computer bursting at once.
-local UPDATE_TICK  = 300   -- GitHub auto-update check (s)
 local MAX_AUDIT    = 15    -- max audit log history items
 
 peripheral.find("modem", function(n) rednet.open(n) end)
@@ -1869,9 +1859,6 @@ local nextEval   = now() + EVAL_TICK
 -- initial subscribe/req_registry (see "if t >= nextSync" below) instead of
 -- a separate blocking pre-loop wait.
 local nextSync   = 0
--- staggered by computer ID so a whole fleet of computers doesn't burst
--- its GitHub requests in the same second and blow the shared rate limit
-local nextUpdate = now() + (os.getComputerID() % UPDATE_TICK)
 
 -- Redraws are throttled separately from message handling, same reasoning
 -- as the broker: redrawMonitor/redrawTerminal do real monitor/terminal I/O,
@@ -1914,9 +1901,8 @@ while true do
     safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
-  -- Runs every iteration (cheap), unlike checkNow() itself which only
-  -- fires every UPDATE_TICK - see updater.tick()'s own comment for why
-  -- that matters.
+  -- Drives all update-check scheduling (routine checks, failure retries,
+  -- stuck-request recovery) - see updater.tick()'s own comment.
   safeUpdaterCall(updater.tick)
 
   local t = now()
@@ -1956,10 +1942,5 @@ while true do
       rednet.send(broker, { type = "req_registry" }, PROTOCOL)
     end
     nextSync = t + SYNC_TICK
-  end
-
-  if t >= nextUpdate then
-    nextUpdate = t + UPDATE_TICK
-    safeUpdaterCall(updater.checkNow)
   end
 end

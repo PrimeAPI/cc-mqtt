@@ -980,17 +980,12 @@ end
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
 
--- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
--- every CC:Tweaked computer on this Minecraft server shares the server's
--- one outbound IP. At the old 60s tick, just 2 always-running scripts
--- checking in parallel already exceeds that budget, so most checks were
--- silently rate-limited and falling back to fetching main's raw file by
--- BRANCH name - which lags behind GitHub's raw-content CDN by several
--- minutes. 300s cuts total request volume 5x; the computer-ID-based
--- stagger applied to nextUpdate below spreads checks across that window
--- instead of every computer bursting at once.
-local UPDATE_TICK = 300
-
+-- Routine re-check cadence, retry-after-failure backoff, and the
+-- computer-ID stagger that keeps a whole fleet of computers from bursting
+-- GitHub requests in the same second are all handled internally by the
+-- updater module now (see nextCheckAt/scheduleNext in src/lib/updater.lua)
+-- - updater.tick(), called every main-loop iteration below, is the only
+-- thing needed to drive it.
 local updater = Updater.new({ scriptName = "provider.lua" })
 
 -- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
@@ -1196,9 +1191,6 @@ local nextPub = 0
 -- delay entering the loop itself (see the startup section for why that
 -- matters for the update checker too).
 local nextAnn = 0
--- staggered by computer ID so a whole fleet of computers doesn't burst
--- its GitHub requests in the same second and blow the shared rate limit
-local nextUpdate = os.clock() + (os.getComputerID() % UPDATE_TICK)
 
 -- Devices are polled one at a time, round-robin, instead of all in one
 -- synchronous burst every INTERVAL. Every peripheral call here is a real
@@ -1256,7 +1248,7 @@ local function redrawTerminal()
 
   local pushCd = math.max(0, math.floor((nextPub - os.clock()) * 10) / 10)
   local annCd  = math.max(0, math.floor(nextAnn - os.clock()))
-  local updCd  = math.max(0, math.floor(nextUpdate - os.clock()))
+  local updCd  = updater.secondsUntilNextCheck()
 
   if viewMode == "LIST" then
     term.setCursorPos(1, 1)
@@ -1664,11 +1656,8 @@ while true do
     safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
-  -- Runs every iteration (cheap - a clock read, maybe a comparison),
-  -- unlike checkNow() itself which only fires every UPDATE_TICK. Without
-  -- this, a check that gets stuck (see updater.tick()'s own comment)
-  -- would only be noticed - and cleared - the next time checkNow()
-  -- happened to run, which could be minutes away.
+  -- Drives all update-check scheduling (routine checks, failure retries,
+  -- stuck-request recovery) - see updater.tick()'s own comment.
   safeUpdaterCall(updater.tick)
 
   local t = os.clock()
@@ -1691,12 +1680,6 @@ while true do
     nextAnn = t + ANNOUNCE
     dirty = true
   end
-  if t >= nextUpdate then
-    nextUpdate = t + UPDATE_TICK
-    safeUpdaterCall(updater.checkNow)
-    dirty = true
-  end
-
   -- the console only gets redrawn if it's actually open - a provider
   -- computer nobody is standing at doesn't need term I/O recomputed on
   -- every publish cycle (which, with several devices, can be several
