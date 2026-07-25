@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v24 | commit ebe5719 | built 2026-07-25T22:50:52Z
+-- cc-mqtt provider.lua | release v25 | commit a45655e | built 2026-07-25T23:06:21Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -200,6 +200,40 @@ function Updater.new(opts)
     end
   end
 
+  -- os.epoch("utc") (real wall-clock time, unlike os.clock() which resets
+  -- every reboot) of the last time applyUpdate() actually wrote a new
+  -- version to disk - persisted alongside versionFile so "downloaded Xh
+  -- ago" survives the reboot applyUpdate() itself triggers, for a status
+  -- display's benefit (see broker.lua's drawStatus). nil if this computer
+  -- has never applied an update since this file scheme existed.
+  local downloadedAtFile = versionFile .. ".downloaded_at"
+  self.lastDownloadedAt = nil
+  if fs.exists(downloadedAtFile) then
+    local f = fs.open(downloadedAtFile, "r")
+    if f then
+      self.lastDownloadedAt = tonumber(f.readAll())
+      f.close()
+    end
+  end
+
+  -- os.clock()-based (in-memory only, doesn't need to survive a reboot -
+  -- a pending update almost always resolves, one way or another, well
+  -- within a single boot session): since when the CURRENTLY-tracked
+  -- pending tag was first noticed. self.pendingTag lets repeated checks
+  -- that keep finding the same still-not-yet-applied tag (retries after a
+  -- failure, or the periodic re-check while stuck) leave this timestamp
+  -- alone instead of resetting it on every single check - only a genuinely
+  -- NEW tag, or catching back up to date, moves it.
+  self.updateDetectedAt = nil
+  self.pendingTag = nil
+  local function notePendingTag(tagName)
+    if tagName == self.currentVersion then
+      self.pendingTag, self.updateDetectedAt = nil, nil
+    elseif tagName ~= self.pendingTag then
+      self.pendingTag, self.updateDetectedAt = tagName, os.epoch("utc")
+    end
+  end
+
   -- Short status word for a terminal/monitor header line, plus a full
   -- message printed to the console log. Checks used to fail completely
   -- silently, which made "http blocked" and "not due yet" indistinguishable.
@@ -339,6 +373,13 @@ function Updater.new(opts)
     vf.write(version)
     vf.close()
 
+    self.lastDownloadedAt = os.epoch("utc")
+    local df = fs.open(downloadedAtFile, "w")
+    if df then
+      df.write(tostring(self.lastDownloadedAt))
+      df.close()
+    end
+
     -- Was a flat sleep(1) - long enough that the update itself was never
     -- in doubt, but far too short to actually read the verbose log above
     -- before the screen clears on reboot. Counts down out loud specifically
@@ -410,6 +451,7 @@ function Updater.new(opts)
   -- same reason checkNow/tick/handleHttp all live below that point too.
   function self.applyFromRelay(tagName, assetUrl, checksum)
     if not http then return end
+    if tagName then notePendingTag(tagName) end
     if state then return end -- already checking
     if not tagName or tagName == self.currentVersion then
       self.status = "up to date"
@@ -544,6 +586,7 @@ function Updater.new(opts)
         startFallback()
         return
       end
+      notePendingTag(tagName)
       if tagName == self.currentVersion then
         self.status = "up to date"
         state = nil
