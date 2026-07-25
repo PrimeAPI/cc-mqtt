@@ -1191,6 +1191,8 @@ if ok then
     return
   elseif reason == "check failed" then
     printError("[Updater] couldn't reach GitHub - skipping this check")
+  elseif reason == "rate limited" then
+    printError("[Updater] GitHub API rate limit hit - skipping this check")
   elseif reason ~= "http disabled" then
     -- "http disabled" already printed its own explanation above - saying
     -- "up to date" on top of that would be actively misleading, since it
