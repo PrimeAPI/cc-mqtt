@@ -1,4 +1,4 @@
--- cc-mqtt controller.lua | release v27 | commit 8bdd4a4 | built 2026-07-25T23:34:41Z
+-- cc-mqtt controller.lua | release v28 | commit 4b48ce4 | built 2026-07-25T23:48:15Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -310,13 +310,22 @@ function Updater.new(opts)
   -- reason before this module's own generic "abandoned" backstop does.
   local REQUEST_TIMEOUT = 20
   -- A failed/timed-out check is quite possibly transient (exactly the kind
-  -- of slow-connection hiccup STATE_TIMEOUT above is guarding against) -
-  -- retrying soon costs nothing extra against GitHub's rate limit (still
-  -- well under 60 requests/hour even retrying every 30s) and means a
-  -- transient failure recovers in under a minute instead of making the
-  -- user wait out a full, unrelated updateTick (routine-check interval,
-  -- e.g. 300s) to find out whether trying again would just have worked.
-  local FAILURE_RETRY = 30
+  -- of slow-connection hiccup STATE_TIMEOUT above is guarding against), so
+  -- retrying sooner than a full routine updateTick is worth it - but the
+  -- old value here (30s) was wrong: the 60 requests/hour GitHub allows is
+  -- shared across every computer on the server's one outbound IP, not
+  -- per-computer, and every target with relayFor unset (i.e. everything
+  -- except the broker) also falls back to its OWN direct checking whenever
+  -- it hasn't heard from a relaying broker in RELAY_GRACE seconds - so one
+  -- computer alone retrying every 30s (120/hour) was already enough to
+  -- exhaust the whole fleet's shared budget on its own, and once that
+  -- happens every other computer's checks start failing too, each of
+  -- THEM retrying every 30s right back into the same still-exhausted
+  -- limit. 300s keeps a transient hiccup recovering well inside a minute
+  -- or two while actually respecting the shared budget: even several
+  -- computers retrying independently at this cadence stays a small
+  -- fraction of 60/hour instead of blowing past it in a couple of minutes.
+  local FAILURE_RETRY = 300
   local updateTick = opts.updateTick or 300
   -- Due immediately, staggered by computer ID - a whole fleet of computers
   -- rebooting together (e.g. after a server restart) shouldn't all burst
