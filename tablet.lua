@@ -1,4 +1,4 @@
--- cc-mqtt tablet.lua | release v4 | commit c427935 | built 2026-07-25T00:07:55Z
+-- cc-mqtt tablet.lua | release dev | commit 6d46e0a | built 2026-07-25T00:15:51Z
 -- Generated from src/targets/tablet.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cc-mqtt tablet controller & dashboard for pocket computers
@@ -176,6 +176,28 @@ function Updater.new(opts)
     http.request(state.url, nil, HTTP_HEADERS)
   end
 
+  -- Shared by an explicit http_failure event AND by tick()'s timeout below -
+  -- a request that times out with no response at all is, as far as this
+  -- updater is concerned, exactly as much of a failure as one CC:Tweaked
+  -- actively reports, and deserves the exact same recovery: "release" or
+  -- "asset" failing still has the raw-content fallback to fall back to
+  -- (e.g. the release asset's browser_download_url redirects through a
+  -- host - typically objects.githubusercontent.com - that isn't
+  -- api.github.com or raw.githubusercontent.com, and may not be on this
+  -- Minecraft server's http allowlist even when those two are). Only a
+  -- "fallback" failure is truly terminal - there's nowhere else left to try.
+  local function handleFailure(reason)
+    local stage = state.stage
+    if stage == "release" or stage == "asset" then
+      print(("[Updater] %s check failed (%s) - falling back to raw content"):format(stage, reason))
+      startFallback()
+    else
+      self.status = "check failed"
+      print(("[Updater] %s check failed: %s"):format(stage, reason))
+      state = nil
+    end
+  end
+
   -- Cheap enough to call on every single main-loop iteration (a clock read
   -- and maybe a comparison) - and needs to be, since checkNow() itself is
   -- only invoked every UPDATE_TICK by the caller's own periodic timer
@@ -186,9 +208,7 @@ function Updater.new(opts)
   -- regardless of how far off the next scheduled check is.
   function self.tick()
     if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
-      print(("[Updater] previous %s check never resolved - abandoning it"):format(state.stage))
-      state = nil
-      self.status = "check failed"
+      handleFailure("timed out, no response")
     end
   end
 
@@ -221,20 +241,7 @@ function Updater.new(opts)
     if not state or url ~= state.url then return end
 
     if eventType == "http_failure" then
-      -- "release" or "asset" failing (e.g. the release asset's
-      -- browser_download_url redirects through a host - typically
-      -- objects.githubusercontent.com - that isn't api.github.com or
-      -- raw.githubusercontent.com, and may not be on this Minecraft
-      -- server's http allowlist even when those two are) still has a way
-      -- forward: the raw-content fallback. Only a "fallback" failure is
-      -- truly terminal - there's nowhere else left to try.
-      if state.stage == "release" or state.stage == "asset" then
-        startFallback()
-      else
-        self.status = "check failed"
-        print(("[Updater] %s check failed: %s"):format(state.stage, tostring(handle)))
-        state = nil
-      end
+      handleFailure(tostring(handle))
       return
     end
 
