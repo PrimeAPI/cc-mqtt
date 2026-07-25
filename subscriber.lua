@@ -1,4 +1,4 @@
--- cc-mqtt subscriber.lua | release v7 | commit 004c1ee | built 2026-07-25T00:39:51Z
+-- cc-mqtt subscriber.lua | release dev | commit fdf7143 | built 2026-07-25T00:51:27Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus subscriber  --  dashboard edition
@@ -175,6 +175,30 @@ local function cacheBust()
   return os.epoch and os.epoch("utc") or (os.clock() * 1000)
 end
 
+-- Verbose on purpose: every previous round of "it still doesn't work" on
+-- this exact updater turned out to need real facts (an actual HTTP status
+-- code, an actual CC:Tweaked-reported failure reason, actual elapsed
+-- time) that silent operation couldn't surface. This is cheap enough to
+-- always print - a handful of lines per check, not per tick.
+local function debugPrint(fmt, ...)
+  print(("[Updater] " .. fmt):format(...))
+end
+
+-- http.request() has its own "timeout" option (table-call form only) that
+-- makes CC:Tweaked's OWN HTTP client give up and fire a real http_failure
+-- with an actual reason (connection refused, DNS failure, TLS error,
+-- genuine timeout, ...) - this was never being used before, which meant
+-- the only timeout in play was this module's own STATE_TIMEOUT watchdog,
+-- which knows nothing about WHY a request never resolved, only that it
+-- didn't. Passing this explicitly (kept under STATE_TIMEOUT, so CC:Tweaked
+-- has a chance to report the real reason before this module's own
+-- backstop watchdog gives up with a generic "no response" instead) should
+-- turn most silent hangs into an actual diagnosable error message.
+local function httpRequest(url, headers, timeoutSec)
+  debugPrint("GET %s (timeout %ds)", url, timeoutSec)
+  http.request({ url = url, headers = headers, timeout = timeoutSec })
+end
+
 local function getShortVer(v)
   if not v or v == "" then return "?" end
   if #v >= 7 then return v:sub(1, 7) end
@@ -264,6 +288,10 @@ function Updater.new(opts)
   -- giving a genuinely-slow-but-succeeding transfer more room to finish
   -- before this gives up on it.
   local STATE_TIMEOUT = 60
+  -- Passed to http.request() itself (see httpRequest() above) - kept
+  -- under STATE_TIMEOUT so CC:Tweaked's own timeout, with a real reported
+  -- reason, fires before this module's own generic "abandoned" backstop.
+  local REQUEST_TIMEOUT = 45
   -- A failed/timed-out check is quite possibly transient (exactly the kind
   -- of slow-connection hiccup STATE_TIMEOUT above is guarding against) -
   -- retrying soon costs nothing extra against GitHub's rate limit (still
@@ -333,7 +361,7 @@ function Updater.new(opts)
   local function startFallback()
     state = { stage = "fallback", url = fallbackUrl() }
     stateStartedAt = os.clock()
-    http.request(state.url, nil, DOWNLOAD_HEADERS)
+    httpRequest(state.url, DOWNLOAD_HEADERS, REQUEST_TIMEOUT)
   end
 
   -- Shared by an explicit http_failure event AND by tick()'s timeout below -
@@ -348,12 +376,13 @@ function Updater.new(opts)
   -- "fallback" failure is truly terminal - there's nowhere else left to try.
   local function handleFailure(reason)
     local stage = state.stage
+    local elapsed = stateStartedAt and (os.clock() - stateStartedAt) or -1
     if stage == "release" or stage == "asset" then
-      print(("[Updater] %s check failed (%s) - falling back to raw content"):format(stage, reason))
+      debugPrint("%s check failed after %.1fs (%s) - falling back to raw content", stage, elapsed, reason)
       startFallback()
     else
       self.status = "check failed"
-      print(("[Updater] %s check failed: %s"):format(stage, reason))
+      debugPrint("%s check failed after %.1fs: %s", stage, elapsed, reason)
       state = nil
       scheduleNext()
     end
@@ -376,7 +405,7 @@ function Updater.new(opts)
     self.status = "checking"
     state = { stage = "release", url = releaseUrl() }
     stateStartedAt = os.clock()
-    http.request(state.url, nil, API_HEADERS)
+    httpRequest(state.url, API_HEADERS, REQUEST_TIMEOUT)
   end
 
   -- Cheap enough to call on every single main-loop iteration (a clock read
@@ -402,18 +431,40 @@ function Updater.new(opts)
   -- CC:Tweaked passes the error message string in that same slot instead -
   -- captured here as the reason so a check failure is actually visible.
   function self.handleHttp(eventType, url, handle)
-    if not state or url ~= state.url then return end
+    -- Logged BEFORE the match check below, deliberately - if a response
+    -- ever arrives for a URL that doesn't match state.url (a redirect
+    -- changing the URL CC:Tweaked reports it under, a late response to an
+    -- already-abandoned request, ...), this is the only way to ever see
+    -- that happened instead of it just looking like nothing arrived at all.
+    if not state then
+      debugPrint("%s for %s, but no check is in flight - ignoring", eventType, url)
+      return
+    end
+    if url ~= state.url then
+      debugPrint("%s for %s, but currently waiting on %s (stage %s) - ignoring", eventType, url, state.url, state.stage)
+      return
+    end
 
     if eventType == "http_failure" then
       handleFailure(tostring(handle))
       return
     end
 
+    local elapsed = stateStartedAt and (os.clock() - stateStartedAt) or -1
+    local codeOk, code, codeMsg = pcall(function() return handle.getResponseCode() end)
+    if codeOk then
+      debugPrint("%s http_success after %.1fs: HTTP %s %s", state.stage, elapsed, tostring(code), tostring(codeMsg))
+    else
+      debugPrint("%s http_success after %.1fs (no response code available)", state.stage, elapsed)
+    end
+
     if state.stage == "release" then
       local raw = handle.readAll()
       handle.close()
+      debugPrint("release body: %d bytes", raw and #raw or 0)
       local tagName, assetUrl, checksum = parseReleaseResponse(raw, scriptName)
       if not tagName then
+        debugPrint("release response didn't parse as expected (bad JSON, or no matching asset for %s)", scriptName)
         startFallback()
         return
       end
@@ -427,11 +478,12 @@ function Updater.new(opts)
       print(("[Updater] New version detected (%s -> %s)!"):format(getShortVer(self.currentVersion), getShortVer(tagName)))
       state = { stage = "asset", url = assetUrl, tagName = tagName, checksum = checksum }
       stateStartedAt = os.clock()
-      http.request(state.url, nil, DOWNLOAD_HEADERS)
+      httpRequest(state.url, DOWNLOAD_HEADERS, REQUEST_TIMEOUT)
 
     elseif state.stage == "asset" then
       local code = handle.readAll()
       handle.close()
+      debugPrint("asset body: %d bytes", code and #code or 0)
       -- readAll() can come back nil/empty on a truncated or otherwise bad
       -- response even when CC:Tweaked still calls it "http_success" - and
       -- rollingHash(nil) would throw ("attempt to get length of a nil
@@ -439,12 +491,15 @@ function Updater.new(opts)
       -- bare pcall - would silently swallow the error and leave `state`
       -- stuck here forever. Treat it as a failure and fall back instead.
       if type(code) ~= "string" or #code < 100 then
-        print("[Updater] asset response looked invalid, falling back to raw content")
+        -- printed in full (not just "invalid") since a short body is
+        -- usually an actual error page/JSON from GitHub (rate limit,
+        -- permission, ...) worth seeing verbatim rather than guessing at.
+        debugPrint("asset response looked invalid, falling back to raw content. Body was: %s", tostring(code))
         startFallback()
         return
       end
       if state.checksum and rollingHash(code) ~= state.checksum then
-        print("[Updater] asset checksum mismatch, falling back to raw content")
+        debugPrint("asset checksum mismatch (got %s, expected %s), falling back to raw content", rollingHash(code), state.checksum)
         startFallback()
         return
       end
@@ -456,9 +511,10 @@ function Updater.new(opts)
       local code = handle.readAll()
       local headers = handle.getResponseHeaders()
       handle.close()
+      debugPrint("fallback body: %d bytes", code and #code or 0)
       if type(code) ~= "string" or #code < 100 then
         self.status = "check failed"
-        print("[Updater] fallback response looked invalid")
+        debugPrint("fallback response looked invalid. Body was: %s", tostring(code))
         state = nil
         scheduleNext()
         return
@@ -494,7 +550,7 @@ function Updater.new(opts)
     timeoutSec = timeoutSec or 60
 
     local function awaitHttp(url, headers)
-      http.request(url, nil, headers or DOWNLOAD_HEADERS)
+      httpRequest(url, headers or DOWNLOAD_HEADERS, math.max(1, timeoutSec - 5))
       local timer = os.startTimer(timeoutSec)
       while true do
         local ev = { os.pullEvent() }
@@ -509,19 +565,23 @@ function Updater.new(opts)
     end
 
     local relOk, relRes = awaitHttp(releaseUrl(), API_HEADERS)
+    debugPrint("release: %s", relOk and "success" or ("failed (" .. tostring(relRes) .. ")"))
     local tagName, assetUrl, checksum
     if relOk then
       local raw = relRes.readAll()
       relRes.close()
+      debugPrint("release body: %d bytes", raw and #raw or 0)
       tagName, assetUrl, checksum = parseReleaseResponse(raw, scriptName)
     end
 
     if tagName then
       if tagName == self.currentVersion then return false, "up to date" end
       local assetOk, assetRes = awaitHttp(assetUrl)
+      debugPrint("asset: %s", assetOk and "success" or ("failed (" .. tostring(assetRes) .. ")"))
       if assetOk then
         local code = assetRes.readAll()
         assetRes.close()
+        debugPrint("asset body: %d bytes", code and #code or 0)
         if type(code) == "string" and #code >= 100 and (not checksum or rollingHash(code) == checksum) then
           applyUpdate(tagName, code) -- reboots, does not return
         end
@@ -530,10 +590,12 @@ function Updater.new(opts)
     end
 
     local fbOk, fbRes = awaitHttp(fallbackUrl())
+    debugPrint("fallback: %s", fbOk and "success" or ("failed (" .. tostring(fbRes) .. ")"))
     if not fbOk then return false, "check failed" end
     local code = fbRes.readAll()
     local headers = fbRes.getResponseHeaders()
     fbRes.close()
+    debugPrint("fallback body: %d bytes", code and #code or 0)
     if type(code) ~= "string" or #code < 100 then return false, "check failed" end
     local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
     local version = etag and etag:match("(%x%x%x%x%x%x%x+)") or rollingHash(code)
