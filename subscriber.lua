@@ -1,4 +1,4 @@
--- cc-mqtt subscriber.lua | release dev | commit c04f427 | built 2026-07-25T00:29:55Z
+-- cc-mqtt subscriber.lua | release v6 | commit 3754229 | built 2026-07-25T00:30:11Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus subscriber  --  dashboard edition
