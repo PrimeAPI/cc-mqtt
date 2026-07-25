@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release dev | commit a63fd7d | built 2026-07-25T01:12:50Z
+-- cc-mqtt provider.lua | release v10 | commit da7e39d | built 2026-07-25T01:13:07Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
