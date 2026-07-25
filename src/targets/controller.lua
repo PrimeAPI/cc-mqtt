@@ -235,6 +235,8 @@ local function preprocessExpression(expr)
   -- unchanged, silently comparing against the wrong scale.
   s = s:gsub("([0-9%.]+)%%", "(%1/100)")
 
+  s = s:gsub("([0-9%.]+)%s*TFE/t", "(%1 * 1000000000000)")
+  s = s:gsub("([0-9%.]+)%s*TFE",   "(%1 * 1000000000000)")
   s = s:gsub("([0-9%.]+)%s*GFE/t", "(%1 * 1000000000)")
   s = s:gsub("([0-9%.]+)%s*GFE",   "(%1 * 1000000000)")
   s = s:gsub("([0-9%.]+)%s*MFE/t", "(%1 * 1000000)")
@@ -306,6 +308,7 @@ local function createEvalEnv(refTracker)
     kFE = 1000,
     MFE = 1000000,
     GFE = 1000000000,
+    TFE = 1000000000000,
     t = 1,
   }
 
@@ -666,7 +669,7 @@ local function coerceThresholdLiteral(v)
   if lower == "true" or lower == "false" then return lower end
   if tonumber(v) then return v end
   if v:match("^[%d%.]+%%$") then return v end -- e.g. "30%"
-  if v:match("^[%d%.]+%s*[GkM]?FE/?t?$") then return v end -- e.g. "5MFE/t", "20kFE"
+  if v:match("^[%d%.]+%s*[TGkM]?FE/?t?$") then return v end -- e.g. "5MFE/t", "20kFE", "10TFE"
   return ("%q"):format(v)
 end
 
