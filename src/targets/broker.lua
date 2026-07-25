@@ -21,6 +21,13 @@ local PROTOCOL      = "cbus"
 local HOSTNAME      = "broker"
 local OFFLINE_AFTER = 15   -- seconds without a message => shown offline
 local TICK          = 2    -- monitor refresh / prune interval
+-- How long an entity can sit on an update the broker has relayed to it
+-- (see relayInfoForKind()/nextRelayTracking() below) before the entities
+-- monitor stops calling it "updating" (yellow) and calls it "failed"/
+-- stuck (red) instead - roughly one full retry cycle of the target's own
+-- updater (src/lib/updater.lua's STATE_TIMEOUT + FAILURE_RETRY + another
+-- attempt), plus room for the apply+reboot+reannounce itself.
+local UPDATE_RELAY_TIMEOUT = 90
 
 peripheral.find("modem", function(n) rednet.open(n) end)
 rednet.host(PROTOCOL, HOSTNAME)
@@ -159,6 +166,27 @@ end
 
 local function now() return os.clock() end
 local bootTime = now()
+
+-- Tracks "the broker relayed vNN to this entity, and it hasn't reported
+-- back running vNN yet" - carried forward across re-announces/subscribes
+-- so the entities monitor can show how LONG an entity has been sitting on
+-- a relayed update (see UPDATE_RELAY_TIMEOUT / drawEntities' verColor).
+-- prev: the entity's previous table (nil if never seen before).
+-- relay: this kind's current relay info from relayInfoForKind() (nil if
+--   the broker doesn't know of a newer release for this kind at all).
+-- reportedVersion: the version this SAME announce/subscribe message says
+--   the entity is actually running right now.
+-- Returns updateRelayTag, updateRelayedAt (both nil once the entity has
+-- caught up to what was relayed, or if nothing's been relayed at all).
+local function nextRelayTracking(prev, relay, reportedVersion)
+  if not relay or not relay.tagName or relay.tagName == reportedVersion then
+    return nil, nil
+  end
+  if prev and prev.updateRelayTag == relay.tagName then
+    return prev.updateRelayTag, prev.updateRelayedAt
+  end
+  return relay.tagName, now()
+end
 
 local function logAction(text, isError)
   actionLog[#actionLog + 1] = { time = os.date("%H:%M:%S"), text = text, error = isError or false }
@@ -321,6 +349,15 @@ local function drawStatus(screen)
   stat("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
     stats.maxIterMs > 500 and colors.red or colors.lime)
   stat("Update", ("%s (v:%s)"):format(updater.status, updater.getShortVer(updater.currentVersion)))
+  -- only shown while an update is actually pending (see updater.lua's
+  -- notePendingTag) - clears itself back to nothing once applied, since
+  -- the broker reboots right after anyway
+  if updater.updateDetectedAt then
+    stat("Update Pending", Util.formatDuration((os.epoch("utc") - updater.updateDetectedAt) / 1000) .. " ago", colors.yellow)
+  end
+  stat("Downloaded", updater.lastDownloadedAt
+    and (Util.formatDuration((os.epoch("utc") - updater.lastDownloadedAt) / 1000) .. " ago")
+    or "never")
   stat("Uptime", formatAge(now() - bootTime))
 end
 
@@ -371,7 +408,11 @@ end
 -- header says it once instead, freeing the row itself for what's
 -- actually useful per-entity - version (previously cut off) and how
 -- long since it was last heard from, for debugging a stuck/offline one.
-local ENT_CELL_W = 32
+-- Widened from 32 to fit an uptime string ("up 12h34m") next to the
+-- version - unlike the old last-heartbeat age it replaced (always under
+-- OFFLINE_AFTER seconds, so always short), uptime can legitimately run to
+-- several digits of hours on a long-lived broker.
+local ENT_CELL_W = 36
 
 local KIND_ORDER = { "provider", "subscriber", "controller", "tablet" }
 local KIND_LABEL = {
@@ -455,12 +496,34 @@ local function drawEntities(screen)
       screen.write(x + 2, y, padName, colors.white)
 
       local verStr = "v:" .. updater.getShortVer(e.version)
-      local eVerNum = Util.versionNum(e.version)
-      local verColor = (maxVerNum and eVerNum and eVerNum < maxVerNum) and colors.red or colors.lightGray
+      -- yellow/red "relayed an update, still hasn't caught up" (see
+      -- nextRelayTracking() in handle()'s announce/subscribe branches)
+      -- takes priority over the plain "behind the fleet's newest known
+      -- version" red - it's strictly more specific: the broker knows it
+      -- personally told this entity about the new version, and how long
+      -- ago, rather than just noticing it's numerically behind.
+      local verColor = colors.lightGray
+      if e.updateRelayedAt then
+        verColor = (t - e.updateRelayedAt > UPDATE_RELAY_TIMEOUT) and colors.red or colors.yellow
+      else
+        local eVerNum = Util.versionNum(e.version)
+        if maxVerNum and eVerNum and eVerNum < maxVerNum then verColor = colors.red end
+      end
       screen.write(x + 16, y, verStr, verColor)
 
-      local ageStr = e.online and formatAge(t - e.lastSeen) or "offline"
-      screen.write(x + 16 + #verStr + 1, y, ageStr, colors.gray)
+      -- uptime (since first-seen-while-not-already-online, see the
+      -- announce/subscribe handlers) replaces the old "Ns ago" last-
+      -- heartbeat age here - that number was always small and low-signal
+      -- for a healthy online entity; offline still just reads "offline".
+      -- Util.formatDuration, not the local formatAge, since this can run
+      -- to hours on a long-lived entity where formatAge's plain "%dm%02ds"
+      -- would grow unbounded; still explicitly clipped to the cell's
+      -- remaining width as a backstop so a pathologically long uptime
+      -- truncates instead of corrupting the next column.
+      local ageStr = e.online and ("up " .. Util.formatDuration(t - (e.since or e.lastSeen))) or "offline"
+      local ageX = x + 16 + #verStr + 1
+      local ageMax = math.max(0, (x + ENT_CELL_W - 1) - ageX + 1)
+      screen.write(ageX, y, ageStr:sub(1, ageMax), colors.gray)
 
       col = col + 1
       if col >= cols then col, y = 0, y + 1 end
@@ -775,17 +838,29 @@ local function handle(id, msg)
   if type(msg) ~= "table" or not msg.type then return end
 
   if msg.type == "announce" then
+    local prev = entities[msg.entity]
+    -- uptime: kept across re-announces while the entity's stayed online
+    -- (providers re-announce every 15s regardless) - only reset when it
+    -- was offline or never seen before, since that's the broker's only
+    -- signal an actual reboot might have happened.
+    local since = (prev and prev.online and prev.since) or now()
+    local reportedVersion = msg.version or (msg.meta and msg.meta.version) or "dev"
+    local relay = relayInfoForKind(msg.kind or "provider")
+    local updateRelayTag, updateRelayedAt = nextRelayTracking(prev, relay, reportedVersion)
     entities[msg.entity] = {
       id = id,
       kind = msg.kind or "provider",
       topics = msg.topics or {},
       meta = msg.meta,
       actions = msg.actions or (msg.meta and msg.meta.actions) or {},
-      version = msg.version or (msg.meta and msg.meta.version) or "dev",
+      version = reportedVersion,
       lastSeen = now(),
       online = true,
+      since = since,
+      updateRelayTag = updateRelayTag,
+      updateRelayedAt = updateRelayedAt,
     }
-    send(id, { type = "ack", of = "announce", update = relayInfoForKind(msg.kind or "provider") })
+    send(id, { type = "ack", of = "announce", update = relay })
 
   elseif msg.type == "publish" then
     if msg.entity then
@@ -801,6 +876,7 @@ local function handle(id, msg)
           version = msg.version or "dev",
           lastSeen = now(),
           online = true,
+          since = now(),
         }
         send(id, { type = "reannounce_req" })
       else
@@ -826,8 +902,17 @@ local function handle(id, msg)
     -- msg.kind distinguishes subscriber.lua/controller.lua/tablet.lua,
     -- which all send this same message shape - "subscriber" is only a
     -- fallback for an older client that predates the field existing.
-    entities[name] = { id = id, kind = msg.kind or "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
-    send(id, { type = "ack", of = "subscribe", update = relayInfoForKind(msg.kind or "subscriber") })
+    local prev = entities[name]
+    local since = (prev and prev.online and prev.since) or now()
+    local reportedVersion = msg.version or "dev"
+    local relay = relayInfoForKind(msg.kind or "subscriber")
+    local updateRelayTag, updateRelayedAt = nextRelayTracking(prev, relay, reportedVersion)
+    entities[name] = {
+      id = id, kind = msg.kind or "subscriber", version = reportedVersion,
+      lastSeen = now(), online = true, since = since,
+      updateRelayTag = updateRelayTag, updateRelayedAt = updateRelayedAt,
+    }
+    send(id, { type = "ack", of = "subscribe", update = relay })
     for topic, m in pairs(retained) do
       for _, pat in ipairs(subs[id].patterns) do
         if topicMatches(pat, topic) then send(id, m) break end
