@@ -9,6 +9,7 @@ local STALE_AFTER  = 8 -- s without update -> stale
 -- auto updater (runs ONLY on startup as requested)
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
+--[[@include lib/screen.lua as Screen]]
 
 local updater = Updater.new({ scriptName = "tablet.lua" })
 -- checkAndApplySync() reuses the exact same URL building / parsing /
@@ -243,7 +244,6 @@ local inspectScroll   = 1
 local selectedAction  = nil
 local editMetricIdx   = nil
 local inputBuffer     = ""
-local statusBanner    = nil
 
 -- Add Metric/Action wizard state
 local wizardEntity    = nil
@@ -254,10 +254,6 @@ local wizardCustomAction = false -- true while INPUT_ARG is collecting args for 
 -- Heartbeat animation frames
 local animFrames      = { "O", "o", ".", "o" }
 local animIdx         = 1
-
-local function setBanner(msg, isError)
-  statusBanner = { text = msg, error = isError or false, time = os.clock() }
-end
 
 local function padLine(str, w)
   str = tostring(str or "")
@@ -307,872 +303,791 @@ end
 --------------------------------------------------------------------
 -- screens rendering
 --------------------------------------------------------------------
-local function renderScreen()
-  local w, h = term.getSize()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-
-  if statusBanner and (os.clock() - statusBanner.time > 5) then
-    statusBanner = nil
-  end
-
-  -- Header Bar (Line 1)
-  term.setCursorPos(1, 1)
-  term.setBackgroundColor(colors.blue)
-  term.setTextColor(colors.white)
+-- Shared by every tab's draw() below: identical header bar content, and
+-- identical banner/tab-bar placement at the bottom (see drawChromeFooter).
+-- Screen.tick() already clear()s the whole frame before draw() runs, so
+-- (unlike the original hand-rolled version) nothing here needs to
+-- manually blank out unused trailing rows.
+local function drawChromeHeader(screen, w)
   local animChar = animFrames[animIdx]
   local headText = (" [%s] Tablet (v:%s)"):format(animChar, updater.getShortVer(updater.currentVersion))
   local bText    = ("#%s "):format(broker and tostring(broker) or "?")
   local space    = math.max(1, w - #headText - #bText)
-  term.write(headText .. string.rep(" ", space) .. bText)
+  screen.row(1, headText .. string.rep(" ", space) .. bText, colors.white, colors.blue)
+end
 
-  -- Content Area (Lines 2 to h-1)
-  if activeTab == "DASHBOARD" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" METRICS DASHBOARD", w))
+local CFG_TAB_GROUP = {
+  SETTINGS = true, SETTINGS_METRICS = true, SETTINGS_ACTIONS = true,
+  WIZARD_ENTITY = true, WIZARD_FIELD = true, WIZARD_ACTION = true,
+  INPUT_ACTION_NAME = true, RENAME_METRIC = true, INPUT_ARG = true,
+}
 
-    local y = 3
-    if #cfg.metrics == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No metrics added yet.")
-      term.setCursorPos(2, 5)
-      term.write("Go to Settings [Cfg] to add!")
-    else
-      for _, m in ipairs(cfg.metrics) do
-        if y >= h - 1 then break end
-        local ent = ents[m.entity]
-        local val = ent and ent.data and ent.data[m.key]
+local function drawChromeFooter(screen, w, h)
+  local banner = screen.currentBanner()
+  if banner then
+    screen.row(h - 1, (banner.error and "[!] " or "[*] ") .. banner.text,
+      banner.error and colors.red or colors.lime)
+  end
 
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.black)
+  local function tab(isActive, label, x)
+    screen.write(x, h, label, isActive and colors.yellow or colors.white, isActive and colors.blue or colors.gray)
+  end
+  tab(activeTab == "DASHBOARD", " Dash ", 1)
+  tab(activeTab == "ACTIONS",   " Act  ", 7)
+  tab(activeTab == "ENTITIES" or activeTab == "INSPECT", " Ent  ", 13)
+  tab(CFG_TAB_GROUP[activeTab] or false, " Cfg  ", 19)
+end
 
-        -- Strict 25-char max line length to prevent CC terminal auto-wrap cursor shift
-        local maxLineW = math.min(25, w - 1)
-        local lblW = 6 -- 5 chars + 1 space = 6 chars
-        local availW = math.max(8, maxLineW - lblW)
+-- Tapping the bottom tab bar switches tabs from any screen - checked
+-- first by every onClick handler below, mirroring the original
+-- handleTouch()'s shared early check.
+local function tabBarClick(screen, x, y)
+  local h = select(2, screen.size())
+  if y ~= h then return false end
+  if x <= 6 then activeTab = "DASHBOARD"; screen.show("dashboard")
+  elseif x <= 12 then activeTab = "ACTIONS"; screen.show("actions")
+  elseif x <= 18 then activeTab = "ENTITIES"; screen.show("entities")
+  else activeTab = "SETTINGS"; screen.show("settings") end
+  return true
+end
 
-        -- 1. Custom Label Column (5 chars max)
-        term.setTextColor(colors.cyan)
-        local rawLabel = m.label or m.entity
-        local displayLabel = rawLabel:sub(1, 5)
-        term.write(displayLabel .. string.rep(" ", math.max(1, lblW - #displayLabel)))
+local function drawDashboard(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " METRICS DASHBOARD", colors.yellow, colors.gray)
 
-        -- 2. Value / Smooth Color Block Bar Area
-        if not ent or not ent.data then
-          term.setTextColor(colors.gray)
-          term.write("offline")
-        elseif type(val) == "number" then
-          local kLower = m.key:lower()
-          if (val >= 0 and val <= 1) and (kLower:find("percent") or kLower:find("fill") or kLower == "fuel" or kLower == "coolant" or kLower == "waste" or kLower == "damage" or kLower == "steam" or kLower == "charge") then
-            local pct = math.floor(val * 100 + 0.5)
-            local pctStr = string.format("%3d%%", pct)
-            local barW = math.max(3, availW - #pctStr - 1)
-            local fill = math.floor(val * barW + 0.5)
-            local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
+  local y = 3
+  if #cfg.metrics == 0 then
+    screen.write(2, 4, "No metrics added yet.", colors.gray)
+    screen.write(2, 5, "Go to Settings [Cfg] to add!", colors.gray)
+  else
+    for _, m in ipairs(cfg.metrics) do
+      if y >= h - 1 then break end
+      local ent = ents[m.entity]
+      local val = ent and ent.data and ent.data[m.key]
 
-            term.setBackgroundColor(isDanger and colors.red or colors.lime)
-            term.write(string.rep(" ", fill))
-            term.setBackgroundColor(colors.gray)
-            term.write(string.rep(" ", barW - fill))
-            term.setBackgroundColor(colors.black)
-            term.setTextColor(colors.white)
-            term.write(" " .. pctStr)
-          else
-            local formatted, valColor = formatSmartValue(m.key, val)
-            term.setTextColor(valColor)
-            term.write(formatted:sub(1, availW))
-          end
+      -- Strict 25-char max line length to prevent CC terminal auto-wrap cursor shift
+      local maxLineW = math.min(25, w - 1)
+      local lblW = 6 -- 5 chars + 1 space = 6 chars
+      local availW = math.max(8, maxLineW - lblW)
+
+      -- 1. Custom Label Column (5 chars max)
+      local rawLabel = m.label or m.entity
+      local displayLabel = rawLabel:sub(1, 5)
+      screen.write(1, y, displayLabel .. string.rep(" ", math.max(1, lblW - #displayLabel)), colors.cyan)
+
+      -- 2. Value / Smooth Color Block Bar Area
+      local valX = 1 + lblW
+      if not ent or not ent.data then
+        screen.write(valX, y, "offline", colors.gray)
+      elseif type(val) == "number" then
+        local kLower = m.key:lower()
+        if (val >= 0 and val <= 1) and (kLower:find("percent") or kLower:find("fill") or kLower == "fuel" or kLower == "coolant" or kLower == "waste" or kLower == "damage" or kLower == "steam" or kLower == "charge") then
+          local pct = math.floor(val * 100 + 0.5)
+          local pctStr = string.format("%3d%%", pct)
+          local barW = math.max(3, availW - #pctStr - 1)
+          local fill = math.floor(val * barW + 0.5)
+          local isDanger = kLower:find("damage") or kLower:find("waste") or (kLower:find("temp") and val > 0.8)
+
+          screen.write(valX, y, string.rep(" ", fill), colors.white, isDanger and colors.red or colors.lime)
+          screen.write(valX + fill, y, string.rep(" ", barW - fill), colors.white, colors.gray)
+          screen.write(valX + barW, y, " " .. pctStr, colors.white)
         else
           local formatted, valColor = formatSmartValue(m.key, val)
-          term.setTextColor(valColor)
-          term.write(formatted:sub(1, availW))
+          screen.write(valX, y, formatted:sub(1, availW), valColor)
         end
-
-        local cx, _ = term.getCursorPos()
-        if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
-        y = y + 1
-      end
-    end
-
-    -- fill empty body lines cleanly without flickering
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "ACTIONS" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" QUICK ACTIONS", w))
-
-    local y = 3
-    if #cfg.quickActions == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No quick actions configured.")
-      term.setCursorPos(2, 5)
-      term.write("Go to Settings [Cfg] to add!")
-    else
-      for idx, qa in ipairs(cfg.quickActions) do
-        if y >= h - 1 then break end
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.white)
-
-        local btnText = (" [%d] %s"):format(idx, qa.label or qa.action)
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-        term.write(padLine(btnText, w - 2))
-        term.setBackgroundColor(colors.black)
-        term.write(" ")
-        y = y + 2
-      end
-    end
-
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "ENTITIES" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" REGISTERED ENTITIES", w))
-
-    local sorted = {}
-    for n in pairs(registry) do sorted[#sorted + 1] = n end
-    for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
-    table.sort(sorted)
-
-    local y = 3
-    if #sorted == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("Waiting for entities...")
-    else
-      for _, name in ipairs(sorted) do
-        if y >= h - 1 then break end
-        local e = ents[name]
-        local reg = registry[name]
-        local isOnline = (e and e.lastSeen and (os.clock() - e.lastSeen <= STALE_AFTER)) or (reg and reg.online)
-
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(isOnline and colors.lime or colors.red)
-        term.write(isOnline and " * " or " x ")
-
-        term.setTextColor(colors.white)
-        local padName = name .. string.rep(" ", math.max(1, 14 - #name))
-        term.write(padName:sub(1, 14))
-
-        term.setTextColor(colors.lightGray)
-        local k = (e and e.kind) or (reg and reg.kind) or "dev"
-        term.write(k:sub(1, w - 18))
-
-        local cx, _ = term.getCursorPos()
-        if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
-        y = y + 1
-      end
-    end
-
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "INSPECT" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" ENTITY: " .. tostring(inspectEntity), w))
-
-    local y = 3
-    local e = ents[inspectEntity]
-    if not e then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.red)
-      term.write("No data available.")
-    else
-      local layout = computeInspectLayout(inspectEntity)
-      local keys = layout.keys
-
-      term.setCursorPos(1, y)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.cyan)
-      term.write((" TELEMETRY (%d fields):"):format(#keys))
-      y = y + 1
-
-      if layout.scrollUpShown then
-        term.setCursorPos(2, y)
-        term.setTextColor(colors.yellow)
-        term.write("^ tap to scroll up ^")
-        y = y + 1
-      end
-
-      for i = inspectScroll, layout.endIdx do
-        local k = keys[i]
-        local val = e.data[k]
-        local formatted, valColor = formatSmartValue(k, val)
-
-        term.setCursorPos(2, y)
-        term.setTextColor(colors.lightGray)
-        local keyLabel = k:sub(1, 8)
-        term.write(keyLabel .. ": ")
-
-        term.setTextColor(valColor)
-        term.write(formatted:sub(1, math.max(1, w - 17)))
-
-        term.setCursorPos(w - 5, y)
-        term.setBackgroundColor(colors.green)
-        term.setTextColor(colors.white)
-        term.write("[+Dash]")
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
-
-      if layout.scrollDownShown then
-        term.setCursorPos(2, y)
-        term.setTextColor(colors.yellow)
-        term.write("v tap to scroll down (" .. (#keys - layout.endIdx) .. " more) v")
-        y = y + 1
-      end
-
-      y = layout.actionsHeaderY
-      term.setCursorPos(1, y)
-      term.setTextColor(colors.yellow)
-      term.write(" ACTIONS (Tap to trigger):")
-      y = y + 1
-
-      local actList = getEntityActions(inspectEntity)
-      if #actList == 0 then
-        term.setCursorPos(2, y)
-        term.setTextColor(colors.gray)
-        term.write("(no actions available)")
-        y = y + 1
       else
-        for idx, act in ipairs(actList) do
-          if y >= h - 1 then break end
-          term.setCursorPos(2, y)
-          term.setBackgroundColor(colors.gray)
-          term.setTextColor(colors.white)
-          term.write(padLine((" [%d] %s "):format(idx, act), w - 3))
-          term.setBackgroundColor(colors.black)
-          y = y + 1
-        end
+        local formatted, valColor = formatSmartValue(m.key, val)
+        screen.write(valX, y, formatted:sub(1, availW), valColor)
       end
-    end
-
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "SETTINGS" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" SETTINGS & MANAGEMENT", w))
-
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    term.write(padLine((" Metrics (%d)"):format(#cfg.metrics), w - 1))
-    term.setBackgroundColor(colors.gray)
-    term.write(">")
-
-    term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    term.write(padLine((" Quick Actions (%d)"):format(#cfg.quickActions), w - 1))
-    term.setBackgroundColor(colors.gray)
-    term.write(">")
-
-    term.setCursorPos(1, 6)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.lightGray)
-    term.write(padLine(" Network", w))
-
-    term.setCursorPos(1, 7)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(padLine(" Re-Sync Broker", w))
-
-    term.setCursorPos(1, 8)
-    term.setBackgroundColor(colors.red)
-    term.setTextColor(colors.white)
-    term.write(padLine(" Clear All Config", w))
-
-    for r = 9, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "SETTINGS_METRICS" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" DASHBOARD METRICS", w))
-
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [+] Add Metric", w))
-
-    term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [<] Back to Settings", w))
-
-    local y = 6
-    if #cfg.metrics == 0 then
-      term.setCursorPos(2, y)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("(no metrics configured)")
       y = y + 1
-    else
-      for idx, m in ipairs(cfg.metrics) do
-        if y >= h - 2 then break end
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.cyan)
-        local nick = (m.label or m.entity):sub(1, 6)
-        term.write(nick .. string.rep(" ", math.max(1, 7 - #nick)))
-
-        term.setTextColor(colors.lightGray)
-        local keyText = (m.entity .. "." .. m.key)
-        term.write(keyText:sub(1, math.max(1, w - 15)))
-
-        term.setCursorPos(w - 7, y)
-        term.setBackgroundColor(colors.blue)
-        term.setTextColor(colors.white)
-        term.write("[N]")
-        term.setBackgroundColor(colors.red)
-        term.setTextColor(colors.white)
-        term.write(" [X]")
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
     end
+  end
 
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
+  drawChromeFooter(screen, w, h)
+end
 
-  elseif activeTab == "SETTINGS_ACTIONS" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" QUICK ACTIONS", w))
+local function dashboardOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  tabBarClick(screen, x, y)
+end
 
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [+] Add Quick Action", w))
+local function drawActions(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " QUICK ACTIONS", colors.yellow, colors.gray)
 
-    term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [<] Back to Settings", w))
-
-    local y = 6
-    if #cfg.quickActions == 0 then
-      term.setCursorPos(2, y)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("(no quick actions configured)")
-      y = y + 1
-    else
-      for idx, qa in ipairs(cfg.quickActions) do
-        if y >= h - 2 then break end
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.white)
-        local aText = padLine(("%d. %s -> %s"):format(idx, qa.label or qa.action, qa.entity), w - 4)
-        term.write(aText)
-        term.setBackgroundColor(colors.red)
-        term.setTextColor(colors.white)
-        term.write(" [X]")
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
-    end
-
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "WIZARD_ENTITY" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" SELECT ENTITY:", w))
-
-    local sorted = getSortedEntities()
-
-    local y = 3
-    if #sorted == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No entities discovered yet.")
-    else
-      for idx, name in ipairs(sorted) do
-        if y >= h - 2 then break end
-        local actCount = #getEntityActions(name)
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-        local itemText = (" [%d] %s"):format(idx, name)
-        if wizardTarget == "ACTION" then
-          itemText = itemText .. (" (%d acts)"):format(actCount)
-        end
-        term.write(padLine(itemText, w))
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
-    end
-
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "WIZARD_FIELD" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" SELECT FIELD FOR " .. tostring(wizardEntity) .. ":", w))
-
-    local fields = getEntityFields(wizardEntity)
-
-    local y = 3
-    if #fields == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No fields available.")
-    else
-      for idx, fKey in ipairs(fields) do
-        if y >= h - 2 then break end
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-        term.write(padLine((" [%d] %s"):format(idx, fKey), w))
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
-    end
-
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-
-  elseif activeTab == "WIZARD_ACTION" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" SELECT ACTION FOR " .. tostring(wizardEntity) .. ":", w))
-
-    local actList = getEntityActions(wizardEntity)
-    local y = 3
-    if #actList == 0 then
-      term.setCursorPos(2, 4)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No actions defined for entity.")
+  local y = 3
+  if #cfg.quickActions == 0 then
+    screen.write(2, 4, "No quick actions configured.", colors.gray)
+    screen.write(2, 5, "Go to Settings [Cfg] to add!", colors.gray)
+  else
+    for idx, qa in ipairs(cfg.quickActions) do
+      if y >= h - 1 then break end
+      local btnText = (" [%d] %s"):format(idx, qa.label or qa.action)
+      screen.write(1, y, padLine(btnText, w - 2), colors.white, colors.gray)
       y = y + 2
-    else
-      for idx, act in ipairs(actList) do
-        if y >= h - 3 then break end
-        term.setCursorPos(1, y)
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-        term.write(padLine((" [%d] %s"):format(idx, act), w))
-        term.setBackgroundColor(colors.black)
-        y = y + 1
-      end
     end
+  end
 
-    -- Custom action option at bottom
-    term.setCursorPos(1, y)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    term.write(padLine(" [*] Enter Custom Action...", w))
-    term.setBackgroundColor(colors.black)
+  drawChromeFooter(screen, w, h)
+end
+
+local function actionsOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+
+  local btnIdx = math.floor((y - 3) / 2) + 1
+  if btnIdx >= 1 and btnIdx <= #cfg.quickActions then
+    local qa = cfg.quickActions[btnIdx]
+    sendCommand(qa.entity, qa.action, qa.args)
+    screen.banner(("Sent '%s' to %s"):format(qa.action, qa.entity), false)
+  end
+end
+
+local function drawEntities(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " REGISTERED ENTITIES", colors.yellow, colors.gray)
+
+  local sorted = {}
+  for n in pairs(registry) do sorted[#sorted + 1] = n end
+  for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
+  table.sort(sorted)
+
+  local y = 3
+  if #sorted == 0 then
+    screen.write(2, 4, "Waiting for entities...", colors.gray)
+  else
+    for _, name in ipairs(sorted) do
+      if y >= h - 1 then break end
+      local e = ents[name]
+      local reg = registry[name]
+      local isOnline = (e and e.lastSeen and (os.clock() - e.lastSeen <= STALE_AFTER)) or (reg and reg.online)
+
+      screen.write(1, y, isOnline and " * " or " x ", isOnline and colors.lime or colors.red)
+
+      local padName = (name .. string.rep(" ", math.max(1, 14 - #name))):sub(1, 14)
+      screen.write(4, y, padName, colors.white)
+
+      local k = (e and e.kind) or (reg and reg.kind) or "dev"
+      screen.write(4 + #padName, y, k:sub(1, w - 18), colors.lightGray)
+
+      y = y + 1
+    end
+  end
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function entitiesOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+
+  local sorted = {}
+  for n in pairs(registry) do sorted[#sorted + 1] = n end
+  for n in pairs(ents) do if not registry[n] then sorted[#sorted + 1] = n end end
+  table.sort(sorted)
+  local rowIdx = y - 2
+  if rowIdx >= 1 and rowIdx <= #sorted then
+    inspectEntity = sorted[rowIdx]
+    inspectScroll = 1
+    activeTab = "INSPECT"
+    screen.show("inspect")
+  end
+end
+
+local function drawInspect(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " ENTITY: " .. tostring(inspectEntity), colors.yellow, colors.gray)
+
+  local y = 3
+  local e = ents[inspectEntity]
+  if not e then
+    screen.write(2, 4, "No data available.", colors.red)
+  else
+    local layout = computeInspectLayout(inspectEntity)
+    local keys = layout.keys
+
+    screen.write(1, y, (" TELEMETRY (%d fields):"):format(#keys), colors.cyan)
     y = y + 1
 
-    for r = y, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
+    if layout.scrollUpShown then
+      screen.write(2, y, "^ tap to scroll up ^", colors.yellow)
+      y = y + 1
     end
 
-  elseif activeTab == "INPUT_ACTION_NAME" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" NEW CUSTOM ACTION", w))
+    for i = inspectScroll, layout.endIdx do
+      local k = keys[i]
+      local val = e.data[k]
+      local formatted, valColor = formatSmartValue(k, val)
 
-    term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.write("Entity: " .. tostring(wizardEntity))
+      local keyLabel = k:sub(1, 8) .. ": "
+      screen.write(2, y, keyLabel, colors.lightGray)
+      screen.write(2 + #keyLabel, y, formatted:sub(1, math.max(1, w - 17)), valColor)
 
-    term.setCursorPos(1, 6)
-    term.setTextColor(colors.yellow)
-    term.write("Enter action name:")
-
-    term.setCursorPos(1, 8)
-    term.setTextColor(colors.white)
-    term.write(" > " .. inputBuffer .. "_")
-
-    for r = 9, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
+      screen.write(w - 5, y, "[+Dash]", colors.white, colors.green)
+      y = y + 1
     end
 
-  elseif activeTab == "INPUT_ARG" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(wizardCustomAction and " NEW QUICK ACTION" or " TRIGGER ACTION", w))
-
-    term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.write("Action: " .. tostring(selectedAction))
-
-    term.setCursorPos(1, 6)
-    term.setTextColor(colors.yellow)
-    term.write("Enter arguments (or blank):")
-
-    term.setCursorPos(1, 8)
-    term.setTextColor(colors.white)
-    term.write(" > " .. inputBuffer .. "_")
-
-    for r = 9, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
+    if layout.scrollDownShown then
+      screen.write(2, y, "v tap to scroll down (" .. (#keys - layout.endIdx) .. " more) v", colors.yellow)
+      y = y + 1
     end
 
-  elseif activeTab == "RENAME_METRIC" then
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(padLine(" RENAME METRIC NICKNAME", w))
+    y = layout.actionsHeaderY
+    screen.write(1, y, " ACTIONS (Tap to trigger):", colors.yellow)
+    y = y + 1
 
-    local target = cfg.metrics[editMetricIdx]
-    term.setCursorPos(1, 4)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.cyan)
-    term.write("Metric: " .. (target and (target.entity .. "." .. target.key) or "?"))
-
-    term.setCursorPos(1, 6)
-    term.setTextColor(colors.yellow)
-    term.write("Enter short nickname (max 6):")
-
-    term.setCursorPos(1, 8)
-    term.setTextColor(colors.white)
-    term.write(" > " .. inputBuffer .. "_")
-
-    for r = 9, h - 2 do
-      term.setCursorPos(1, r)
-      term.setBackgroundColor(colors.black)
-      term.write(string.rep(" ", w))
-    end
-  end
-
-  -- Status Banner Line (Line h-1)
-  term.setCursorPos(1, h - 1)
-  if statusBanner then
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(statusBanner.error and colors.red or colors.lime)
-    term.write(padLine((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text, w))
-  else
-    term.setBackgroundColor(colors.black)
-    term.write(string.rep(" ", w))
-  end
-
-  -- Bottom Tab Bar (Line h)
-  term.setCursorPos(1, h)
-  term.setBackgroundColor(colors.gray)
-  term.setTextColor(colors.white)
-
-  local cfgGroup = {
-    SETTINGS = true, SETTINGS_METRICS = true, SETTINGS_ACTIONS = true,
-    WIZARD_ENTITY = true, WIZARD_FIELD = true, WIZARD_ACTION = true,
-    INPUT_ACTION_NAME = true, RENAME_METRIC = true, INPUT_ARG = true,
-  }
-
-  local function drawTab(isActive, label, startX, endX)
-    term.setCursorPos(startX, h)
-    if isActive then
-      term.setBackgroundColor(colors.blue)
-      term.setTextColor(colors.yellow)
+    local actList = getEntityActions(inspectEntity)
+    if #actList == 0 then
+      screen.write(2, y, "(no actions available)", colors.gray)
+      y = y + 1
     else
-      term.setBackgroundColor(colors.gray)
-      term.setTextColor(colors.white)
+      for idx, act in ipairs(actList) do
+        if y >= h - 1 then break end
+        screen.write(2, y, padLine((" [%d] %s "):format(idx, act), w - 3), colors.white, colors.gray)
+        y = y + 1
+      end
     end
-    term.write(label)
   end
 
-  drawTab(activeTab == "DASHBOARD", " Dash ", 1, 6)
-  drawTab(activeTab == "ACTIONS",   " Act  ", 7, 12)
-  drawTab(activeTab == "ENTITIES" or activeTab == "INSPECT", " Ent  ", 13, 18)
-  drawTab(cfgGroup[activeTab] or false, " Cfg  ", 19, 26)
+  drawChromeFooter(screen, w, h)
+end
+
+local function inspectOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+  local w = screen.size()
+
+  local layout = computeInspectLayout(inspectEntity)
+  local keys = layout.keys
+
+  -- Scroll tap buttons
+  if y == 4 and layout.scrollUpShown then
+    inspectScroll = math.max(1, inspectScroll - 1)
+    return
+  end
+
+  if y == layout.scrollDownY and layout.scrollDownShown then
+    inspectScroll = inspectScroll + 1
+    return
+  end
+
+  -- Pin to Dash: only when the tap actually lands on the [+Dash] button
+  -- (previously any tap on the row pinned the field, even scroll-adjacent misclicks)
+  local valRowIdx = y - layout.valStartY + 1
+  if x >= w - 5 and valRowIdx >= 1 and valRowIdx <= layout.rowsDrawn then
+    local keyIdx = inspectScroll + valRowIdx - 1
+    if keys[keyIdx] then
+      local k = keys[keyIdx]
+      cfg.metrics[#cfg.metrics + 1] = {
+        entity = inspectEntity,
+        key = k,
+        label = inspectEntity .. "." .. k
+      }
+      saveConfig()
+      screen.banner(("Pinned %s.%s to Dash!"):format(inspectEntity, k), false)
+      return
+    end
+  end
+
+  -- Actions touch handling
+  local actList = getEntityActions(inspectEntity)
+  if #actList > 0 then
+    local actStartY = layout.actStartY
+    local actIdx = y - actStartY + 1
+    if actIdx >= 1 and actIdx <= #actList then
+      local actName = actList[actIdx]
+      -- One-off blocking prompt via the real read() - see prompt()'s
+      -- identical reasoning in subscriber.lua: read() always targets the
+      -- live terminal/cursor directly, so this stays a raw, unbuffered
+      -- draw; the next screen.tick() after this returns cleanly repaints
+      -- over it with the normal Inspect view.
+      term.setBackgroundColor(colors.black)
+      term.clear()
+      term.setCursorPos(1, 2)
+      term.setBackgroundColor(colors.gray)
+      term.setTextColor(colors.yellow)
+      term.write(padLine(" TRIGGER ACTION: " .. actName, w))
+      term.setBackgroundColor(colors.black)
+      term.setCursorPos(1, 4)
+      term.setTextColor(colors.yellow)
+      term.write("Enter args (blank for none):")
+      term.setCursorPos(1, 6)
+      term.setTextColor(colors.white)
+      term.write("> ")
+      local input = read()
+      local parsed = input
+      if not input or input == "" then parsed = nil
+      elseif tonumber(input) then parsed = tonumber(input)
+      elseif input:lower() == "true" then parsed = true
+      elseif input:lower() == "false" then parsed = false end
+
+      sendCommand(inspectEntity, actName, parsed)
+      screen.banner(("Sent '%s' to %s"):format(actName, inspectEntity), false)
+    end
+  end
+end
+
+local function inspectOnKey(screen, ev)
+  local key = ev[2]
+  if key == keys.up or key == keys.w then
+    inspectScroll = math.max(1, inspectScroll - 1)
+  elseif key == keys.down or key == keys.s then
+    inspectScroll = inspectScroll + 1
+  end
+end
+
+local function inspectOnScroll(screen, ev)
+  local dir = ev[2]
+  if dir < 0 then
+    inspectScroll = math.max(1, inspectScroll - 1)
+  else
+    inspectScroll = inspectScroll + 1
+  end
+end
+
+local function drawSettings(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " SETTINGS & MANAGEMENT", colors.yellow, colors.gray)
+
+  screen.write(1, 3, padLine((" Metrics (%d)"):format(#cfg.metrics), w - 1), colors.white, colors.blue)
+  screen.write(w, 3, ">", colors.white, colors.gray)
+
+  screen.write(1, 4, padLine((" Quick Actions (%d)"):format(#cfg.quickActions), w - 1), colors.white, colors.blue)
+  screen.write(w, 4, ">", colors.white, colors.gray)
+
+  screen.write(1, 6, padLine(" Network", w), colors.lightGray)
+  screen.write(1, 7, padLine(" Re-Sync Broker", w), colors.white, colors.gray)
+  screen.write(1, 8, padLine(" Clear All Config", w), colors.white, colors.red)
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawSettingsMetrics(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " DASHBOARD METRICS", colors.yellow, colors.gray)
+  screen.write(1, 3, padLine(" [+] Add Metric", w), colors.white, colors.blue)
+  screen.write(1, 4, padLine(" [<] Back to Settings", w), colors.white, colors.gray)
+
+  local y = 6
+  if #cfg.metrics == 0 then
+    screen.write(2, y, "(no metrics configured)", colors.gray)
+  else
+    for idx, m in ipairs(cfg.metrics) do
+      if y >= h - 2 then break end
+      local nick = (m.label or m.entity):sub(1, 6)
+      local nickField = nick .. string.rep(" ", math.max(1, 7 - #nick))
+      screen.write(1, y, nickField, colors.cyan)
+
+      local keyText = (m.entity .. "." .. m.key)
+      screen.write(1 + #nickField, y, keyText:sub(1, math.max(1, w - 15)), colors.lightGray)
+
+      screen.write(w - 7, y, "[N]", colors.white, colors.blue)
+      screen.write(w - 4, y, " [X]", colors.white, colors.red)
+      y = y + 1
+    end
+  end
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawSettingsActions(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " QUICK ACTIONS", colors.yellow, colors.gray)
+  screen.write(1, 3, padLine(" [+] Add Quick Action", w), colors.white, colors.blue)
+  screen.write(1, 4, padLine(" [<] Back to Settings", w), colors.white, colors.gray)
+
+  local y = 6
+  if #cfg.quickActions == 0 then
+    screen.write(2, y, "(no quick actions configured)", colors.gray)
+  else
+    for idx, qa in ipairs(cfg.quickActions) do
+      if y >= h - 2 then break end
+      local aText = padLine(("%d. %s -> %s"):format(idx, qa.label or qa.action, qa.entity), w - 4)
+      screen.write(1, y, aText, colors.white)
+      screen.write(1 + #aText, y, " [X]", colors.white, colors.red)
+      y = y + 1
+    end
+  end
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawWizardEntity(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " SELECT ENTITY:", colors.yellow, colors.gray)
+
+  local sorted = getSortedEntities()
+  local y = 3
+  if #sorted == 0 then
+    screen.write(2, 4, "No entities discovered yet.", colors.gray)
+  else
+    for idx, name in ipairs(sorted) do
+      if y >= h - 2 then break end
+      local actCount = #getEntityActions(name)
+      local itemText = (" [%d] %s"):format(idx, name)
+      if wizardTarget == "ACTION" then
+        itemText = itemText .. (" (%d acts)"):format(actCount)
+      end
+      screen.write(1, y, padLine(itemText, w), colors.white, colors.gray)
+      y = y + 1
+    end
+  end
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawWizardField(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " SELECT FIELD FOR " .. tostring(wizardEntity) .. ":", colors.yellow, colors.gray)
+
+  local fields = getEntityFields(wizardEntity)
+  local y = 3
+  if #fields == 0 then
+    screen.write(2, 4, "No fields available.", colors.gray)
+  else
+    for idx, fKey in ipairs(fields) do
+      if y >= h - 2 then break end
+      screen.write(1, y, padLine((" [%d] %s"):format(idx, fKey), w), colors.white, colors.gray)
+      y = y + 1
+    end
+  end
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawWizardAction(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " SELECT ACTION FOR " .. tostring(wizardEntity) .. ":", colors.yellow, colors.gray)
+
+  local actList = getEntityActions(wizardEntity)
+  local y = 3
+  if #actList == 0 then
+    screen.write(2, 4, "No actions defined for entity.", colors.gray)
+    y = y + 2
+  else
+    for idx, act in ipairs(actList) do
+      if y >= h - 3 then break end
+      screen.write(1, y, padLine((" [%d] %s"):format(idx, act), w), colors.white, colors.gray)
+      y = y + 1
+    end
+  end
+
+  -- Custom action option at bottom
+  screen.write(1, y, padLine(" [*] Enter Custom Action...", w), colors.white, colors.blue)
+
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawInputActionName(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " NEW CUSTOM ACTION", colors.yellow, colors.gray)
+  screen.write(1, 4, "Entity: " .. tostring(wizardEntity), colors.white)
+  screen.write(1, 6, "Enter action name:", colors.yellow)
+  screen.write(1, 8, " > " .. inputBuffer .. "_", colors.white)
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawInputArg(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, wizardCustomAction and " NEW QUICK ACTION" or " TRIGGER ACTION", colors.yellow, colors.gray)
+  screen.write(1, 4, "Action: " .. tostring(selectedAction), colors.white)
+  screen.write(1, 6, "Enter arguments (or blank):", colors.yellow)
+  screen.write(1, 8, " > " .. inputBuffer .. "_", colors.white)
+  drawChromeFooter(screen, w, h)
+end
+
+local function drawRenameMetric(screen)
+  local w, h = screen.size()
+  drawChromeHeader(screen, w)
+  screen.row(2, " RENAME METRIC NICKNAME", colors.yellow, colors.gray)
+
+  local target = cfg.metrics[editMetricIdx]
+  screen.write(1, 4, "Metric: " .. (target and (target.entity .. "." .. target.key) or "?"), colors.cyan)
+  screen.write(1, 6, "Enter short nickname (max 6):", colors.yellow)
+  screen.write(1, 8, " > " .. inputBuffer .. "_", colors.white)
+
+  drawChromeFooter(screen, w, h)
 end
 
 --------------------------------------------------------------------
 -- touch & key event handling
 --------------------------------------------------------------------
-local function handleTouch(x, y)
-  local w, h = term.getSize()
+local function settingsOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
 
-  -- Bottom Tab Bar Touch
-  if y == h then
-    if x <= 6 then activeTab = "DASHBOARD"
-    elseif x <= 12 then activeTab = "ACTIONS"
-    elseif x <= 18 then activeTab = "ENTITIES"
-    else activeTab = "SETTINGS" end
-    renderScreen()
-    return
+  if y == 3 then
+    activeTab = "SETTINGS_METRICS"
+    screen.show("settings_metrics")
+
+  elseif y == 4 then
+    activeTab = "SETTINGS_ACTIONS"
+    screen.show("settings_actions")
+
+  elseif y == 7 then
+    subscribe()
+    requestRegistry()
+    screen.banner("Broker re-sync requested", false)
+
+  elseif y == 8 then
+    cfg.metrics = {}
+    cfg.quickActions = {}
+    saveConfig()
+    screen.banner("Config cleared", false)
   end
+end
 
-  if activeTab == "ACTIONS" then
-    local btnIdx = math.floor((y - 3) / 2) + 1
-    if btnIdx >= 1 and btnIdx <= #cfg.quickActions then
-      local qa = cfg.quickActions[btnIdx]
-      sendCommand(qa.entity, qa.action, qa.args)
-      setBanner(("Sent '%s' to %s"):format(qa.action, qa.entity), false)
-      renderScreen()
-    end
+local function settingsMetricsOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+  local w = screen.size()
 
-  elseif activeTab == "ENTITIES" then
-    local sorted = getSortedEntities()
-    local rowIdx = y - 2
-    if rowIdx >= 1 and rowIdx <= #sorted then
-      inspectEntity = sorted[rowIdx]
-      inspectScroll = 1
-      activeTab = "INSPECT"
-      renderScreen()
-    end
+  if y == 3 then
+    wizardTarget = "METRIC"
+    activeTab = "WIZARD_ENTITY"
+    screen.show("wizard_entity")
 
-  elseif activeTab == "INSPECT" then
-    local layout = computeInspectLayout(inspectEntity)
-    local keys = layout.keys
+  elseif y == 4 then
+    activeTab = "SETTINGS"
+    screen.show("settings")
 
-    -- Scroll tap buttons
-    if y == 4 and layout.scrollUpShown then
-      inspectScroll = math.max(1, inspectScroll - 1)
-      renderScreen()
-      return
-    end
-
-    if y == layout.scrollDownY and layout.scrollDownShown then
-      inspectScroll = inspectScroll + 1
-      renderScreen()
-      return
-    end
-
-    -- Pin to Dash: only when the tap actually lands on the [+Dash] button
-    -- (previously any tap on the row pinned the field, even scroll-adjacent misclicks)
-    local valRowIdx = y - layout.valStartY + 1
-    if x >= w - 5 and valRowIdx >= 1 and valRowIdx <= layout.rowsDrawn then
-      local keyIdx = inspectScroll + valRowIdx - 1
-      if keys[keyIdx] then
-        local k = keys[keyIdx]
-        cfg.metrics[#cfg.metrics + 1] = {
-          entity = inspectEntity,
-          key = k,
-          label = inspectEntity .. "." .. k
-        }
+  elseif y >= 6 then
+    local idx = y - 6 + 1
+    if cfg.metrics[idx] then
+      if x >= w - 4 then
+        local removed = table.remove(cfg.metrics, idx)
         saveConfig()
-        setBanner(("Pinned %s.%s to Dash!"):format(inspectEntity, k), false)
-        renderScreen()
-        return
+        screen.banner("Removed metric: " .. (removed.label or (removed.entity .. "." .. removed.key)), false)
+      elseif x >= w - 8 then
+        editMetricIdx = idx
+        inputBuffer = ""
+        activeTab = "RENAME_METRIC"
+        screen.show("rename_metric")
       end
-    end
-
-    -- Actions touch handling
-    local actList = getEntityActions(inspectEntity)
-    if #actList > 0 then
-      local actStartY = layout.actStartY
-      local actIdx = y - actStartY + 1
-      if actIdx >= 1 and actIdx <= #actList then
-        local actName = actList[actIdx]
-        term.setBackgroundColor(colors.black)
-        term.clear()
-        term.setCursorPos(1, 2)
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.yellow)
-        term.write(padLine(" TRIGGER ACTION: " .. actName, w))
-        term.setBackgroundColor(colors.black)
-        term.setCursorPos(1, 4)
-        term.setTextColor(colors.yellow)
-        term.write("Enter args (blank for none):")
-        term.setCursorPos(1, 6)
-        term.setTextColor(colors.white)
-        term.write("> ")
-        local input = read()
-        local parsed = input
-        if not input or input == "" then parsed = nil
-        elseif tonumber(input) then parsed = tonumber(input)
-        elseif input:lower() == "true" then parsed = true
-        elseif input:lower() == "false" then parsed = false end
-
-        sendCommand(inspectEntity, actName, parsed)
-        setBanner(("Sent '%s' to %s"):format(actName, inspectEntity), false)
-        renderScreen()
-      end
-    end
-
-  elseif activeTab == "SETTINGS" then
-    if y == 3 then
-      activeTab = "SETTINGS_METRICS"
-      renderScreen()
-
-    elseif y == 4 then
-      activeTab = "SETTINGS_ACTIONS"
-      renderScreen()
-
-    elseif y == 7 then
-      subscribe()
-      requestRegistry()
-      setBanner("Broker re-sync requested", false)
-      renderScreen()
-
-    elseif y == 8 then
-      cfg.metrics = {}
-      cfg.quickActions = {}
-      saveConfig()
-      setBanner("Config cleared", false)
-      renderScreen()
-    end
-
-  elseif activeTab == "SETTINGS_METRICS" then
-    if y == 3 then
-      wizardTarget = "METRIC"
-      activeTab = "WIZARD_ENTITY"
-      renderScreen()
-
-    elseif y == 4 then
-      activeTab = "SETTINGS"
-      renderScreen()
-
-    elseif y >= 6 then
-      local idx = y - 6 + 1
-      if cfg.metrics[idx] then
-        if x >= w - 4 then
-          local removed = table.remove(cfg.metrics, idx)
-          saveConfig()
-          setBanner("Removed metric: " .. (removed.label or (removed.entity .. "." .. removed.key)), false)
-          renderScreen()
-        elseif x >= w - 8 then
-          editMetricIdx = idx
-          inputBuffer = ""
-          activeTab = "RENAME_METRIC"
-          renderScreen()
-        end
-      end
-    end
-
-  elseif activeTab == "SETTINGS_ACTIONS" then
-    if y == 3 then
-      wizardTarget = "ACTION"
-      activeTab = "WIZARD_ENTITY"
-      renderScreen()
-
-    elseif y == 4 then
-      activeTab = "SETTINGS"
-      renderScreen()
-
-    elseif y >= 6 then
-      local idx = y - 6 + 1
-      if cfg.quickActions[idx] then
-        local removed = table.remove(cfg.quickActions, idx)
-        saveConfig()
-        setBanner("Removed action: " .. (removed.label or removed.action), false)
-        renderScreen()
-      end
-    end
-
-  elseif activeTab == "WIZARD_ENTITY" then
-    local sorted = getSortedEntities()
-
-    local entIdx = y - 2
-    if entIdx >= 1 and entIdx <= #sorted then
-      wizardEntity = sorted[entIdx]
-      if wizardTarget == "METRIC" then
-        activeTab = "WIZARD_FIELD"
-      else
-        activeTab = "WIZARD_ACTION"
-      end
-      renderScreen()
-    end
-
-  elseif activeTab == "WIZARD_FIELD" then
-    local fields = getEntityFields(wizardEntity)
-
-    local fIdx = y - 2
-    if fIdx >= 1 and fIdx <= #fields then
-      local selField = fields[fIdx]
-      cfg.metrics[#cfg.metrics + 1] = {
-        entity = wizardEntity,
-        key = selField,
-        label = wizardEntity .. "." .. selField
-      }
-      saveConfig()
-      setBanner(("Added metric: %s.%s"):format(wizardEntity, selField), false)
-      activeTab = "SETTINGS_METRICS"
-      renderScreen()
-    end
-
-  elseif activeTab == "WIZARD_ACTION" then
-    local actList = getEntityActions(wizardEntity)
-    local aIdx = y - 2
-    if aIdx >= 1 and aIdx <= #actList then
-      local selAct = actList[aIdx]
-      cfg.quickActions[#cfg.quickActions + 1] = {
-        entity = wizardEntity,
-        action = selAct,
-        label = selAct:upper() .. " " .. wizardEntity:upper()
-      }
-      saveConfig()
-      setBanner(("Added action: %s on %s"):format(selAct, wizardEntity), false)
-      activeTab = "SETTINGS_ACTIONS"
-      renderScreen()
-    elseif aIdx == #actList + 1 or (#actList == 0 and y >= 4) then
-      wizardCustomAction = true
-      inputBuffer = ""
-      activeTab = "INPUT_ACTION_NAME"
-      renderScreen()
     end
   end
 end
+
+local function settingsActionsOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+
+  if y == 3 then
+    wizardTarget = "ACTION"
+    activeTab = "WIZARD_ENTITY"
+    screen.show("wizard_entity")
+
+  elseif y == 4 then
+    activeTab = "SETTINGS"
+    screen.show("settings")
+
+  elseif y >= 6 then
+    local idx = y - 6 + 1
+    if cfg.quickActions[idx] then
+      local removed = table.remove(cfg.quickActions, idx)
+      saveConfig()
+      screen.banner("Removed action: " .. (removed.label or removed.action), false)
+    end
+  end
+end
+
+local function wizardEntityOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+
+  local sorted = getSortedEntities()
+  local entIdx = y - 2
+  if entIdx >= 1 and entIdx <= #sorted then
+    wizardEntity = sorted[entIdx]
+    if wizardTarget == "METRIC" then
+      activeTab = "WIZARD_FIELD"
+      screen.show("wizard_field")
+    else
+      activeTab = "WIZARD_ACTION"
+      screen.show("wizard_action")
+    end
+  end
+end
+
+local function wizardFieldOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+
+  local fields = getEntityFields(wizardEntity)
+  local fIdx = y - 2
+  if fIdx >= 1 and fIdx <= #fields then
+    local selField = fields[fIdx]
+    cfg.metrics[#cfg.metrics + 1] = {
+      entity = wizardEntity,
+      key = selField,
+      label = wizardEntity .. "." .. selField
+    }
+    saveConfig()
+    screen.banner(("Added metric: %s.%s"):format(wizardEntity, selField), false)
+    activeTab = "SETTINGS_METRICS"
+    screen.show("settings_metrics")
+  end
+end
+
+local function wizardActionOnClick(screen, ev)
+  local x, y = ev[3], ev[4]
+  if tabBarClick(screen, x, y) then return end
+
+  local actList = getEntityActions(wizardEntity)
+  local aIdx = y - 2
+  if aIdx >= 1 and aIdx <= #actList then
+    local selAct = actList[aIdx]
+    cfg.quickActions[#cfg.quickActions + 1] = {
+      entity = wizardEntity,
+      action = selAct,
+      label = selAct:upper() .. " " .. wizardEntity:upper()
+    }
+    saveConfig()
+    screen.banner(("Added action: %s on %s"):format(selAct, wizardEntity), false)
+    activeTab = "SETTINGS_ACTIONS"
+    screen.show("settings_actions")
+  elseif aIdx == #actList + 1 or (#actList == 0 and y >= 4) then
+    wizardCustomAction = true
+    inputBuffer = ""
+    activeTab = "INPUT_ACTION_NAME"
+    screen.show("input_action_name")
+  end
+end
+
+-- Shared by the three text-input views (rename_metric, input_action_name,
+-- input_arg): inputBuffer is one module-level var reused across all of
+-- them, same as before.
+local function textInputOnChar(screen, ev)
+  if activeTab == "RENAME_METRIC" and #inputBuffer >= 6 then
+    -- max 6 chars for label
+  else
+    inputBuffer = inputBuffer .. ev[2]
+  end
+end
+
+local function renameMetricOnKey(screen, ev)
+  local key = ev[2]
+  if key == keys.backspace then
+    inputBuffer = inputBuffer:sub(1, -2)
+
+  elseif key == keys.enter then
+    if editMetricIdx and cfg.metrics[editMetricIdx] then
+      cfg.metrics[editMetricIdx].label = inputBuffer ~= "" and inputBuffer or nil
+      saveConfig()
+      screen.banner("Metric nickname updated!", false)
+    end
+    activeTab = "SETTINGS_METRICS"
+    screen.show("settings_metrics")
+
+  -- Tab, not Escape: Minecraft eats Escape to close the terminal/pocket
+  -- computer GUI before it ever reaches CC:Tweaked as a "key" event,
+  -- and letters must stay typeable here, so no letter key can double
+  -- as "cancel".
+  elseif key == keys.tab then
+    activeTab = "SETTINGS_METRICS"
+    screen.show("settings_metrics")
+  end
+end
+
+local function inputActionNameOnKey(screen, ev)
+  local key = ev[2]
+  if key == keys.backspace then
+    inputBuffer = inputBuffer:sub(1, -2)
+
+  elseif key == keys.enter then
+    if inputBuffer ~= "" then
+      selectedAction = inputBuffer
+      inputBuffer = ""
+      activeTab = "INPUT_ARG"
+      screen.show("input_arg")
+    end
+
+  elseif key == keys.tab then
+    wizardCustomAction = false
+    activeTab = "WIZARD_ACTION"
+    screen.show("wizard_action")
+  end
+end
+
+local function inputArgOnKey(screen, ev)
+  local key = ev[2]
+  if key == keys.backspace then
+    inputBuffer = inputBuffer:sub(1, -2)
+
+  elseif key == keys.enter then
+    local parsed = inputBuffer
+    if inputBuffer == "" then parsed = nil
+    elseif tonumber(inputBuffer) then parsed = tonumber(inputBuffer)
+    elseif inputBuffer:lower() == "true" then parsed = true
+    elseif inputBuffer:lower() == "false" then parsed = false end
+
+    if wizardCustomAction then
+      cfg.quickActions[#cfg.quickActions + 1] = {
+        entity = wizardEntity,
+        action = selectedAction,
+        args = parsed,
+        label = selectedAction:upper() .. " " .. wizardEntity:upper()
+      }
+      saveConfig()
+      screen.banner(("Added custom action: %s on %s"):format(selectedAction, wizardEntity), false)
+      wizardCustomAction = false
+      activeTab = "SETTINGS_ACTIONS"
+      screen.show("settings_actions")
+    else
+      sendCommand(inspectEntity, selectedAction, parsed)
+      screen.banner(("Sent '%s' to %s"):format(selectedAction, inspectEntity), false)
+      activeTab = "INSPECT"
+      screen.show("inspect")
+    end
+
+  elseif key == keys.tab then
+    if wizardCustomAction then
+      wizardCustomAction = false
+      activeTab = "SETTINGS_ACTIONS"
+      screen.show("settings_actions")
+    else
+      activeTab = "INSPECT"
+      screen.show("inspect")
+    end
+  end
+end
+
+-- No screensaver/idle-hide here, unlike the other targets: a tablet is a
+-- personal handheld device someone's actively holding, not a fixed
+-- computer nobody's standing at most of the day, so there's no "closed
+-- until first key" state to begin with - the dashboard is always live.
+local tabletScreen = Screen.new(term, { defaultView = "dashboard" })
+tabletScreen.registerView("dashboard", { draw = drawDashboard, onClick = dashboardOnClick })
+tabletScreen.registerView("actions", { draw = drawActions, onClick = actionsOnClick })
+tabletScreen.registerView("entities", { draw = drawEntities, onClick = entitiesOnClick })
+tabletScreen.registerView("inspect", {
+  draw = drawInspect, onClick = inspectOnClick, onKey = inspectOnKey, onScroll = inspectOnScroll,
+})
+tabletScreen.registerView("settings", { draw = drawSettings, onClick = settingsOnClick })
+tabletScreen.registerView("settings_metrics", { draw = drawSettingsMetrics, onClick = settingsMetricsOnClick })
+tabletScreen.registerView("settings_actions", { draw = drawSettingsActions, onClick = settingsActionsOnClick })
+tabletScreen.registerView("wizard_entity", { draw = drawWizardEntity, onClick = wizardEntityOnClick })
+tabletScreen.registerView("wizard_field", { draw = drawWizardField, onClick = wizardFieldOnClick })
+tabletScreen.registerView("wizard_action", { draw = drawWizardAction, onClick = wizardActionOnClick })
+tabletScreen.registerView("input_action_name", {
+  draw = drawInputActionName, onKey = inputActionNameOnKey, onChar = textInputOnChar,
+})
+tabletScreen.registerView("input_arg", { draw = drawInputArg, onKey = inputArgOnKey, onChar = textInputOnChar })
+tabletScreen.registerView("rename_metric", {
+  draw = drawRenameMetric, onKey = renameMetricOnKey, onChar = textInputOnChar,
+})
 
 --------------------------------------------------------------------
 -- main loop
@@ -1209,7 +1124,8 @@ findBroker()
 subscribe()
 requestRegistry()
 
-renderScreen()
+tabletScreen.show("dashboard")
+tabletScreen.tick()
 
 local animTimer = os.startTimer(0.5)
 
@@ -1219,123 +1135,26 @@ while true do
   if ev[1] == "timer" and ev[2] == animTimer then
     animIdx = (animIdx % #animFrames) + 1
     animTimer = os.startTimer(0.5)
-    -- selective light redraw of header animation only (zero flicker)
+    -- selective light redraw of header animation only (zero flicker) -
+    -- a real, unbuffered single-character write straight to the
+    -- terminal, exactly as before. This coexists safely with the
+    -- double-buffered Screen used for everything else: its window stays
+    -- visible between full redraws, so this direct write lands on the
+    -- same physical cell the last buffered draw painted, and a full
+    -- redraw here every 0.5s (just to animate one character) would cost
+    -- more than it's worth on a pocket computer.
     term.setCursorPos(3, 1)
     term.setBackgroundColor(colors.blue)
     term.setTextColor(colors.yellow)
     term.write(animFrames[animIdx])
 
-  elseif ev[1] == "mouse_click" or ev[1] == "touch" then
-    handleTouch(ev[3], ev[4])
-
-  elseif ev[1] == "mouse_scroll" and activeTab == "INSPECT" then
-    local dir = ev[2]
-    if dir < 0 then
-      inspectScroll = math.max(1, inspectScroll - 1)
-    else
-      inspectScroll = inspectScroll + 1
-    end
-    renderScreen()
-
-  elseif ev[1] == "char" and (activeTab == "INPUT_ARG" or activeTab == "RENAME_METRIC" or activeTab == "INPUT_ACTION_NAME") then
-    if activeTab == "RENAME_METRIC" and #inputBuffer >= 6 then
-      -- max 6 chars for label
-    else
-      inputBuffer = inputBuffer .. ev[2]
-      renderScreen()
-    end
-
-  elseif ev[1] == "key" then
-    local key = ev[2]
-    if activeTab == "INSPECT" then
-      if key == keys.up or key == keys.w then
-        inspectScroll = math.max(1, inspectScroll - 1)
-        renderScreen()
-      elseif key == keys.down or key == keys.s then
-        inspectScroll = inspectScroll + 1
-        renderScreen()
-      end
-    elseif activeTab == "RENAME_METRIC" then
-      if key == keys.backspace then
-        inputBuffer = inputBuffer:sub(1, -2)
-        renderScreen()
-      elseif key == keys.enter then
-        if editMetricIdx and cfg.metrics[editMetricIdx] then
-          cfg.metrics[editMetricIdx].label = inputBuffer ~= "" and inputBuffer or nil
-          saveConfig()
-          setBanner("Metric nickname updated!", false)
-        end
-        activeTab = "SETTINGS_METRICS"
-        renderScreen()
-      -- Tab, not Escape: Minecraft eats Escape to close the terminal/pocket
-      -- computer GUI before it ever reaches CC:Tweaked as a "key" event,
-      -- and letters must stay typeable here, so no letter key can double
-      -- as "cancel".
-      elseif key == keys.tab then
-        activeTab = "SETTINGS_METRICS"
-        renderScreen()
-      end
-
-    elseif activeTab == "INPUT_ACTION_NAME" then
-      if key == keys.backspace then
-        inputBuffer = inputBuffer:sub(1, -2)
-        renderScreen()
-      elseif key == keys.enter then
-        if inputBuffer ~= "" then
-          selectedAction = inputBuffer
-          inputBuffer = ""
-          activeTab = "INPUT_ARG"
-        end
-        renderScreen()
-      elseif key == keys.tab then
-        wizardCustomAction = false
-        activeTab = "WIZARD_ACTION"
-        renderScreen()
-      end
-
-    elseif activeTab == "INPUT_ARG" then
-      if key == keys.backspace then
-        inputBuffer = inputBuffer:sub(1, -2)
-        renderScreen()
-
-      elseif key == keys.enter then
-        local parsed = inputBuffer
-        if inputBuffer == "" then parsed = nil
-        elseif tonumber(inputBuffer) then parsed = tonumber(inputBuffer)
-        elseif inputBuffer:lower() == "true" then parsed = true
-        elseif inputBuffer:lower() == "false" then parsed = false end
-
-        if wizardCustomAction then
-          cfg.quickActions[#cfg.quickActions + 1] = {
-            entity = wizardEntity,
-            action = selectedAction,
-            args = parsed,
-            label = selectedAction:upper() .. " " .. wizardEntity:upper()
-          }
-          saveConfig()
-          setBanner(("Added custom action: %s on %s"):format(selectedAction, wizardEntity), false)
-          wizardCustomAction = false
-          activeTab = "SETTINGS_ACTIONS"
-        else
-          sendCommand(inspectEntity, selectedAction, parsed)
-          setBanner(("Sent '%s' to %s"):format(selectedAction, inspectEntity), false)
-          activeTab = "INSPECT"
-        end
-        renderScreen()
-
-      elseif key == keys.tab then
-        if wizardCustomAction then
-          wizardCustomAction = false
-          activeTab = "SETTINGS_ACTIONS"
-        else
-          activeTab = "INSPECT"
-        end
-        renderScreen()
-      end
-    end
+  elseif ev[1] == "mouse_click" or ev[1] == "touch" or ev[1] == "mouse_scroll" or ev[1] == "key" or ev[1] == "char" then
+    tabletScreen.handleEvent(ev)
+    tabletScreen.tick()
 
   elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     pcall(handleNet, ev[3], ev[2])
-    renderScreen()
+    tabletScreen.markDirty()
+    tabletScreen.tick()
   end
 end

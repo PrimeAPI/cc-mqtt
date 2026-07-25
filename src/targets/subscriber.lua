@@ -39,6 +39,12 @@ peripheral.find("modem", function(n) rednet.open(n) end)
 local mon = peripheral.find("monitor")
 if not mon then error("No monitor found!", 0) end
 
+-- The real peripheral - clearMonitor() below reassigns `mon` itself to a
+-- double-buffered window over this every redraw pass, but setTextScale/
+-- setPaletteColour and the buffer's own creation need the real device,
+-- not whatever window currently wraps it.
+local realMon = mon
+
 --------------------------------------------------------------------
 -- config
 --------------------------------------------------------------------
@@ -112,6 +118,7 @@ end
 -- auto updater
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
+--[[@include lib/screen.lua as Screen]]
 
 -- Routine re-check cadence, retry-after-failure backoff, and the
 -- computer-ID stagger that keeps a whole fleet of computers from bursting
@@ -661,13 +668,31 @@ local function renderAll(sel)
     end
     mon.setBackgroundColor(colors.black)
   end
+
+  -- clearMonitor() (below) leaves `mon` invisible so the clear, status
+  -- bar, decor, buttons and every panel window drawn above all land in
+  -- the buffer first - this is the one flip that reveals the whole
+  -- finished frame at once instead of the real hardware showing each of
+  -- those steps as they happened. A renderAll() called without a
+  -- preceding clearMonitor() (the periodic/partial-update call sites)
+  -- reuses the already-visible buffer from last time, so this is just a
+  -- harmless no-op there.
+  mon.setVisible(true)
 end
 
 local function clearMonitor()
   for _, item in ipairs(cfg.layout) do item._win = nil end
-  mon.setTextScale(cfg.textScale)
+  realMon.setTextScale(cfg.textScale)
   -- repurpose brown as a dark gray for empty gauge tracks
-  pcall(mon.setPaletteColour, TRACK_COLOR, 0x303030)
+  pcall(realMon.setPaletteColour, TRACK_COLOR, 0x303030)
+  -- Fresh double-buffer every full redraw: `mon` becomes a window over
+  -- the real monitor (window.create(..., false) starts it invisible), so
+  -- every draw below - status bar, decor, buttons, panels - accumulates
+  -- off-screen until renderAll() flips it visible in one shot. Old
+  -- item._win panel windows were nil'd above since they'd otherwise point
+  -- at the previous (now-replaced) buffer instance as their parent.
+  local w, h = realMon.getSize()
+  mon = window.create(realMon, 1, 1, w, h, false)
   mon.setBackgroundColor(colors.black)
   mon.clear()
 end
@@ -893,6 +918,30 @@ local function tLine(y, text, color)
   term.write(text:sub(1, w))
 end
 
+-- Setup mode's screens (entity list, layout list, fields list, item
+-- editor, pick-list) each own their own blocking event loop and call
+-- each other directly by name rather than being routed through one
+-- central dispatcher - they don't fit the registerView/handleEvent shape
+-- the other targets' consoles use. They still redraw the same physical
+-- terminal repeatedly (every keypress, and on their own ~1s idle-refresh
+-- timer while a live monitor preview is open), which is exactly what
+-- caused the flicker elsewhere, so they get the same double-buffered
+-- Screen instance regardless - just driven directly (markDirty + tick)
+-- instead of through a view registry. setupDraw is swapped to whichever
+-- screen currently owns the terminal; prompt()'s use of the real read()
+-- for single-line text input is untouched, since read() always targets
+-- the live term/cursor and would show nothing if redirected into this
+-- buffer.
+local setupScreen = Screen.new(term, {})
+local setupDraw = function() end
+setupScreen.registerView("main", { draw = function(scr) setupDraw(scr) end })
+setupScreen.show("main")
+
+local function setupRedraw()
+  setupScreen.markDirty()
+  setupScreen.tick()
+end
+
 local function prompt(label, default)
   local w, h = term.getSize()
   -- leave room for the typed input itself: a label that fills the
@@ -931,11 +980,10 @@ local function pickList(title, items, allowCustom, colorFn, currentValue)
       if v == currentValue then sel = i break end
     end
   end
-  local function draw()
-    local w, h = term.getSize()
-    tClear()
-    tLine(1, title, colors.yellow)
-    tLine(2, string.rep("-", w), colors.gray)
+  setupDraw = function(scr)
+    local w, h = scr.size()
+    scr.row(1, title, colors.yellow)
+    scr.row(2, string.rep("-", w), colors.gray)
     local listH = h - 4
     if sel - offset > listH then offset = sel - listH end
     if sel - offset < 1 then offset = sel - 1 end
@@ -943,20 +991,15 @@ local function pickList(title, items, allowCustom, colorFn, currentValue)
       local idx = i + offset
       local it = list[idx]
       if not it then break end
-      term.setCursorPos(1, 2 + i)
-      term.clearLine()
       if idx == sel then
-        term.setTextColor(colors.black)
-        term.setBackgroundColor(colors.yellow)
-        term.write(it:sub(1, w))
-        term.setBackgroundColor(colors.black)
+        scr.row(2 + i, it, colors.black, colors.yellow)
       else
-        term.setTextColor((colorFn and colorFn(it)) or colors.white)
-        term.write(it:sub(1, w))
+        scr.row(2 + i, it, (colorFn and colorFn(it)) or colors.white)
       end
     end
-    tLine(h, "up/down:sel enter:pick b:cancel", colors.lightGray)
+    scr.row(h, "up/down:sel enter:pick b:cancel", colors.lightGray)
   end
+  local function draw() setupRedraw() end
 
   draw()
   while true do
@@ -995,11 +1038,10 @@ local function entityScreen()
   local sel, offset = 1, 0
   local nextReg = 0   -- deadline-based, immune to swallowed timer events
 
-  local function draw()
-    local w, h = term.getSize()
-    tClear()
-    tLine(1, "cbus setup - entities", colors.yellow)
-    tLine(2, string.rep("-", w), colors.gray)
+  setupDraw = function(scr)
+    local w, h = scr.size()
+    scr.row(1, "cbus setup - entities", colors.yellow)
+    scr.row(2, string.rep("-", w), colors.gray)
     local names = sortedEntityNames()
     if sel > #names then sel = math.max(1, #names) end
     local listH = h - 4
@@ -1015,22 +1057,17 @@ local function entityScreen()
       local status = reg and (reg.online and "online" or "offline") or "unknown"
       local alias = (c.alias and c.alias ~= "") and (' "' .. c.alias .. '"') or ""
       local line = ("%s %s%s (%s)"):format(mark, n, alias, status)
-      term.setCursorPos(1, 2 + i)
-      term.clearLine()
       if idx == sel then
-        term.setTextColor(colors.black)
-        term.setBackgroundColor(colors.yellow)
-        term.write(line:sub(1, w))
-        term.setBackgroundColor(colors.black)
+        scr.row(2 + i, line, colors.black, colors.yellow)
       else
-        term.setTextColor(c.enabled and colors.white or colors.gray)
-        term.write(line:sub(1, w))
+        scr.row(2 + i, line, c.enabled and colors.white or colors.gray)
       end
     end
-    if #names == 0 then tLine(4, "no entities known yet - waiting for broker...", colors.gray) end
-    tLine(h - 1, "space: toggle  r: rename  enter: layout editor", colors.lightGray)
-    tLine(h, "q: save & exit setup", colors.lightGray)
+    if #names == 0 then scr.row(4, "no entities known yet - waiting for broker...", colors.gray) end
+    scr.row(h - 1, "space: toggle  r: rename  enter: layout editor", colors.lightGray)
+    scr.row(h, "q: save & exit setup", colors.lightGray)
   end
+  local function draw() setupRedraw() end
 
   draw()
   while true do
@@ -1090,16 +1127,16 @@ end
 
 -- interactive move/resize of one item, live on the monitor
 local function editItem(item)
-  local function drawTerm()
-    local w, h = term.getSize()
-    tClear()
-    tLine(1, "editing: " .. itemLabel(item), colors.yellow)
-    tLine(2, string.rep("-", w), colors.gray)
-    tLine(4, ("pos %d,%d   size %dx%d"):format(item.x, item.y, item.w, item.h))
-    tLine(6, "arrows: move", colors.lightGray)
-    tLine(7, "a/d: width -/+   w/s: height -/+", colors.lightGray)
-    tLine(h, "enter: done", colors.lightGray)
+  setupDraw = function(scr)
+    local w, h = scr.size()
+    scr.row(1, "editing: " .. itemLabel(item), colors.yellow)
+    scr.row(2, string.rep("-", w), colors.gray)
+    scr.row(4, ("pos %d,%d   size %dx%d"):format(item.x, item.y, item.w, item.h))
+    scr.row(6, "arrows: move", colors.lightGray)
+    scr.row(7, "a/d: width -/+   w/s: height -/+", colors.lightGray)
+    scr.row(h, "enter: done", colors.lightGray)
   end
+  local function drawTerm() setupRedraw() end
   local function drawMon()
     clearMonitor()
     renderAll(item)
@@ -1192,11 +1229,10 @@ local function fieldsScreen(item)
     item.fields[#item.fields + 1] = { source = "meta", key = f.key }
   end
 
-  local function drawTerm()
-    local w, h = term.getSize()
-    tClear()
-    tLine(1, "fields: " .. entityTitle(item.entity), colors.yellow)
-    tLine(2, string.rep("-", w), colors.gray)
+  setupDraw = function(scr)
+    local w, h = scr.size()
+    scr.row(1, "fields: " .. entityTitle(item.entity), colors.yellow)
+    scr.row(2, string.rep("-", w), colors.gray)
     local list = rows()
     if selIdx > #list then selIdx = math.max(1, #list) end
     local listH = h - 6
@@ -1213,23 +1249,18 @@ local function fieldsScreen(item)
       else
         line = ("[calc] %s = %s"):format(r.f.label or r.f.key, r.f.expr)
       end
-      term.setCursorPos(1, 2 + i)
-      term.clearLine()
       if idx == selIdx then
-        term.setTextColor(colors.black)
-        term.setBackgroundColor(colors.yellow)
-        term.write(line:sub(1, w))
-        term.setBackgroundColor(colors.black)
+        scr.row(2 + i, line, colors.black, colors.yellow)
       else
-        term.setTextColor(colors.white)
-        term.write(line:sub(1, w))
+        scr.row(2 + i, line, colors.white)
       end
     end
-    if #list == 0 then tLine(4, "no fields known yet - waiting for data...", colors.gray) end
-    tLine(h - 2, ("mode: %s"):format(item.fields and "custom selection" or "showing all (default)"), colors.lightGray)
-    tLine(h - 1, "space:toggle c:+calc x:delcalc r:reset", colors.lightGray)
-    tLine(h, "enter/b: back", colors.lightGray)
+    if #list == 0 then scr.row(4, "no fields known yet - waiting for data...", colors.gray) end
+    scr.row(h - 2, ("mode: %s"):format(item.fields and "custom selection" or "showing all (default)"), colors.lightGray)
+    scr.row(h - 1, "space:toggle c:+calc x:delcalc r:reset", colors.lightGray)
+    scr.row(h, "enter/b: back", colors.lightGray)
   end
+  local function drawTerm() setupRedraw() end
 
   local function drawMon()
     clearMonitor()
@@ -1343,12 +1374,11 @@ local function layoutScreen()
   ensurePanels()
   local sel, offset = 1, 0
 
-  local function draw()
-    local w, h = term.getSize()
-    tClear()
+  setupDraw = function(scr)
+    local w, h = scr.size()
     local W, H = mon.getSize()
-    tLine(1, ("cbus setup - layout (monitor %dx%d)"):format(W, H), colors.yellow)
-    tLine(2, string.rep("-", w), colors.gray)
+    scr.row(1, ("cbus setup - layout (monitor %dx%d)"):format(W, H), colors.yellow)
+    scr.row(2, string.rep("-", w), colors.gray)
     if sel > #cfg.layout then sel = math.max(1, #cfg.layout) end
     local listH = h - 5
     if sel - offset > listH then offset = sel - listH end
@@ -1359,24 +1389,19 @@ local function layoutScreen()
       if not item then break end
       local line = ("%-28s %d,%d %dx%d"):format(
         itemLabel(item):sub(1, 28), item.x, item.y, item.w, item.h)
-      term.setCursorPos(1, 2 + i)
-      term.clearLine()
       if idx == sel then
-        term.setTextColor(colors.black)
-        term.setBackgroundColor(colors.yellow)
-        term.write(line:sub(1, w))
-        term.setBackgroundColor(colors.black)
+        scr.row(2 + i, line, colors.black, colors.yellow)
       else
-        term.setTextColor(itemVisible(item) and colors.white or colors.gray)
-        term.write(line:sub(1, w))
+        scr.row(2 + i, line, itemVisible(item) and colors.white or colors.gray)
       end
     end
     -- kept short & split across 3 rows so it still fits a 39-col
     -- turtle terminal, not just the 51-col computer terminal
-    tLine(h - 2, "enter:move/resize  p:properties  x:delete", colors.lightGray)
-    tLine(h - 1, "t:title l:line k:button f:fields", colors.lightGray)
-    tLine(h, "g:auto-layout b:back q:save&exit", colors.lightGray)
+    scr.row(h - 2, "enter:move/resize  p:properties  x:delete", colors.lightGray)
+    scr.row(h - 1, "t:title l:line k:button f:fields", colors.lightGray)
+    scr.row(h, "g:auto-layout b:back q:save&exit", colors.lightGray)
   end
+  local function draw() setupRedraw() end
 
   local function preview(withSel)
     clearMonitor()
@@ -1559,27 +1584,6 @@ end
 --------------------------------------------------------------------
 -- display mode & interactive terminal management
 --------------------------------------------------------------------
-local subStatusBanner  = nil
-
--- The local terminal console only costs anything while it's actually being
--- looked at. Starts closed; any key opens it, [H] closes it again. The
--- monitor dashboard is unaffected either way - it keeps rendering on its
--- own schedule regardless of console state.
-local consoleOn = false
-
-local function setSubBanner(msg, isError)
-  subStatusBanner = { text = msg, error = isError or false, time = os.clock() }
-end
-
--- drawn once (not on a redraw loop) whenever the console is closed
-local function showIdleScreen()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-  term.setCursorPos(1, 1)
-  term.setTextColor(colors.gray)
-  term.write(("cbus subscriber: %s - press any key for console"):format(cfg.name))
-end
-
 local function runDisplay()
   ensurePanels()
   findBroker()
@@ -1597,8 +1601,8 @@ local function runDisplay()
     mon.write("no entities enabled - run: subscriber setup")
   end
 
-  local nextDraw, nextReg, nextSub, nextTermDraw =
-    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL, 0
+  local nextDraw, nextReg, nextSub =
+    0, os.clock() + REG_INTERVAL, os.clock() + SUB_INTERVAL
 
   -- The terminal is a static status console while the dashboard is
   -- running - it used to mirror the entity list live (toggle/alias
@@ -1606,51 +1610,36 @@ local function runDisplay()
   -- rednet_message, which meant term.clear() firing multiple times a
   -- second and the whole console visibly flashing. All that editing
   -- already lives in Setup ([S] below), so this just shows identity,
-  -- connection and a countdown, redrawn on its own ~1s cadence (see
-  -- nextTermDraw in tick()) instead of on every network event.
-  local function redrawSubscriberTerminal()
-    local w, h = term.getSize()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
+  -- connection and a countdown - redrawn on its own ~1s cadence via
+  -- redrawInterval below instead of on every network event, and
+  -- double-buffered (see src/lib/screen.lua) so that cadence itself
+  -- never shows as a visible flash. 20s of no key swaps to the
+  -- screensaver; any input swaps back.
+  local subScreen = Screen.new(term, { defaultView = "status", idleSeconds = 20 })
 
-    if subStatusBanner and (os.clock() - subStatusBanner.time > 5) then
-      subStatusBanner = nil
-    end
+  local function drawStatus(screen)
+    local w, h = screen.size()
+    local banner = screen.currentBanner()
 
-    term.setCursorPos(1, 1)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
     local headerText = (" cbus subscriber: %s (v:%s)"):format(cfg.name, updater.getShortVer(updater.currentVersion))
     local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
     local space = math.max(1, w - #headerText - #brokerText)
-    term.write(headerText .. string.rep(" ", space) .. brokerText)
+    screen.row(1, headerText .. string.rep(" ", space) .. brokerText, colors.white, colors.blue)
 
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.lightGray)
-    term.write("Dashboard is running on the monitor.")
+    screen.write(1, 3, "Dashboard is running on the monitor.", colors.lightGray)
 
-    term.setCursorPos(1, 5)
-    term.setTextColor(colors.gray)
     local updCd = updater.secondsUntilNextCheck()
-    term.write((("Update: %s - next check in %ds"):format(updater.status, updCd)):sub(1, w))
+    screen.write(1, 5, ("Update: %s - next check in %ds"):format(updater.status, updCd), colors.gray)
 
-    if subStatusBanner then
-      term.setCursorPos(1, h - 1)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(subStatusBanner.error and colors.red or colors.lime)
-      term.write((subStatusBanner.error and "[!] " or "[*] ") .. subStatusBanner.text)
+    if banner then
+      screen.row(h - 1, (banner.error and "[!] " or "[*] ") .. banner.text,
+        banner.error and colors.red or colors.lime)
     end
 
-    term.setCursorPos(1, h)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    local footerText = " [H]ide  [S] Setup   [R] Force Resync"
-    term.write((footerText .. string.rep(" ", math.max(0, w - #footerText))):sub(1, w))
+    screen.row(h, " [H]ide  [S] Setup   [R] Force Resync", colors.white, colors.blue)
   end
 
-  local function handleTerminalKey(ev)
+  local function statusOnKey(screen, ev)
     local key = ev[2]
 
     if key == keys.s then
@@ -1660,20 +1649,23 @@ local function runDisplay()
       -- take effect on the real dashboard instead of just the preview.
       clearMonitor()
       renderAll()
-      setSubBanner(ok and "Setup saved" or ("Setup error: " .. tostring(err)), not ok)
-      redrawSubscriberTerminal()
+      screen.banner(ok and "Setup saved" or ("Setup error: " .. tostring(err)), not ok)
 
     elseif key == keys.r then
       subscribe()
       requestRegistry()
-      setSubBanner("Forced re-subscribe & registry sync", false)
-      redrawSubscriberTerminal()
+      screen.banner("Forced re-subscribe & registry sync", false)
 
     elseif key == keys.h then
-      consoleOn = false
-      showIdleScreen()
+      screen.enterScreensaver()
     end
   end
+
+  subScreen.registerView("status", { draw = drawStatus, onKey = statusOnKey, redrawInterval = 1 })
+  subScreen.registerView("screensaver", Screen.logView({
+    header = ("cbus subscriber: %s - press any key for console"):format(cfg.name),
+  }))
+  subScreen.setScreensaver("screensaver")
 
   local function tick()
     -- Drives all update-check scheduling (routine checks, failure
@@ -1704,13 +1696,13 @@ local function runDisplay()
       subscribe()
       nextSub = t + SUB_INTERVAL
     end
-    if consoleOn and t >= nextTermDraw then
-      redrawSubscriberTerminal()
-      nextTermDraw = t + 1
-    end
+    -- Runs every iteration regardless of the monitor's own throttle above -
+    -- see broker.lua's identical comment on screen.tick().
+    subScreen.tick()
   end
 
-  showIdleScreen()
+  subScreen.show("status")
+  subScreen.enterScreensaver()
 
   while true do
     os.startTimer(0.5)
@@ -1719,18 +1711,11 @@ local function runDisplay()
     if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
       local ok, newFound = pcall(handleNet, ev[3], ev[2])
       if ok and newFound then
-        setSubBanner("New entity discovered (disabled by default - enable it in Setup)", false)
-        if consoleOn then redrawSubscriberTerminal() end
+        subScreen.banner("New entity discovered (disabled by default - enable it in Setup)", false)
       end
 
     elseif ev[1] == "key" then
-      if not consoleOn then
-        consoleOn = true
-        redrawSubscriberTerminal()
-        nextTermDraw = os.clock() + 1
-      else
-        handleTerminalKey(ev)
-      end
+      subScreen.handleEvent(ev)
 
     elseif ev[1] == "monitor_touch" then
       local tx, ty = ev[3], ev[4]

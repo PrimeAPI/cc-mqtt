@@ -27,24 +27,24 @@ local entities      = {}  -- entName -> { id, kind, topics, actions, lastSeen, o
 local state         = {}  -- entName -> { propKey -> propVal }
 local auditLog      = {}  -- list of { time, ruleId, ruleName, entity, action, args, status }
 local rules         = {}  -- list of rule tables
-local viewMode      = "RULES" -- "RULES", "INSPECT", "ENTITIES", "WIZARD"
 local selectedIndex = 1
-local statusBanner  = nil
 local pendingDelete = false
-
--- The local terminal console only costs anything while it's actually being
--- looked at, and nobody stands at every controller computer all day. Starts
--- closed; any key/char opens it, [H] closes it again. Rule evaluation and
--- telemetry handling are unaffected either way.
-local consoleOn = false
 
 -- Wizard state for creating/editing rules
 local wizardData    = nil
+
+-- Forward-declared: loadConfig() (below) already wants to log a banner
+-- into this, but it's only actually created down in the "terminal
+-- interactive TUI" section. Same reasoning as provider.lua's identical
+-- forward decl - a local assigned later is still the same upvalue every
+-- closure defined in between sees.
+local termScreen
 
 --------------------------------------------------------------------
 -- auto updater
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
+--[[@include lib/screen.lua as Screen]]
 
 local updater = Updater.new({ scriptName = "controller.lua" })
 
@@ -61,10 +61,6 @@ end
 --------------------------------------------------------------------
 local function now() return os.clock() end
 
-local function setBanner(msg, isError)
-  statusBanner = { text = msg, error = isError or false, time = now() }
-end
-
 local function addAudit(ruleId, ruleName, entity, action, args, status)
   local t = os.date("%H:%M:%S")
   table.insert(auditLog, 1, {
@@ -79,6 +75,8 @@ local function addAudit(ruleId, ruleName, entity, action, args, status)
   while #auditLog > MAX_AUDIT do
     table.remove(auditLog)
   end
+  termScreen.log(("%s: %s -> %s(%s) [%s]"):format(
+    ruleName or ruleId, entity, action, tostring(args or ""), status or "OK"), status ~= nil and status ~= "OK")
 end
 
 local function formatNum(n)
@@ -121,7 +119,7 @@ local function loadConfig()
   -- Clean startup with empty rules table on fresh boot
   rules = {}
   saveConfig()
-  setBanner("No automation rules configured. Press [N] to create a rule.", false)
+  termScreen.banner("No automation rules configured. Press [N] to create a rule.", false)
 end
 
 --------------------------------------------------------------------
@@ -510,27 +508,15 @@ end
 --------------------------------------------------------------------
 -- monitor renderer
 --------------------------------------------------------------------
-local function redrawMonitor()
-  if not mon then return end
-  local w, h = mon.getSize()
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
+local function drawMonitor(screen)
+  local w, h = screen.size()
 
-  -- Top Title Bar
-  mon.setCursorPos(1, 1)
-  mon.setBackgroundColor(colors.blue)
-  mon.setTextColor(colors.white)
   local title = (" cbus automation controller #%d"):format(os.getComputerID())
   local statusStr = broker and (" [ONLINE] rules:%d "):format(#rules) or " [OFFLINE] "
   local pad = math.max(0, w - #title - #statusStr)
-  mon.write(title .. string.rep(" ", pad) .. statusStr)
+  screen.row(1, title .. string.rep(" ", pad) .. statusStr, colors.white, colors.blue)
 
-  -- Rules Section Header
-  mon.setCursorPos(1, 2)
-  mon.setBackgroundColor(colors.gray)
-  mon.setTextColor(colors.yellow)
-  mon.write(" AUTOMATION RULES & TRIGGERS")
-  if w > 28 then mon.write(string.rep(" ", w - 28)) end
+  screen.row(2, " AUTOMATION RULES & TRIGGERS", colors.yellow, colors.gray)
 
   local y = 3
   local maxRuleRows = math.floor((h - 8) / 2)
@@ -540,92 +526,71 @@ local function redrawMonitor()
     if y + 1 >= h - 4 then break end
     if i > maxRuleRows then break end
 
-    mon.setCursorPos(1, y)
-    mon.setBackgroundColor(colors.black)
-
     local st = r._status or (r.enabled and "OK" or "OFF")
-    if st == "TRIG" then
-      mon.setTextColor(colors.orange)
-      mon.write("[TRIG] ")
-    elseif st == "ACTIVE" then
-      mon.setTextColor(colors.cyan)
-      mon.write("[ACT]  ")
-    elseif st == "ERR" then
-      mon.setTextColor(colors.red)
-      mon.write("[ERR]  ")
-    elseif st == "STALE" then
-      mon.setTextColor(colors.magenta)
-      mon.write("[STALE]")
-    elseif st == "OFF" then
-      mon.setTextColor(colors.gray)
-      mon.write("[OFF]  ")
-    else
-      mon.setTextColor(colors.lime)
-      mon.write("[OK]   ")
-    end
+    local stTag, stColor
+    if st == "TRIG" then stTag, stColor = "[TRIG] ", colors.orange
+    elseif st == "ACTIVE" then stTag, stColor = "[ACT]  ", colors.cyan
+    elseif st == "ERR" then stTag, stColor = "[ERR]  ", colors.red
+    elseif st == "STALE" then stTag, stColor = "[STALE]", colors.magenta
+    elseif st == "OFF" then stTag, stColor = "[OFF]  ", colors.gray
+    else stTag, stColor = "[OK]   ", colors.lime end
+    screen.write(1, y, stTag, stColor)
 
-    mon.setTextColor(colors.white)
     local ruleName = r.name or r.id
     if #ruleName > w - 12 then ruleName = ruleName:sub(1, w - 15) .. "..." end
-    mon.write(ruleName)
+    screen.write(1 + #stTag, y, ruleName, colors.white)
 
-    mon.setTextColor(colors.gray)
     local cntStr = (" (x%d)"):format(r._execCount or 0)
-    mon.write(cntStr)
+    screen.write(1 + #stTag + #ruleName, y, cntStr, colors.gray)
 
     y = y + 1
-    mon.setCursorPos(8, y)
-    mon.setTextColor(colors.lightGray)
     local nextStr = " | Next: " .. ruleNextRunLabel(r)
     local avail = w - 8
     local condStr = "Cond: " .. (r.condition or "")
     if #condStr + #nextStr > avail then
       condStr = condStr:sub(1, math.max(0, avail - #nextStr - 3)) .. "..."
     end
-    mon.write(condStr)
-    mon.setTextColor(colors.yellow)
-    mon.write(nextStr)
+    screen.write(8, y, condStr, colors.lightGray)
+    screen.write(8 + #condStr, y, nextStr, colors.yellow)
 
     y = y + 1
   end
 
   if #rules == 0 then
-    mon.setCursorPos(1, 4)
-    mon.setTextColor(colors.gray)
-    mon.write("No automation rules configured.")
-    mon.setCursorPos(1, 5)
-    mon.setTextColor(colors.yellow)
-    mon.write("Press [N] on terminal to add a rule.")
+    screen.write(1, 4, "No automation rules configured.", colors.gray)
+    screen.write(1, 5, "Press [N] on terminal to add a rule.", colors.yellow)
   end
 
   if y < h - 4 then
-    mon.setCursorPos(1, h - 5)
-    mon.setBackgroundColor(colors.gray)
-    mon.setTextColor(colors.yellow)
-    mon.write(" RECENT AUTOMATION AUDIT LOG")
-    if w > 28 then mon.write(string.rep(" ", w - 28)) end
+    screen.row(h - 5, " RECENT AUTOMATION AUDIT LOG", colors.yellow, colors.gray)
 
     local logY = h - 4
     for i = 1, 4 do
       if logY >= h then break end
-      mon.setCursorPos(1, logY)
-      mon.setBackgroundColor(colors.black)
-
       local entry = auditLog[i]
       if entry then
-        mon.setTextColor(colors.gray)
-        mon.write("[" .. entry.time .. "] ")
-        mon.setTextColor(entry.status == "OK" and colors.lime or colors.red)
-        mon.write(entry.entity .. "->" .. entry.action)
-        mon.setTextColor(colors.lightGray)
+        local stamp = "[" .. entry.time .. "] "
+        screen.write(1, logY, stamp, colors.gray)
+        local entAct = entry.entity .. "->" .. entry.action
+        screen.write(1 + #stamp, logY, entAct, entry.status == "OK" and colors.lime or colors.red)
         local argStr = entry.args ~= nil and ("(" .. formatNum(entry.args) .. ")") or "()"
         if #entry.time + #entry.entity + #entry.action + #argStr + 4 <= w then
-          mon.write(argStr)
+          screen.write(1 + #stamp + #entAct, logY, argStr, colors.lightGray)
         end
       end
       logY = logY + 1
     end
   end
+end
+
+-- Double-buffered like the terminal console below (see src/lib/screen.lua)
+-- - no screensaver/idle view, since a monitor is a passive display someone
+-- in the world might be looking at any time.
+local monScreen = mon and Screen.new(mon, {})
+if monScreen then
+  monScreen.registerView("main", { draw = drawMonitor })
+  monScreen.show("main")
+  monScreen.tick()
 end
 
 --------------------------------------------------------------------
@@ -758,7 +723,7 @@ local function wizardPhaseTitle(w)
 end
 
 local function startWizard(existingRuleIndex)
-  viewMode = "WIZARD"
+  termScreen.show("wizard")
   if existingRuleIndex and rules[existingRuleIndex] then
     local r = rules[existingRuleIndex]
 
@@ -833,16 +798,16 @@ local function finishWizard()
 
   if wizardData.editingIndex then
     rules[wizardData.editingIndex] = ruleObj
-    setBanner("Updated rule: " .. ruleObj.name, false)
+    termScreen.banner("Updated rule: " .. ruleObj.name, false)
   else
     table.insert(rules, ruleObj)
     selectedIndex = #rules
-    setBanner("Created new rule: " .. ruleObj.name, false)
+    termScreen.banner("Created new rule: " .. ruleObj.name, false)
   end
 
   saveConfig()
   wizardData = nil
-  viewMode = "RULES"
+  termScreen.show("rules")
 end
 
 --------------------------------------------------------------------
@@ -863,7 +828,7 @@ local WIZARD_LIST_PHASES = {
 -- of silently cutting off past whatever fits on screen.
 -- formatFn(item) -> label, sublabel (sublabel may be nil)
 -- Returns the row just below whatever was drawn.
-local function drawWizardOptionList(startY, maxY, items, formatFn, customLabel)
+local function drawWizardOptionList(screen, startY, maxY, items, formatFn, customLabel)
   local total = #items + 1 -- +1 for the trailing custom entry
   local capacity = math.max(1, maxY - startY)
   local maxScroll = math.max(0, total - capacity)
@@ -872,35 +837,28 @@ local function drawWizardOptionList(startY, maxY, items, formatFn, customLabel)
 
   local y = startY
   if scroll > 0 then
-    term.setCursorPos(1, y)
-    term.setTextColor(colors.gray)
-    term.write(("-- %d more above (Up arrow) --"):format(scroll))
+    screen.write(1, y, ("-- %d more above (Up arrow) --"):format(scroll), colors.gray)
     y = y + 1
   end
 
   local idx = scroll + 1
   while y < maxY and idx <= total do
-    term.setCursorPos(1, y)
     if idx <= #items then
-      term.setTextColor(colors.lime)
       local label, sub = formatFn(items[idx])
-      term.write((" [%d] %s"):format(idx, label))
+      local prefix = (" [%d] %s"):format(idx, label)
+      screen.write(1, y, prefix, colors.lime)
       if sub then
-        term.setTextColor(colors.gray)
-        term.write(" " .. sub)
+        screen.write(1 + #prefix, y, " " .. sub, colors.gray)
       end
     else
-      term.setTextColor(colors.yellow)
-      term.write((" [%d] %s"):format(idx, customLabel))
+      screen.write(1, y, (" [%d] %s"):format(idx, customLabel), colors.yellow)
     end
     y = y + 1
     idx = idx + 1
   end
 
   if idx <= total then
-    term.setCursorPos(1, y)
-    term.setTextColor(colors.gray)
-    term.write(("-- %d more below (Down arrow) --"):format(total - idx + 1))
+    screen.write(1, y, ("-- %d more below (Down arrow) --"):format(total - idx + 1), colors.gray)
     y = y + 1
   end
 
@@ -908,565 +866,378 @@ local function drawWizardOptionList(startY, maxY, items, formatFn, customLabel)
 end
 
 -- drawn once (not on a redraw loop) whenever the console is closed
-local function showIdleScreen()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-  term.setCursorPos(1, 1)
-  term.setTextColor(colors.gray)
-  term.write(("cbus controller #%d - press any key for console"):format(os.getComputerID()))
-end
-
-local function redrawTerminal()
-  local w, h = term.getSize()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-
-  if statusBanner and (now() - statusBanner.time > 5) then
-    statusBanner = nil
-  end
-
-  -- Header Bar
-  term.setCursorPos(1, 1)
-  term.setBackgroundColor(colors.blue)
-  term.setTextColor(colors.white)
+-- Shared by all four views below: identical header/subheader content
+-- (only the mode label differs) and identical banner/footer placement
+-- (only the footer text differs), so each draw() calls these instead of
+-- repeating the same six lines four times over.
+local function drawHeader(screen, w, modeLabel)
   local headText = (" cbus controller #%d (v:%s)"):format(os.getComputerID(), updater.getShortVer(updater.currentVersion))
   local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
   local space = math.max(1, w - #headText - #brokerText)
-  term.write(headText .. string.rep(" ", space) .. brokerText)
-
-  -- Subheader Bar
-  term.setCursorPos(1, 2)
-  term.setBackgroundColor(colors.gray)
-  term.setTextColor(colors.white)
-  local subText = (" Mode: %s | Rules: %d | Audit: %d | Upd: %s"):format(viewMode, #rules, #auditLog, updater.status)
-  term.write((subText .. string.rep(" ", math.max(0, w - #subText))):sub(1, w))
-
-  if viewMode == "RULES" then
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    local rulesHeader = " ST  RULE NAME                     EXEC  MODE       NEXT"
-    term.write(rulesHeader)
-    if w > #rulesHeader then term.write(string.rep(" ", w - #rulesHeader)) end
-
-    local listH = h - 4
-    if statusBanner then listH = listH - 1 end
-
-    for i = 1, listH do
-      local rowY = 3 + i
-      if i > #rules then break end
-      local r = rules[i]
-
-      term.setCursorPos(1, rowY)
-      if i == selectedIndex then
-        term.setBackgroundColor(colors.gray)
-      else
-        term.setBackgroundColor(colors.black)
-      end
-
-      local selChar = (i == selectedIndex) and ">" or " "
-      term.setTextColor(colors.white)
-      term.write(selChar)
-
-      local st = r._status or (r.enabled and "OK" or "OFF")
-      if st == "TRIG" then term.setTextColor(colors.orange)
-      elseif st == "ACTIVE" then term.setTextColor(colors.cyan)
-      elseif st == "ERR" then term.setTextColor(colors.red)
-      elseif st == "STALE" then term.setTextColor(colors.magenta)
-      elseif st == "OFF" then term.setTextColor(colors.gray)
-      else term.setTextColor(colors.lime) end
-
-      term.write(r.enabled and "[ON] " or "[OFF]")
-
-      term.setTextColor(colors.white)
-      local rName = (r.name or r.id) .. string.rep(" ", 28)
-      term.write(rName:sub(1, 26) .. " ")
-
-      term.setTextColor(colors.yellow)
-      local cntStr = string.format("%4d ", r._execCount or 0)
-      term.write(cntStr)
-
-      term.setTextColor(colors.lightGray)
-      local modeStr = (r.mode or "edge"):sub(1, 10)
-      term.write(modeStr .. string.rep(" ", 11 - #modeStr))
-
-      term.setTextColor(colors.white)
-      term.write(ruleNextRunLabel(r))
-
-      local cx, _ = term.getCursorPos()
-      if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
-    end
-
-    if #rules == 0 then
-      term.setCursorPos(2, 5)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No automation rules configured.")
-      term.setCursorPos(2, 6)
-      term.setTextColor(colors.yellow)
-      term.write("Press [N] to create a new rule with live entities!")
-    end
-
-  elseif viewMode == "WIZARD" and wizardData then
-    wizardData.inputBuffer = wizardData.inputBuffer or "" -- guard against a nil buffer crashing every "_" concat below
-
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.yellow)
-    local stepTitle = (" INTERACTIVE RULE CREATOR - " .. wizardPhaseTitle(wizardData) .. " "):upper()
-    term.write(stepTitle .. string.rep(" ", math.max(0, w - #stepTitle)))
-
-    term.setBackgroundColor(colors.black)
-
-    if wizardData.phase == "title" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Rule Title / Friendly Name")
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.gray)
-      term.write("e.g. 'Main Reactor Safety Scram'")
-
-      term.setCursorPos(1, 9)
-      term.setTextColor(colors.yellow)
-      term.write("Title: ")
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "cond_entity" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.white)
-      term.write("Select Trigger Entity:")
-
-      local disco = getDiscoveredEntitiesList()
-      local promptY = h - 2
-      local _, total = drawWizardOptionList(7, promptY - 1, disco, function(ent)
-        local k = entities[ent] and entities[ent].kind or "entity"
-        return ent, "(" .. k .. ")"
-      end, "Type Custom Entity...")
-
-      term.setCursorPos(1, promptY)
-      term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(total))
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "cond_prop" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.white)
-      term.write("Select Telemetry Field for " .. wizardData.curCond.ent .. ":")
-
-      local props = getDiscoveredPropertiesFor(wizardData.curCond.ent)
-      local promptY = h - 2
-      local startY = 7
-      if #props == 0 then
-        term.setCursorPos(1, startY)
-        term.setTextColor(colors.gray)
-        term.write("(no telemetry reported yet - type the field name manually)")
-        startY = startY + 1
-      end
-      local _, total = drawWizardOptionList(startY, promptY - 1, props, function(p)
-        return p.name, "(live: " .. formatNum(p.val) .. ")"
-      end, "Type Custom Expression...")
-
-      term.setCursorPos(1, promptY)
-      term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(total))
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "cond_op" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.white)
-      term.write("Select Comparison Operator:")
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.lime)
-      term.write("[1] >  (Greater than)   [2] <  (Less than)")
-      term.setCursorPos(1, 8)
-      term.setTextColor(colors.lime)
-      term.write("[3] >= (Greater/Equal)  [4] <= (Less/Equal)")
-      term.setCursorPos(1, 9)
-      term.setTextColor(colors.lime)
-      term.write("[5] == (Equal to)       [6] != (Not Equal)")
-
-      term.setCursorPos(1, 11)
-      term.setTextColor(colors.yellow)
-      term.write(("For %s.%s, e.g. >20, ==true, ==RUNNING:"):format(wizardData.curCond.ent, wizardData.curCond.prop))
-      term.setCursorPos(1, 12)
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "cond_more" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Condition so far:")
-      term.setCursorPos(1, 6)
-      term.setTextColor(colors.white)
-      local condPreview = buildConditionString(wizardData.conditions, wizardData.joiners)
-      term.write((condPreview ~= "" and condPreview or "(none)"):sub(1, w))
-
-      term.setCursorPos(1, 8)
-      term.setTextColor(colors.lime)
-      term.write("[1] No  - Continue to Execution Mode")
-      term.setCursorPos(1, 9)
-      term.setTextColor(colors.lime)
-      term.write("[2] Yes - AND another condition (all must be true)")
-      term.setCursorPos(1, 10)
-      term.setTextColor(colors.lime)
-      term.write("[3] Yes - OR another condition (either can be true)")
-
-      term.setCursorPos(1, 12)
-      term.setTextColor(colors.yellow)
-      term.write("Press 1, 2, or 3.")
-
-    elseif wizardData.phase == "mode" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.white)
-      term.write("Select Execution Mode:")
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.lime)
-      term.write("[1] edge       ")
-      term.setTextColor(colors.lightGray)
-      term.write("- Trigger once when condition turns true")
-
-      term.setCursorPos(1, 8)
-      term.setTextColor(colors.lime)
-      term.write("[2] continuous ")
-      term.setTextColor(colors.lightGray)
-      term.write("- Dynamic proportional scaling (e.g. fill * MFE)")
-
-      term.setCursorPos(1, 9)
-      term.setTextColor(colors.lime)
-      term.write("[3] state      ")
-      term.setTextColor(colors.lightGray)
-      term.write("- State transitions (then on true, else on false)")
-
-      term.setCursorPos(1, 11)
-      term.setTextColor(colors.yellow)
-      term.write("Condition: ")
-      term.setTextColor(colors.cyan)
-      term.write(buildConditionString(wizardData.conditions, wizardData.joiners):sub(1, w - 11))
-
-    elseif wizardData.phase == "action_entity" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write(("Action %d: "):format(#wizardData.actions + 1))
-      term.setTextColor(colors.white)
-      term.write("Select Action Target Entity:")
-
-      local disco = getDiscoveredEntitiesList()
-      local promptY = h - 2
-      local _, total = drawWizardOptionList(7, promptY - 1, disco, function(ent)
-        return ent, nil
-      end, "Type Custom Entity...")
-
-      term.setCursorPos(1, promptY)
-      term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(total))
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "action_name" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write(("Action %d: "):format(#wizardData.actions + 1))
-      term.setTextColor(colors.white)
-      term.write("Select Method for " .. wizardData.curAction.entity .. ":")
-
-      local acts = getDiscoveredActionsFor(wizardData.curAction.entity)
-      local promptY = h - 2
-      local startY = 7
-      if #acts == 0 then
-        term.setCursorPos(1, startY)
-        term.setTextColor(colors.gray)
-        term.write("(no actions reported yet - type the action name manually)")
-        startY = startY + 1
-      end
-      local _, total = drawWizardOptionList(startY, promptY - 1, acts, function(act)
-        return act, nil
-      end, "Type Custom Action...")
-
-      term.setCursorPos(1, promptY)
-      term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(total))
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "action_args" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write(("Action %d: "):format(#wizardData.actions + 1))
-      term.setTextColor(colors.white)
-      term.write("Arguments (math/units/string):")
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.gray)
-      term.write("e.g. 'fillPercent * 100MFE/t' or '5MFE/t' or leave blank")
-
-      term.setCursorPos(1, 9)
-      term.setTextColor(colors.yellow)
-      term.write("Args: ")
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "action_more" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Actions so far (all fire together when triggered):")
-
-      local y = 6
-      for i, a in ipairs(wizardData.actions) do
-        if y >= 9 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.white)
-        term.write((" %d. %s"):format(i, actionToString(a)):sub(1, w))
-        y = y + 1
-      end
-
-      term.setCursorPos(1, 10)
-      term.setTextColor(colors.lime)
-      term.write("[1] No  - Continue")
-      term.setCursorPos(1, 11)
-      term.setTextColor(colors.lime)
-      term.write("[2] Yes - Add another action to fire at the same time")
-
-      term.setCursorPos(1, 13)
-      term.setTextColor(colors.yellow)
-      term.write("Press 1 or 2.")
-
-    elseif wizardData.phase == "else_prompt" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.white)
-      term.write("Configure Else Actions (when condition is false)?")
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.lime)
-      term.write("[1] No  - Finish and save rule")
-
-      term.setCursorPos(1, 8)
-      term.setTextColor(colors.lime)
-      term.write("[2] Yes - Add Else Action")
-
-      term.setCursorPos(1, 10)
-      term.setTextColor(colors.yellow)
-      term.write("Press 1 or 2.")
-
-    elseif wizardData.phase == "else_entity" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write(("Else Action %d: "):format(#wizardData.elseActionsList + 1))
-      term.setTextColor(colors.white)
-      term.write("Target Entity:")
-
-      local disco = getDiscoveredEntitiesList()
-      local promptY = h - 2
-      local _, total = drawWizardOptionList(7, promptY - 1, disco, function(ent)
-        return ent, nil
-      end, "Type Custom Entity...")
-
-      term.setCursorPos(1, promptY)
-      term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(total))
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "else_name" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write(("Else Action %d: "):format(#wizardData.elseActionsList + 1))
-      term.setTextColor(colors.white)
-      term.write("Method for " .. wizardData.curElseAction.entity .. ":")
-
-      local acts = getDiscoveredActionsFor(wizardData.curElseAction.entity)
-      local promptY = h - 2
-      local startY = 7
-      if #acts == 0 then
-        term.setCursorPos(1, startY)
-        term.setTextColor(colors.gray)
-        term.write("(no actions reported yet - type the action name manually)")
-        startY = startY + 1
-      end
-      local _, total = drawWizardOptionList(startY, promptY - 1, acts, function(act)
-        return act, nil
-      end, "Type Custom Action...")
-
-      term.setCursorPos(1, promptY)
-      term.setTextColor(colors.yellow)
-      term.write(("Select [1-%d] or Type: "):format(total))
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "else_args" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write(("Else Action %d: "):format(#wizardData.elseActionsList + 1))
-      term.setTextColor(colors.white)
-      term.write("Arguments:")
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.gray)
-      term.write("e.g. '0' or '500kFE/t' or leave blank")
-
-      term.setCursorPos(1, 9)
-      term.setTextColor(colors.yellow)
-      term.write("Else Args: ")
-      term.setTextColor(colors.white)
-      term.write(wizardData.inputBuffer .. "_")
-
-    elseif wizardData.phase == "else_more" then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Else actions so far (all fire together):")
-
-      local y = 6
-      for i, a in ipairs(wizardData.elseActionsList) do
-        if y >= 9 then break end
-        term.setCursorPos(1, y)
-        term.setTextColor(colors.white)
-        term.write((" %d. %s"):format(i, actionToString(a)):sub(1, w))
-        y = y + 1
-      end
-
-      term.setCursorPos(1, 10)
-      term.setTextColor(colors.lime)
-      term.write("[1] No  - Finish and save rule")
-      term.setCursorPos(1, 11)
-      term.setTextColor(colors.lime)
-      term.write("[2] Yes - Add another else action")
-
-      term.setCursorPos(1, 13)
-      term.setTextColor(colors.yellow)
-      term.write("Press 1 or 2.")
-    end
-
-  elseif viewMode == "INSPECT" then
-    local r = rules[selectedIndex]
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.yellow)
-    term.write("=== RULE DETAILS ===")
-
-    if r then
-      term.setCursorPos(1, 5)
-      term.setTextColor(colors.cyan)
-      term.write("Name      : ")
-      term.setTextColor(colors.white)
-      term.write(tostring(r.name or r.id))
-
-      term.setCursorPos(1, 6)
-      term.setTextColor(colors.cyan)
-      term.write("Enabled   : ")
-      term.setTextColor(r.enabled and colors.lime or colors.red)
-      term.write(tostring(r.enabled))
-
-      term.setCursorPos(1, 7)
-      term.setTextColor(colors.cyan)
-      term.write("Mode      : ")
-      term.setTextColor(colors.white)
-      term.write(tostring(r.mode or "edge"))
-
-      term.setCursorPos(1, 8)
-      term.setTextColor(colors.cyan)
-      term.write("Condition : ")
-      term.setTextColor(colors.yellow)
-      term.write(tostring(r.condition))
-
-      term.setCursorPos(1, 10)
-      term.setTextColor(colors.cyan)
-      term.write("Actions   : ")
-      term.setTextColor(colors.white)
-      if r.actions then
-        for idx, act in ipairs(r.actions) do
-          term.setCursorPos(13, 10 + idx - 1)
-          term.write(("%s -> %s(%s)"):format(act.entity, act.action, tostring(act.args or "")))
-        end
-      end
-
-      if r.elseActions and #r.elseActions > 0 then
-        term.setCursorPos(1, 12)
-        term.setTextColor(colors.cyan)
-        term.write("Else Actions:")
-        term.setTextColor(colors.white)
-        for idx, act in ipairs(r.elseActions) do
-          term.setCursorPos(13, 12 + idx - 1)
-          term.write(("%s -> %s(%s)"):format(act.entity, act.action, tostring(act.args or "")))
-        end
-      end
-
-      if r._lastErr then
-        term.setCursorPos(1, 15)
-        term.setTextColor(colors.red)
-        term.write("Last Error: " .. tostring(r._lastErr))
-      end
-    end
-
-  elseif viewMode == "ENTITIES" then
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(" MONITORED ENTITIES & STATE")
-    if w > 28 then term.write(string.rep(" ", w - 28)) end
-
-    local names = {}
-    for n in pairs(state) do names[#names + 1] = n end
-    table.sort(names)
-
-    local rowY = 4
-    for _, name in ipairs(names) do
-      if rowY >= h - 2 then break end
-      term.setCursorPos(1, rowY)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.lime)
-      term.write(" * ")
-      term.setTextColor(colors.white)
-      term.write(name .. ": ")
-
-      local sData = state[name] or {}
-      local summaryParts = {}
-      for k, v in pairs(sData) do
-        if k:sub(1, 1) ~= "_" and type(v) ~= "table" then
-          summaryParts[#summaryParts + 1] = k .. "=" .. formatNum(v)
-        end
-      end
-      term.setTextColor(colors.lightGray)
-      term.write(table.concat(summaryParts, ", "):sub(1, w - #name - 5))
-      rowY = rowY + 1
-    end
-
-    if #names == 0 then
-      term.setCursorPos(2, 5)
-      term.setTextColor(colors.gray)
-      term.write("No telemetry streams received yet.")
-    end
+  screen.row(1, headText .. string.rep(" ", space) .. brokerText, colors.white, colors.blue)
+
+  local subText = (" Mode: %s | Rules: %d | Audit: %d | Upd: %s"):format(modeLabel, #rules, #auditLog, updater.status)
+  screen.row(2, subText, colors.white, colors.gray)
+end
+
+local function drawFooter(screen, w, h, footerText)
+  local banner = screen.currentBanner()
+  if banner then
+    screen.row(h - 1, (banner.error and "[!] " or "[*] ") .. banner.text,
+      banner.error and colors.red or colors.lime)
   end
-
-  if statusBanner then
-    term.setCursorPos(1, h - 1)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(statusBanner.error and colors.red or colors.lime)
-    term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
-  end
-
-  -- Navigation Controls Footer
-  term.setCursorPos(1, h)
-  term.setBackgroundColor(colors.blue)
-  term.setTextColor(colors.white)
-
   -- these footers used to overflow a standard 51-col terminal (the wizard
   -- list-phase one was 54 chars, the main one 77 with [H]Hide tacked on
   -- the end), so the tail - including the console-hide hint - silently
-  -- clipped off-screen. Shortened to fit, and :sub(1,w) as a backstop.
-  if viewMode == "WIZARD" then
-    local ctrlStr = WIZARD_LIST_PHASES[wizardData and wizardData.phase]
-      and " [Up/Down]Scroll [Enter]Next [Tab]Cancel"
-      or " [Enter]Next Step [Tab]Cancel Wizard"
-    term.write((ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr))):sub(1, w))
-  else
-    local ctrlStr = " [H]ide [N]ew [E]dit [D]el [Spc]Tgl [T]est [Tab]Vw"
-    term.write((ctrlStr .. string.rep(" ", math.max(0, w - #ctrlStr))):sub(1, w))
+  -- clipped off-screen. screen.row() clips to width as a backstop either way.
+  screen.row(h, footerText, colors.white, colors.blue)
+end
+
+local function drawRules(screen)
+  local w, h = screen.size()
+  drawHeader(screen, w, "RULES")
+  local banner = screen.currentBanner()
+
+  local rulesHeader = " ST  RULE NAME                     EXEC  MODE       NEXT"
+  screen.row(3, rulesHeader, colors.yellow, colors.gray)
+
+  local listH = h - 4
+  if banner then listH = listH - 1 end
+
+  for i = 1, listH do
+    local rowY = 3 + i
+    if i > #rules then break end
+    local r = rules[i]
+    local rowBg = (i == selectedIndex) and colors.gray or colors.black
+
+    local selChar = (i == selectedIndex) and ">" or " "
+    screen.write(1, rowY, selChar, colors.white, rowBg)
+
+    local st = r._status or (r.enabled and "OK" or "OFF")
+    local stColor
+    if st == "TRIG" then stColor = colors.orange
+    elseif st == "ACTIVE" then stColor = colors.cyan
+    elseif st == "ERR" then stColor = colors.red
+    elseif st == "STALE" then stColor = colors.magenta
+    elseif st == "OFF" then stColor = colors.gray
+    else stColor = colors.lime end
+    screen.write(2, rowY, r.enabled and "[ON] " or "[OFF]", stColor, rowBg)
+
+    local rName = ((r.name or r.id) .. string.rep(" ", 28)):sub(1, 26) .. " "
+    screen.write(7, rowY, rName, colors.white, rowBg)
+
+    local cntStr = string.format("%4d ", r._execCount or 0)
+    screen.write(34, rowY, cntStr, colors.yellow, rowBg)
+
+    local modeStr = (r.mode or "edge"):sub(1, 10)
+    screen.write(39, rowY, modeStr .. string.rep(" ", 11 - #modeStr), colors.lightGray, rowBg)
+
+    local nextLabel = ruleNextRunLabel(r)
+    screen.write(50, rowY, nextLabel, colors.white, rowBg)
+
+    local usedTo = 50 + #nextLabel - 1
+    if usedTo < w then screen.write(usedTo + 1, rowY, string.rep(" ", w - usedTo), colors.white, rowBg) end
   end
+
+  if #rules == 0 then
+    screen.write(2, 5, "No automation rules configured.", colors.gray)
+    screen.write(2, 6, "Press [N] to create a new rule with live entities!", colors.yellow)
+  end
+
+  drawFooter(screen, w, h, " [H]ide [N]ew [E]dit [D]el [Spc]Tgl [T]est [Tab]Vw")
+end
+
+local function drawWizard(screen)
+  local w, h = screen.size()
+  if not wizardData then return end
+  wizardData.inputBuffer = wizardData.inputBuffer or "" -- guard against a nil buffer crashing every "_" concat below
+
+  drawHeader(screen, w, "WIZARD")
+
+  local stepTitle = (" INTERACTIVE RULE CREATOR - " .. wizardPhaseTitle(wizardData) .. " "):upper()
+  screen.row(3, stepTitle, colors.yellow, colors.blue)
+
+  if wizardData.phase == "title" then
+    screen.write(1, 5, "Rule Title / Friendly Name", colors.cyan)
+    screen.write(1, 7, "e.g. 'Main Reactor Safety Scram'", colors.gray)
+    screen.write(1, 9, "Title: ", colors.yellow)
+    screen.write(8, 9, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "cond_entity" then
+    screen.write(1, 5, "Select Trigger Entity:", colors.white)
+
+    local disco = getDiscoveredEntitiesList()
+    local promptY = h - 2
+    local _, total = drawWizardOptionList(screen, 7, promptY - 1, disco, function(ent)
+      local k = entities[ent] and entities[ent].kind or "entity"
+      return ent, "(" .. k .. ")"
+    end, "Type Custom Entity...")
+
+    local prompt = ("Select [1-%d] or Type: "):format(total)
+    screen.write(1, promptY, prompt, colors.yellow)
+    screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "cond_prop" then
+    screen.write(1, 5, "Select Telemetry Field for " .. wizardData.curCond.ent .. ":", colors.white)
+
+    local props = getDiscoveredPropertiesFor(wizardData.curCond.ent)
+    local promptY = h - 2
+    local startY = 7
+    if #props == 0 then
+      screen.write(1, startY, "(no telemetry reported yet - type the field name manually)", colors.gray)
+      startY = startY + 1
+    end
+    local _, total = drawWizardOptionList(screen, startY, promptY - 1, props, function(p)
+      return p.name, "(live: " .. formatNum(p.val) .. ")"
+    end, "Type Custom Expression...")
+
+    local prompt = ("Select [1-%d] or Type: "):format(total)
+    screen.write(1, promptY, prompt, colors.yellow)
+    screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "cond_op" then
+    screen.write(1, 5, "Select Comparison Operator:", colors.white)
+    screen.write(1, 7, "[1] >  (Greater than)   [2] <  (Less than)", colors.lime)
+    screen.write(1, 8, "[3] >= (Greater/Equal)  [4] <= (Less/Equal)", colors.lime)
+    screen.write(1, 9, "[5] == (Equal to)       [6] != (Not Equal)", colors.lime)
+
+    screen.write(1, 11, ("For %s.%s, e.g. >20, ==true, ==RUNNING:"):format(wizardData.curCond.ent, wizardData.curCond.prop), colors.yellow)
+    screen.write(1, 12, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "cond_more" then
+    screen.write(1, 5, "Condition so far:", colors.cyan)
+    local condPreview = buildConditionString(wizardData.conditions, wizardData.joiners)
+    screen.write(1, 6, (condPreview ~= "" and condPreview or "(none)"):sub(1, w), colors.white)
+
+    screen.write(1, 8, "[1] No  - Continue to Execution Mode", colors.lime)
+    screen.write(1, 9, "[2] Yes - AND another condition (all must be true)", colors.lime)
+    screen.write(1, 10, "[3] Yes - OR another condition (either can be true)", colors.lime)
+
+    screen.write(1, 12, "Press 1, 2, or 3.", colors.yellow)
+
+  elseif wizardData.phase == "mode" then
+    screen.write(1, 5, "Select Execution Mode:", colors.white)
+
+    screen.write(1, 7, "[1] edge       ", colors.lime)
+    screen.write(16, 7, "- Trigger once when condition turns true", colors.lightGray)
+
+    screen.write(1, 8, "[2] continuous ", colors.lime)
+    screen.write(16, 8, "- Dynamic proportional scaling (e.g. fill * MFE)", colors.lightGray)
+
+    screen.write(1, 9, "[3] state      ", colors.lime)
+    screen.write(16, 9, "- State transitions (then on true, else on false)", colors.lightGray)
+
+    screen.write(1, 11, "Condition: ", colors.yellow)
+    screen.write(12, 11, buildConditionString(wizardData.conditions, wizardData.joiners):sub(1, w - 11), colors.cyan)
+
+  elseif wizardData.phase == "action_entity" then
+    local prefix = ("Action %d: "):format(#wizardData.actions + 1)
+    screen.write(1, 5, prefix, colors.cyan)
+    screen.write(1 + #prefix, 5, "Select Action Target Entity:", colors.white)
+
+    local disco = getDiscoveredEntitiesList()
+    local promptY = h - 2
+    local _, total = drawWizardOptionList(screen, 7, promptY - 1, disco, function(ent)
+      return ent, nil
+    end, "Type Custom Entity...")
+
+    local prompt = ("Select [1-%d] or Type: "):format(total)
+    screen.write(1, promptY, prompt, colors.yellow)
+    screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "action_name" then
+    local prefix = ("Action %d: "):format(#wizardData.actions + 1)
+    screen.write(1, 5, prefix, colors.cyan)
+    screen.write(1 + #prefix, 5, "Select Method for " .. wizardData.curAction.entity .. ":", colors.white)
+
+    local acts = getDiscoveredActionsFor(wizardData.curAction.entity)
+    local promptY = h - 2
+    local startY = 7
+    if #acts == 0 then
+      screen.write(1, startY, "(no actions reported yet - type the action name manually)", colors.gray)
+      startY = startY + 1
+    end
+    local _, total = drawWizardOptionList(screen, startY, promptY - 1, acts, function(act)
+      return act, nil
+    end, "Type Custom Action...")
+
+    local prompt = ("Select [1-%d] or Type: "):format(total)
+    screen.write(1, promptY, prompt, colors.yellow)
+    screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "action_args" then
+    local prefix = ("Action %d: "):format(#wizardData.actions + 1)
+    screen.write(1, 5, prefix, colors.cyan)
+    screen.write(1 + #prefix, 5, "Arguments (math/units/string):", colors.white)
+
+    screen.write(1, 7, "e.g. 'fillPercent * 100MFE/t' or '5MFE/t' or leave blank", colors.gray)
+
+    screen.write(1, 9, "Args: ", colors.yellow)
+    screen.write(7, 9, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "action_more" then
+    screen.write(1, 5, "Actions so far (all fire together when triggered):", colors.cyan)
+
+    local y = 6
+    for i, a in ipairs(wizardData.actions) do
+      if y >= 9 then break end
+      screen.write(1, y, (" %d. %s"):format(i, actionToString(a)):sub(1, w), colors.white)
+      y = y + 1
+    end
+
+    screen.write(1, 10, "[1] No  - Continue", colors.lime)
+    screen.write(1, 11, "[2] Yes - Add another action to fire at the same time", colors.lime)
+
+    screen.write(1, 13, "Press 1 or 2.", colors.yellow)
+
+  elseif wizardData.phase == "else_prompt" then
+    screen.write(1, 5, "Configure Else Actions (when condition is false)?", colors.white)
+    screen.write(1, 7, "[1] No  - Finish and save rule", colors.lime)
+    screen.write(1, 8, "[2] Yes - Add Else Action", colors.lime)
+    screen.write(1, 10, "Press 1 or 2.", colors.yellow)
+
+  elseif wizardData.phase == "else_entity" then
+    local prefix = ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
+    screen.write(1, 5, prefix, colors.cyan)
+    screen.write(1 + #prefix, 5, "Target Entity:", colors.white)
+
+    local disco = getDiscoveredEntitiesList()
+    local promptY = h - 2
+    local _, total = drawWizardOptionList(screen, 7, promptY - 1, disco, function(ent)
+      return ent, nil
+    end, "Type Custom Entity...")
+
+    local prompt = ("Select [1-%d] or Type: "):format(total)
+    screen.write(1, promptY, prompt, colors.yellow)
+    screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "else_name" then
+    local prefix = ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
+    screen.write(1, 5, prefix, colors.cyan)
+    screen.write(1 + #prefix, 5, "Method for " .. wizardData.curElseAction.entity .. ":", colors.white)
+
+    local acts = getDiscoveredActionsFor(wizardData.curElseAction.entity)
+    local promptY = h - 2
+    local startY = 7
+    if #acts == 0 then
+      screen.write(1, startY, "(no actions reported yet - type the action name manually)", colors.gray)
+      startY = startY + 1
+    end
+    local _, total = drawWizardOptionList(screen, startY, promptY - 1, acts, function(act)
+      return act, nil
+    end, "Type Custom Action...")
+
+    local prompt = ("Select [1-%d] or Type: "):format(total)
+    screen.write(1, promptY, prompt, colors.yellow)
+    screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "else_args" then
+    local prefix = ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
+    screen.write(1, 5, prefix, colors.cyan)
+    screen.write(1 + #prefix, 5, "Arguments:", colors.white)
+
+    screen.write(1, 7, "e.g. '0' or '500kFE/t' or leave blank", colors.gray)
+
+    screen.write(1, 9, "Else Args: ", colors.yellow)
+    screen.write(12, 9, wizardData.inputBuffer .. "_", colors.white)
+
+  elseif wizardData.phase == "else_more" then
+    screen.write(1, 5, "Else actions so far (all fire together):", colors.cyan)
+
+    local y = 6
+    for i, a in ipairs(wizardData.elseActionsList) do
+      if y >= 9 then break end
+      screen.write(1, y, (" %d. %s"):format(i, actionToString(a)):sub(1, w), colors.white)
+      y = y + 1
+    end
+
+    screen.write(1, 10, "[1] No  - Finish and save rule", colors.lime)
+    screen.write(1, 11, "[2] Yes - Add another else action", colors.lime)
+
+    screen.write(1, 13, "Press 1 or 2.", colors.yellow)
+  end
+
+  local ctrlStr = WIZARD_LIST_PHASES[wizardData.phase]
+    and " [Up/Down]Scroll [Enter]Next [Tab]Cancel"
+    or " [Enter]Next Step [Tab]Cancel Wizard"
+  drawFooter(screen, w, h, ctrlStr)
+end
+
+local function drawInspect(screen)
+  local w, h = screen.size()
+  drawHeader(screen, w, "INSPECT")
+  local r = rules[selectedIndex]
+
+  screen.write(1, 3, "=== RULE DETAILS ===", colors.yellow)
+
+  if r then
+    screen.write(1, 5, "Name      : ", colors.cyan)
+    screen.write(13, 5, tostring(r.name or r.id), colors.white)
+
+    screen.write(1, 6, "Enabled   : ", colors.cyan)
+    screen.write(13, 6, tostring(r.enabled), r.enabled and colors.lime or colors.red)
+
+    screen.write(1, 7, "Mode      : ", colors.cyan)
+    screen.write(13, 7, tostring(r.mode or "edge"), colors.white)
+
+    screen.write(1, 8, "Condition : ", colors.cyan)
+    screen.write(13, 8, tostring(r.condition), colors.yellow)
+
+    screen.write(1, 10, "Actions   : ", colors.cyan)
+    if r.actions then
+      for idx, act in ipairs(r.actions) do
+        screen.write(13, 10 + idx - 1, ("%s -> %s(%s)"):format(act.entity, act.action, tostring(act.args or "")), colors.white)
+      end
+    end
+
+    if r.elseActions and #r.elseActions > 0 then
+      screen.write(1, 12, "Else Actions:", colors.cyan)
+      for idx, act in ipairs(r.elseActions) do
+        screen.write(13, 12 + idx - 1, ("%s -> %s(%s)"):format(act.entity, act.action, tostring(act.args or "")), colors.white)
+      end
+    end
+
+    if r._lastErr then
+      screen.write(1, 15, "Last Error: " .. tostring(r._lastErr), colors.red)
+    end
+  end
+
+  drawFooter(screen, w, h, " [H]ide [N]ew [E]dit [D]el [Spc]Tgl [T]est [Tab]Vw")
+end
+
+local function drawEntities(screen)
+  local w, h = screen.size()
+  drawHeader(screen, w, "ENTITIES")
+
+  screen.row(3, " MONITORED ENTITIES & STATE", colors.yellow, colors.gray)
+
+  local names = {}
+  for n in pairs(state) do names[#names + 1] = n end
+  table.sort(names)
+
+  local rowY = 4
+  for _, name in ipairs(names) do
+    if rowY >= h - 2 then break end
+    screen.write(1, rowY, " * ", colors.lime)
+    local label = name .. ": "
+    screen.write(4, rowY, label, colors.white)
+
+    local sData = state[name] or {}
+    local summaryParts = {}
+    for k, v in pairs(sData) do
+      if k:sub(1, 1) ~= "_" and type(v) ~= "table" then
+        summaryParts[#summaryParts + 1] = k .. "=" .. formatNum(v)
+      end
+    end
+    screen.write(4 + #label, rowY, table.concat(summaryParts, ", "):sub(1, w - #name - 5), colors.lightGray)
+    rowY = rowY + 1
+  end
+
+  if #names == 0 then
+    screen.write(2, 5, "No telemetry streams received yet.", colors.gray)
+  end
+
+  drawFooter(screen, w, h, " [H]ide [N]ew [E]dit [D]el [Spc]Tgl [T]est [Tab]Vw")
 end
 
 local function handleWizardInput(val)
@@ -1632,48 +1403,8 @@ local function handleWizardInput(val)
   end
 end
 
-local function handleTerminalKey(ev)
+local function rulesOnKey(screen, ev)
   local key = ev[2]
-
-  if viewMode == "WIZARD" then
-    -- Tab, not Escape: Minecraft eats Escape to close the terminal GUI
-    -- before it ever reaches CC:Tweaked as a "key" event, and letters
-    -- must stay typeable here for wizard text input, so no letter key
-    -- can double as "cancel". Safe to bind Tab here even though it's
-    -- also the RULES/ENTITIES view toggle below - this branch returns
-    -- before falling through to that check.
-    if key == keys.tab then
-      wizardData = nil
-      viewMode = "RULES"
-      setBanner("Cancelled rule wizard", false)
-      redrawTerminal()
-
-    elseif key == keys.backspace then
-      if wizardData and #wizardData.inputBuffer > 0 then
-        wizardData.inputBuffer = wizardData.inputBuffer:sub(1, -2)
-        redrawTerminal()
-      end
-
-    elseif key == keys.up then
-      if wizardData and WIZARD_LIST_PHASES[wizardData.phase] then
-        wizardData.listScroll = math.max(0, (wizardData.listScroll or 0) - 1)
-        redrawTerminal()
-      end
-
-    elseif key == keys.down then
-      if wizardData and WIZARD_LIST_PHASES[wizardData.phase] then
-        wizardData.listScroll = (wizardData.listScroll or 0) + 1 -- clamped on next draw
-        redrawTerminal()
-      end
-
-    elseif key == keys.enter then
-      if wizardData then
-        handleWizardInput(wizardData.inputBuffer)
-        redrawTerminal()
-      end
-    end
-    return
-  end
 
   if pendingDelete then
     if key == keys.y then
@@ -1681,107 +1412,154 @@ local function handleTerminalKey(ev)
       table.remove(rules, selectedIndex)
       if selectedIndex > #rules then selectedIndex = math.max(1, #rules) end
       saveConfig()
-      setBanner("Deleted rule: " .. rName, false)
+      screen.banner("Deleted rule: " .. rName, false)
       pendingDelete = false
-      redrawTerminal()
     else
       pendingDelete = false
-      setBanner("Cancelled delete", false)
-      redrawTerminal()
+      screen.banner("Cancelled delete", false)
     end
     return
   end
 
   if key == keys.tab then
-    if viewMode == "RULES" then viewMode = "ENTITIES"
-    elseif viewMode == "ENTITIES" then viewMode = "RULES"
-    else viewMode = "RULES" end
-    redrawTerminal()
+    screen.show("entities")
 
-  elseif viewMode == "RULES" then
-    if key == keys.up or key == keys.w then
-      selectedIndex = math.max(1, selectedIndex - 1)
-      redrawTerminal()
+  elseif key == keys.up or key == keys.w then
+    selectedIndex = math.max(1, selectedIndex - 1)
 
-    elseif key == keys.down or key == keys.s then
-      selectedIndex = math.min(#rules, selectedIndex + 1)
-      redrawTerminal()
+  elseif key == keys.down or key == keys.s then
+    selectedIndex = math.min(#rules, selectedIndex + 1)
 
-    elseif key == keys.n then
-      startWizard(nil)
-      redrawTerminal()
+  elseif key == keys.n then
+    startWizard(nil)
 
-    elseif key == keys.e or key == keys.enter then
-      if #rules > 0 and rules[selectedIndex] then
-        startWizard(selectedIndex)
-        redrawTerminal()
-      end
-
-    elseif key == keys.i then
-      if #rules > 0 and rules[selectedIndex] then
-        viewMode = "INSPECT"
-        redrawTerminal()
-      end
-
-    elseif key == keys.d or key == keys.delete then
-      if #rules > 0 and rules[selectedIndex] then
-        pendingDelete = true
-        setBanner("Delete rule '" .. rules[selectedIndex].name .. "'? Press [Y] to confirm", true)
-        redrawTerminal()
-      end
-
-    elseif key == keys.space then
-      local r = rules[selectedIndex]
-      if r then
-        r.enabled = not r.enabled
-        saveConfig()
-        setBanner(("Rule '%s' %s"):format(r.name or r.id, r.enabled and "ENABLED" or "DISABLED"), false)
-        redrawTerminal()
-      end
-
-    elseif key == keys.t then
-      local r = rules[selectedIndex]
-      if r then
-        r._lastRun = 0
-        r._lastState = nil
-        evaluateRule(r)
-        setBanner("Force triggered rule: " .. r.name, false)
-        redrawTerminal()
-        redrawMonitor()
-      end
-
-    elseif key == keys.r then
-      loadConfig()
-      setBanner("Reloaded automations.cfg", false)
-      redrawTerminal()
-
-    elseif key == keys.h then
-      consoleOn = false
-      showIdleScreen()
-    end
-
-  elseif viewMode == "INSPECT" then
-    if key == keys.e then
+  elseif key == keys.e or key == keys.enter then
+    if #rules > 0 and rules[selectedIndex] then
       startWizard(selectedIndex)
-      redrawTerminal()
-    -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
-    -- before it ever reaches CC:Tweaked as a "key" event
-    elseif key == keys.backspace or key == keys.b or key == keys.left then
-      viewMode = "RULES"
-      redrawTerminal()
+    end
+
+  elseif key == keys.i then
+    if #rules > 0 and rules[selectedIndex] then
+      screen.show("inspect")
+    end
+
+  elseif key == keys.d or key == keys.delete then
+    if #rules > 0 and rules[selectedIndex] then
+      pendingDelete = true
+      screen.banner("Delete rule '" .. rules[selectedIndex].name .. "'? Press [Y] to confirm", true)
+    end
+
+  elseif key == keys.space then
+    local r = rules[selectedIndex]
+    if r then
+      r.enabled = not r.enabled
+      saveConfig()
+      screen.banner(("Rule '%s' %s"):format(r.name or r.id, r.enabled and "ENABLED" or "DISABLED"), false)
+    end
+
+  elseif key == keys.t then
+    local r = rules[selectedIndex]
+    if r then
+      r._lastRun = 0
+      r._lastState = nil
+      evaluateRule(r)
+      screen.banner("Force triggered rule: " .. r.name, false)
+      if monScreen then monScreen.markDirty(); monScreen.tick() end
+    end
+
+  elseif key == keys.r then
+    loadConfig()
+    screen.banner("Reloaded automations.cfg", false)
+
+  elseif key == keys.h then
+    screen.enterScreensaver()
+  end
+end
+
+local function inspectOnKey(screen, ev)
+  local key = ev[2]
+  if key == keys.tab then
+    screen.show("rules")
+
+  elseif key == keys.e then
+    startWizard(selectedIndex)
+
+  -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
+  -- before it ever reaches CC:Tweaked as a "key" event
+  elseif key == keys.backspace or key == keys.b or key == keys.left then
+    screen.show("rules")
+  end
+end
+
+local function entitiesOnKey(screen, ev)
+  if ev[2] == keys.tab then
+    screen.show("rules")
+  end
+end
+
+local function wizardOnKey(screen, ev)
+  local key = ev[2]
+  -- Tab, not Escape: Minecraft eats Escape to close the terminal GUI
+  -- before it ever reaches CC:Tweaked as a "key" event, and letters must
+  -- stay typeable here for wizard text input, so no letter key can double
+  -- as "cancel".
+  if key == keys.tab then
+    wizardData = nil
+    screen.show("rules")
+    screen.banner("Cancelled rule wizard", false)
+
+  elseif key == keys.backspace then
+    if wizardData and #wizardData.inputBuffer > 0 then
+      wizardData.inputBuffer = wizardData.inputBuffer:sub(1, -2)
+    end
+
+  elseif key == keys.up then
+    if wizardData and WIZARD_LIST_PHASES[wizardData.phase] then
+      wizardData.listScroll = math.max(0, (wizardData.listScroll or 0) - 1)
+    end
+
+  elseif key == keys.down then
+    if wizardData and WIZARD_LIST_PHASES[wizardData.phase] then
+      wizardData.listScroll = (wizardData.listScroll or 0) + 1 -- clamped on next draw
+    end
+
+  elseif key == keys.enter then
+    if wizardData then
+      handleWizardInput(wizardData.inputBuffer)
     end
   end
 end
 
-local function handleTerminalChar(ev)
-  if viewMode == "WIZARD" and wizardData then
-    local ch = ev[2]
-    if ch and #ch == 1 then
-      wizardData.inputBuffer = wizardData.inputBuffer .. ch
-      redrawTerminal()
-    end
+local function wizardOnChar(screen, ev)
+  if not wizardData then return end
+  local ch = ev[2]
+  if ch and #ch == 1 then
+    wizardData.inputBuffer = wizardData.inputBuffer .. ch
   end
 end
+
+-- The local terminal console only costs anything while it's actually
+-- being looked at, and nobody stands at every controller computer all
+-- day - 20s of no key/char swaps to the screensaver below; any input
+-- swaps back. Starts in the screensaver too, matching every target's
+-- previous "closed until first key" behavior. Rule evaluation and
+-- telemetry handling are unaffected either way, and the monitor set up
+-- above keeps updating on its own schedule regardless.
+termScreen = Screen.new(term, { defaultView = "rules", idleSeconds = 20 })
+termScreen.registerView("rules", { draw = drawRules, onKey = rulesOnKey })
+termScreen.registerView("wizard", { draw = drawWizard, onKey = wizardOnKey, onChar = wizardOnChar })
+termScreen.registerView("inspect", { draw = drawInspect, onKey = inspectOnKey })
+termScreen.registerView("entities", { draw = drawEntities, onKey = entitiesOnKey })
+
+-- Screensaver: the passive view shown once idle, built from the activity
+-- log fed by termScreen.log()/termScreen.banner() calls elsewhere
+-- (addAudit, loadConfig, finishWizard). Deliberately no statusLine/
+-- countdown here - the whole point of a screensaver is to sit idle, so it
+-- only redraws when a new log entry actually arrives, not on a timer.
+termScreen.registerView("screensaver", Screen.logView({
+  header = ("cbus controller #%d - press any key for console"):format(os.getComputerID()),
+}))
+termScreen.setScreensaver("screensaver")
 
 --------------------------------------------------------------------
 -- broker communications
@@ -1793,7 +1571,7 @@ local function findBroker(silent)
     return true
   end
   if not silent then
-    setBanner("Looking for cbus broker...", true)
+    termScreen.banner("Looking for cbus broker...", true)
   end
   return false
 end
@@ -1851,8 +1629,8 @@ loadConfig()
 -- fires unconditionally, broker or no broker.
 safeUpdaterCall(updater.checkNow)
 
-redrawMonitor()
-showIdleScreen()
+termScreen.show("rules")
+termScreen.enterScreensaver()
 
 local nextEval   = now() + EVAL_TICK
 -- due immediately: the first main-loop iteration does the broker lookup +
@@ -1860,9 +1638,9 @@ local nextEval   = now() + EVAL_TICK
 -- a separate blocking pre-loop wait.
 local nextSync   = 0
 
--- Redraws are throttled separately from message handling, same reasoning
--- as the broker: redrawMonitor/redrawTerminal do real monitor/terminal I/O,
--- which is genuinely slow, while handling a message (state update + rule
+-- Monitor redraws are throttled separately from message handling, same
+-- reasoning as the broker: drawMonitor does real peripheral I/O, which is
+-- genuinely slow, while handling a message (state update + rule
 -- bookkeeping) is cheap. The controller subscribes to "#" - every topic
 -- from every provider on the network - so redrawing on every single
 -- rednet_message meant its message-handling loop could fall behind under
@@ -1881,21 +1659,8 @@ while true do
     handleMessage(ev[2], ev[3])
     dirty = true
 
-  elseif ev[1] == "key" then
-    if not consoleOn then
-      consoleOn = true
-      redrawTerminal()
-    else
-      handleTerminalKey(ev)
-    end
-
-  elseif ev[1] == "char" then
-    if not consoleOn then
-      consoleOn = true
-      redrawTerminal()
-    else
-      handleTerminalChar(ev)
-    end
+  elseif ev[1] == "key" or ev[1] == "char" or ev[1] == "mouse_click" or ev[1] == "mouse_scroll" then
+    termScreen.handleEvent(ev)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
     safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
@@ -1913,11 +1678,14 @@ while true do
   end
 
   if dirty and t >= nextRedraw then
-    redrawMonitor()
-    if consoleOn then redrawTerminal() end
+    if monScreen then monScreen.markDirty(); monScreen.tick() end
     dirty = false
     nextRedraw = t + REDRAW_TICK
   end
+
+  -- Term console: driven every iteration regardless of the monitor's
+  -- throttle above - see broker.lua's identical comment on screen.tick().
+  termScreen.tick()
 
   if t >= nextSync then
     -- only look the broker up if we don't already have one - rednet.lookup()
