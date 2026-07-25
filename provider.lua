@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v12 | commit a9675e4 | built 2026-07-25T01:52:46Z
+-- cc-mqtt provider.lua | release dev | commit 6776141 | built 2026-07-25T02:03:05Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
@@ -1831,6 +1831,68 @@ function Screen.new(dev, opts)
 end
 
 ------------------------------------------------------------------
+-- Standard up/down (and w/s, matching every target's existing WASD-style
+-- alternative) list navigation. Returns the new 1-based index, clamped to
+-- [1, count], or nil if `ev` wasn't a navigation key - so callers can
+-- check `local nav = Screen.navigate(ev, i, n); if nav then ... else ...`
+-- and fall through to their own key handling otherwise. Generalizes the
+-- near-identical up/down clamping every target's device list, action
+-- list, rule list, entity list and wizard option list each wrote by hand.
+------------------------------------------------------------------
+function Screen.navigate(ev, index, count)
+  local key = ev[2]
+  if key == keys.up or key == keys.w then
+    return math.max(1, index - 1)
+  elseif key == keys.down or key == keys.s then
+    return math.min(math.max(count, 1), index + 1)
+  end
+  return nil
+end
+
+------------------------------------------------------------------
+-- Generic scrollable/selectable list, drawn within a draw() function
+-- (not a standalone view - most list screens also have their own
+-- header/footer/other content around it). Generalizes the page-offset
+-- math every target's entity/rule/device list, and subscriber's
+-- pickList / controller's drawWizardOptionList, each independently
+-- reimplemented: keep `selected` on screen by scrolling a full page at
+-- a time rather than one row at a time.
+--
+-- opts:
+--   x, y      - top-left of the list area (x defaults to 1)
+--   w         - width of the list area (defaults to the rest of the row)
+--   h         - number of rows available (required)
+--   items     - array of arbitrary items
+--   selected  - 1-based index of the current selection
+--   renderItem(screen, item, index, x, y, w, isSelected) - draws one row;
+--             caller owns column layout/colors entirely
+--   emptyText, emptyColor - shown instead when #items == 0
+--
+-- Returns the page offset (rows scrolled), mostly useful for callers that
+-- want to reason about which page is showing.
+------------------------------------------------------------------
+function Screen.list(screen, opts)
+  local w = screen.size()
+  local x, y, rows = opts.x or 1, opts.y, opts.h
+  local items = opts.items or {}
+
+  if #items == 0 then
+    screen.write(x + 1, y, opts.emptyText or "(nothing here)", opts.emptyColor or colors.gray)
+    return 0
+  end
+
+  local selected = opts.selected or 1
+  local pageOffset = math.floor((selected - 1) / math.max(1, rows)) * rows
+  local rowW = opts.w or (w - x + 1)
+  for i = 1, rows do
+    local idx = pageOffset + i
+    if idx > #items then break end
+    opts.renderItem(screen, items[idx], idx, x, y + i - 1, rowW, idx == selected)
+  end
+  return pageOffset
+end
+
+------------------------------------------------------------------
 -- Built-in reusable view: renders screen.logEntries() as a scrolling
 -- tail, with an optional header bar and a status line recomputed
 -- every redraw. This is the default shape for a screensaver - a
@@ -1841,16 +1903,24 @@ end
 --
 -- opts:
 --   header         - optional title text for row 1 (blue bar)
---   statusLine      - optional function() -> string, re-evaluated
---                     every redraw (e.g. countdowns, version, link
---                     status) and shown just under the header
---   redrawInterval - defaults to 1s so statusLine/log stay live while
---                    idle even with no new input or log entries
+--   statusLine     - optional function() -> string, re-evaluated on
+--                     every redraw (e.g. a countdown or link status)
+--                     and shown just under the header. Pulls in
+--                     redrawInterval below - leave unset for a screen
+--                     that's purely event-driven (see redrawInterval).
+--   redrawInterval - keeps redrawing on this cadence even with nothing
+--                     new to show. Only defaults to 1s when statusLine
+--                     is set (it's the only thing here that goes stale
+--                     without a timer); a plain log has none, since the
+--                     whole point of a screensaver is to sit idle -
+--                     drawing it every second regardless of whether
+--                     the log actually changed defeats that. It only
+--                     redraws when log()/banner() add something new.
 ------------------------------------------------------------------
 function Screen.logView(opts)
   opts = opts or {}
   return {
-    redrawInterval = opts.redrawInterval or 1,
+    redrawInterval = opts.redrawInterval or (opts.statusLine and 1 or nil),
     draw = function(screen)
       local w, h = screen.size()
       local y = 1
@@ -2128,6 +2198,44 @@ end
 local providerStats = { lastIterMs = 0, maxIterMs = 0, statWindowStart = os.clock() }
 local STATS_WINDOW = 10
 
+-- One row of the device list, handed to Screen.list below. x/y/w describe
+-- the row's own slice of the screen, so this stays reusable regardless of
+-- where the list is positioned - only the column widths within the row
+-- are provider-specific.
+local function drawDeviceRow(screen, dev, _index, x, y, w, selected)
+  local rowBg = selected and colors.gray or colors.black
+
+  local selChar = selected and ">" or " "
+  screen.write(x, y, selChar .. " ", colors.white, rowBg)
+
+  local padEnt = (dev.entity .. string.rep(" ", math.max(1, 14 - #dev.entity))):sub(1, 14)
+  screen.write(x + 2, y, padEnt, colors.white, rowBg)
+
+  local padTop = (dev.topic .. string.rep(" ", math.max(1, 17 - #dev.topic))):sub(1, 17)
+  screen.write(x + 16, y, padTop, colors.lightGray, rowBg)
+
+  local padTitle = ((dev.title or "?") .. string.rep(" ", math.max(1, 14 - #(dev.title or "?")))):sub(1, 14)
+  screen.write(x + 33, y, padTitle, colors.cyan, rowBg)
+
+  -- collect() timing for THIS device's last poll: how you actually see
+  -- which peripheral is dragging the whole computer down, since a slow
+  -- synchronous call here can't be diagnosed any other way. Red once
+  -- it's slow enough to trigger backoff (see SLOW_COLLECT_MS).
+  local backedOff = dev._backoffUntil and dev._backoffUntil > os.clock()
+  local collectText, collectColor
+  if dev._lastCollectMs then
+    collectText = ("%dms"):format(math.floor(dev._lastCollectMs)) .. (backedOff and " (backoff)" or "")
+    collectColor = dev._lastCollectMs > SLOW_COLLECT_MS and colors.red or colors.lime
+  else
+    collectText, collectColor = "-", colors.gray
+  end
+  screen.write(x + 47, y, collectText, collectColor, rowBg)
+
+  local usedTo = x + 47 + #collectText - 1
+  local rowEndX = x + w - 1
+  if usedTo < rowEndX then screen.write(usedTo + 1, y, string.rep(" ", rowEndX - usedTo), colors.white, rowBg) end
+end
+
 local function drawList(screen)
   local w, h = screen.size()
   local banner = screen.currentBanner()
@@ -2151,48 +2259,14 @@ local function drawList(screen)
 
   local listH = h - 4
   if banner then listH = listH - 1 end
-  local pageOffset = math.floor((selectedIndex - 1) / math.max(1, listH)) * listH
 
-  for i = 1, listH do
-    local idx = pageOffset + i
-    local rowY = 3 + i
-    if idx > #devices then break end
-    local dev = devices[idx]
-    local rowBg = (idx == selectedIndex) and colors.gray or colors.black
-
-    local selChar = (idx == selectedIndex) and ">" or " "
-    screen.write(1, rowY, selChar .. " ", colors.white, rowBg)
-
-    local padEnt = (dev.entity .. string.rep(" ", math.max(1, 14 - #dev.entity))):sub(1, 14)
-    screen.write(3, rowY, padEnt, colors.white, rowBg)
-
-    local padTop = (dev.topic .. string.rep(" ", math.max(1, 17 - #dev.topic))):sub(1, 17)
-    screen.write(17, rowY, padTop, colors.lightGray, rowBg)
-
-    local padTitle = ((dev.title or "?") .. string.rep(" ", math.max(1, 14 - #(dev.title or "?")))):sub(1, 14)
-    screen.write(34, rowY, padTitle, colors.cyan, rowBg)
-
-    -- collect() timing for THIS device's last poll: how you actually see
-    -- which peripheral is dragging the whole computer down, since a slow
-    -- synchronous call here can't be diagnosed any other way. Red once
-    -- it's slow enough to trigger backoff (see SLOW_COLLECT_MS).
-    local backedOff = dev._backoffUntil and dev._backoffUntil > os.clock()
-    local collectText, collectColor
-    if dev._lastCollectMs then
-      collectText = ("%dms"):format(math.floor(dev._lastCollectMs)) .. (backedOff and " (backoff)" or "")
-      collectColor = dev._lastCollectMs > SLOW_COLLECT_MS and colors.red or colors.lime
-    else
-      collectText, collectColor = "-", colors.gray
-    end
-    screen.write(48, rowY, collectText, collectColor, rowBg)
-
-    local usedTo = 48 + #collectText - 1
-    if usedTo < w then screen.write(usedTo + 1, rowY, string.rep(" ", w - usedTo), colors.white, rowBg) end
-  end
-
-  if #devices == 0 then
-    screen.write(2, 5, "No devices configured.", colors.gray)
-  end
+  Screen.list(screen, {
+    y = 4, h = listH,
+    items = devices,
+    selected = selectedIndex,
+    renderItem = drawDeviceRow,
+    emptyText = "No devices configured.",
+  })
 
   if banner then
     screen.row(h - 1, (banner.error and "[!] " or "[*] ") .. banner.text,
@@ -2293,11 +2367,9 @@ end
 
 local function listOnKey(screen, ev)
   local key = ev[2]
-  if key == keys.up or key == keys.w then
-    selectedIndex = math.max(1, selectedIndex - 1)
-
-  elseif key == keys.down or key == keys.s then
-    selectedIndex = math.min(#devices, selectedIndex + 1)
+  local nav = Screen.navigate(ev, selectedIndex, #devices)
+  if nav then
+    selectedIndex = nav
 
   elseif key == keys.enter or key == keys.right or key == keys.c then
     if #devices > 0 and devices[selectedIndex] then
@@ -2320,11 +2392,9 @@ local function inspectOnKey(screen, ev)
   local dev = devices[selectedIndex]
   local actNames = dev and getActionNames(dev) or {}
 
-  if key == keys.up or key == keys.w then
-    selectedActionIndex = math.max(1, selectedActionIndex - 1)
-
-  elseif key == keys.down or key == keys.s then
-    selectedActionIndex = math.min(#actNames, selectedActionIndex + 1)
+  local nav = Screen.navigate(ev, selectedActionIndex, #actNames)
+  if nav then
+    selectedActionIndex = nav
 
   -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
   -- before it ever reaches CC:Tweaked as a "key" event
@@ -2382,21 +2452,14 @@ screen.registerView("list", { draw = drawList, onKey = listOnKey, redrawInterval
 screen.registerView("inspect", { draw = drawInspect, onKey = inspectOnKey })
 screen.registerView("input", { draw = drawInput, onKey = inputOnKey, onChar = inputOnChar })
 
--- Screensaver: the passive view shown once idle, built from the same
--- countdowns as the LIST header/subheader plus the activity log fed by
--- screen.log()/screen.banner() calls elsewhere (handleCommand, the safety
--- watchdog, forced pushes, simulated actions) - a live "what's due / what
--- just happened" summary instead of a static placeholder.
+-- Screensaver: the passive view shown once idle, built from the activity
+-- log fed by screen.log()/screen.banner() calls elsewhere (handleCommand,
+-- the safety watchdog, forced pushes, simulated actions). Deliberately no
+-- statusLine/countdown here - the whole point of a screensaver is to sit
+-- idle, so it only redraws when a new log entry actually arrives, not on
+-- a timer (see Screen.logView's redrawInterval comment).
 screen.registerView("screensaver", Screen.logView({
   header = ("cbus provider #%d - press any key for console"):format(os.getComputerID()),
-  statusLine = function()
-    local pushCd = math.max(0, math.floor((nextPub - os.clock()) * 10) / 10)
-    local annCd  = math.max(0, math.floor(nextAnn - os.clock()))
-    local updCd  = updater.secondsUntilNextCheck()
-    return ("v:%s  Broker #%s  Push:%.1fs Ann:%ds Upd:%s(%ds)"):format(
-      updater.getShortVer(updater.currentVersion),
-      broker and tostring(broker) or "?", pushCd, annCd, updater.status, updCd)
-  end,
 }))
 screen.setScreensaver("screensaver")
 

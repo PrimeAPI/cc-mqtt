@@ -282,6 +282,68 @@ function Screen.new(dev, opts)
 end
 
 ------------------------------------------------------------------
+-- Standard up/down (and w/s, matching every target's existing WASD-style
+-- alternative) list navigation. Returns the new 1-based index, clamped to
+-- [1, count], or nil if `ev` wasn't a navigation key - so callers can
+-- check `local nav = Screen.navigate(ev, i, n); if nav then ... else ...`
+-- and fall through to their own key handling otherwise. Generalizes the
+-- near-identical up/down clamping every target's device list, action
+-- list, rule list, entity list and wizard option list each wrote by hand.
+------------------------------------------------------------------
+function Screen.navigate(ev, index, count)
+  local key = ev[2]
+  if key == keys.up or key == keys.w then
+    return math.max(1, index - 1)
+  elseif key == keys.down or key == keys.s then
+    return math.min(math.max(count, 1), index + 1)
+  end
+  return nil
+end
+
+------------------------------------------------------------------
+-- Generic scrollable/selectable list, drawn within a draw() function
+-- (not a standalone view - most list screens also have their own
+-- header/footer/other content around it). Generalizes the page-offset
+-- math every target's entity/rule/device list, and subscriber's
+-- pickList / controller's drawWizardOptionList, each independently
+-- reimplemented: keep `selected` on screen by scrolling a full page at
+-- a time rather than one row at a time.
+--
+-- opts:
+--   x, y      - top-left of the list area (x defaults to 1)
+--   w         - width of the list area (defaults to the rest of the row)
+--   h         - number of rows available (required)
+--   items     - array of arbitrary items
+--   selected  - 1-based index of the current selection
+--   renderItem(screen, item, index, x, y, w, isSelected) - draws one row;
+--             caller owns column layout/colors entirely
+--   emptyText, emptyColor - shown instead when #items == 0
+--
+-- Returns the page offset (rows scrolled), mostly useful for callers that
+-- want to reason about which page is showing.
+------------------------------------------------------------------
+function Screen.list(screen, opts)
+  local w = screen.size()
+  local x, y, rows = opts.x or 1, opts.y, opts.h
+  local items = opts.items or {}
+
+  if #items == 0 then
+    screen.write(x + 1, y, opts.emptyText or "(nothing here)", opts.emptyColor or colors.gray)
+    return 0
+  end
+
+  local selected = opts.selected or 1
+  local pageOffset = math.floor((selected - 1) / math.max(1, rows)) * rows
+  local rowW = opts.w or (w - x + 1)
+  for i = 1, rows do
+    local idx = pageOffset + i
+    if idx > #items then break end
+    opts.renderItem(screen, items[idx], idx, x, y + i - 1, rowW, idx == selected)
+  end
+  return pageOffset
+end
+
+------------------------------------------------------------------
 -- Built-in reusable view: renders screen.logEntries() as a scrolling
 -- tail, with an optional header bar and a status line recomputed
 -- every redraw. This is the default shape for a screensaver - a
@@ -292,16 +354,24 @@ end
 --
 -- opts:
 --   header         - optional title text for row 1 (blue bar)
---   statusLine      - optional function() -> string, re-evaluated
---                     every redraw (e.g. countdowns, version, link
---                     status) and shown just under the header
---   redrawInterval - defaults to 1s so statusLine/log stay live while
---                    idle even with no new input or log entries
+--   statusLine     - optional function() -> string, re-evaluated on
+--                     every redraw (e.g. a countdown or link status)
+--                     and shown just under the header. Pulls in
+--                     redrawInterval below - leave unset for a screen
+--                     that's purely event-driven (see redrawInterval).
+--   redrawInterval - keeps redrawing on this cadence even with nothing
+--                     new to show. Only defaults to 1s when statusLine
+--                     is set (it's the only thing here that goes stale
+--                     without a timer); a plain log has none, since the
+--                     whole point of a screensaver is to sit idle -
+--                     drawing it every second regardless of whether
+--                     the log actually changed defeats that. It only
+--                     redraws when log()/banner() add something new.
 ------------------------------------------------------------------
 function Screen.logView(opts)
   opts = opts or {}
   return {
-    redrawInterval = opts.redrawInterval or 1,
+    redrawInterval = opts.redrawInterval or (opts.statusLine and 1 or nil),
     draw = function(screen)
       local w, h = screen.size()
       local y = 1
