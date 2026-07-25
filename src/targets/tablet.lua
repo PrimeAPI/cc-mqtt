@@ -4,6 +4,13 @@
 local PROTOCOL     = "cbus"
 local CONFIG_FILE  = "tablet.cfg"
 local STALE_AFTER  = 8 -- s without update -> stale
+-- Broker marks an entity offline after 15s without hearing from it (see
+-- broker.lua's OFFLINE_AFTER) - unlike subscriber.lua/controller.lua,
+-- nothing here previously re-subscribed on any kind of timer, only once
+-- at startup plus a manual [Re-Sync Broker] tap, so the tablet's own
+-- entity on the broker would go offline 15s after boot and just stay
+-- that way. Comfortably inside OFFLINE_AFTER so it never lapses.
+local SUB_INTERVAL = 10
 
 --------------------------------------------------------------------
 -- auto updater (runs ONLY on startup as requested)
@@ -88,7 +95,10 @@ local function send(msg)
 end
 
 local function subscribe()
-  send({ type = "subscribe", topics = { "#" }, version = updater.currentVersion })
+  send({
+    type = "subscribe", kind = "tablet", name = ("tablet-%d"):format(os.getComputerID()),
+    patterns = { "#" }, version = updater.currentVersion,
+  })
 end
 
 local function requestRegistry()
@@ -1084,6 +1094,7 @@ tabletScreen.show("dashboard")
 tabletScreen.tick()
 
 local animTimer = os.startTimer(0.5)
+local nextSub = os.clock() + SUB_INTERVAL
 
 while true do
   local ev = { os.pullEvent() }
@@ -1112,5 +1123,11 @@ while true do
     pcall(handleNet, ev[3], ev[2])
     tabletScreen.markDirty()
     tabletScreen.tick()
+  end
+
+  local t = os.clock()
+  if t >= nextSub then
+    subscribe()
+    nextSub = t + SUB_INTERVAL
   end
 end

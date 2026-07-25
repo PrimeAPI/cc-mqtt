@@ -1573,6 +1573,7 @@ local function handleMessage(srcId, msg)
     broker = srcId
     rednet.send(broker, {
       type = "subscribe",
+      kind = "controller",
       patterns = { "#" },
       name = "controller-" .. os.getComputerID(),
       version = updater.currentVersion
@@ -1693,6 +1694,7 @@ while true do
       -- if it wasn't there yet on the very first tick.
       rednet.send(broker, {
         type = "subscribe",
+        kind = "controller",
         patterns = { "#" },
         name = "controller-" .. os.getComputerID(),
         version = updater.currentVersion

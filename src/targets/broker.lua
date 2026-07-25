@@ -337,7 +337,23 @@ end
 -- so packing left-to-right is what actually uses the extra width for
 -- something (many more entities visible at once) instead of leaving it
 -- blank past whatever the longest name needs.
-local ENT_CELL_W = 30
+--
+-- Grouped by kind (provider/subscriber/controller/tablet - see
+-- handle()'s "announce"/"subscribe" branches for where each entity's
+-- kind actually comes from) rather than one flat list with a "[kind]"
+-- tag on every row: every provider entity literally announces
+-- kind="provider", so that tag was the same word repeated on every
+-- single provider row and never actually told you anything. A group
+-- header says it once instead, freeing the row itself for what's
+-- actually useful per-entity - version (previously cut off) and how
+-- long since it was last heard from, for debugging a stuck/offline one.
+local ENT_CELL_W = 32
+
+local KIND_ORDER = { "provider", "subscriber", "controller", "tablet" }
+local KIND_LABEL = {
+  provider = "PROVIDERS", subscriber = "SUBSCRIBERS",
+  controller = "CONTROLLERS", tablet = "TABLETS",
+}
 
 local function drawEntities(screen)
   local w, h = screen.size()
@@ -357,20 +373,62 @@ local function drawEntities(screen)
     return
   end
 
-  local cols = math.max(1, math.floor(w / ENT_CELL_W))
-  local y0 = 2
-  for i, n in ipairs(names) do
-    local col = (i - 1) % cols
-    local row = math.floor((i - 1) / cols)
-    local x, y = 1 + col * ENT_CELL_W, y0 + row
-    if y > h then break end
+  -- group by kind, preserving each group's own sorted-by-name order
+  local groups, kindsPresent = {}, {}
+  for _, n in ipairs(names) do
+    local k = entities[n].kind or "provider"
+    if not groups[k] then
+      groups[k] = {}
+      kindsPresent[#kindsPresent + 1] = k
+    end
+    groups[k][#groups[k] + 1] = n
+  end
+  table.sort(kindsPresent)
 
-    local e = entities[n]
-    screen.write(x, y, e.online and "\7 " or "x ", e.online and colors.lime or colors.red)
-    local padName = (n .. string.rep(" ", math.max(1, 14 - #n))):sub(1, 14)
-    screen.write(x + 2, y, padName, colors.white)
-    local tag = ("[%s] v:%s"):format(e.kind or "?", updater.getShortVer(e.version))
-    screen.write(x + 16, y, tag:sub(1, ENT_CELL_W - 16), colors.lightGray)
+  -- canonical roles first, in a fixed/predictable order, then any other
+  -- kind (e.g. a pre-kind-field legacy client still on the wire)
+  -- alphabetically after
+  local orderedKinds, seenKind = {}, {}
+  for _, k in ipairs(KIND_ORDER) do
+    if groups[k] then
+      orderedKinds[#orderedKinds + 1] = k
+      seenKind[k] = true
+    end
+  end
+  for _, k in ipairs(kindsPresent) do
+    if not seenKind[k] then orderedKinds[#orderedKinds + 1] = k end
+  end
+
+  local cols = math.max(1, math.floor(w / ENT_CELL_W))
+  local t = now()
+  local y = 2
+  for _, kind in ipairs(orderedKinds) do
+    if y > h then break end
+    local list = groups[kind]
+    local label = (KIND_LABEL[kind] or kind:upper()) .. (" (%d)"):format(#list)
+    screen.row(y, " " .. label, colors.yellow, colors.gray)
+    y = y + 1
+
+    local col = 0
+    for _, n in ipairs(list) do
+      if y > h then break end
+      local x = 1 + col * ENT_CELL_W
+      local e = entities[n]
+
+      screen.write(x, y, e.online and "\7 " or "x ", e.online and colors.lime or colors.red)
+      local padName = (n .. string.rep(" ", math.max(1, 14 - #n))):sub(1, 14)
+      screen.write(x + 2, y, padName, colors.white)
+
+      local verStr = "v:" .. updater.getShortVer(e.version)
+      screen.write(x + 16, y, verStr, colors.lightGray)
+
+      local ageStr = e.online and formatAge(t - e.lastSeen) or "offline"
+      screen.write(x + 16 + #verStr + 1, y, ageStr, colors.gray)
+
+      col = col + 1
+      if col >= cols then col, y = 0, y + 1 end
+    end
+    if col > 0 then y = y + 1 end
   end
 end
 
@@ -697,7 +755,10 @@ local function handle(id, msg)
       if not entities[msg.entity] then
         entities[msg.entity] = {
           id = id,
-          kind = (msg.topic and msg.topic:match("^([^/]+)")) or "provider",
+          -- only providers ever publish telemetry, by protocol - this is
+          -- a fallback for one arriving before its own announce (which
+          -- normally sets kind first), not a guess from the topic name
+          kind = "provider",
           topics = { msg.topic },
           actions = msg.actions or {},
           version = msg.version or "dev",
@@ -725,7 +786,10 @@ local function handle(id, msg)
   elseif msg.type == "subscribe" then
     local name = msg.name or ("sub-" .. id)
     subs[id] = { patterns = msg.patterns or { "#" }, name = name }
-    entities[name] = { id = id, kind = "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
+    -- msg.kind distinguishes subscriber.lua/controller.lua/tablet.lua,
+    -- which all send this same message shape - "subscriber" is only a
+    -- fallback for an older client that predates the field existing.
+    entities[name] = { id = id, kind = msg.kind or "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
     send(id, { type = "ack", of = "subscribe" })
     for topic, m in pairs(retained) do
       for _, pat in ipairs(subs[id].patterns) do

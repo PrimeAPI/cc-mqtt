@@ -161,7 +161,7 @@ local function subscribe()
   -- almost certainly why data kept going stale even after findBroker()
   -- itself was guarded elsewhere. send() already falls back to
   -- findBroker() if broker is somehow still unknown.
-  send({ type = "subscribe", name = cfg.name, patterns = { "#" }, version = updater.currentVersion })
+  send({ type = "subscribe", kind = "subscriber", name = cfg.name, patterns = { "#" }, version = updater.currentVersion })
 end
 
 local function requestRegistry() send({ type = "registry" }) end
