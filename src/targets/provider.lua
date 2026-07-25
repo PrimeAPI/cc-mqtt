@@ -993,6 +993,14 @@ local UPDATE_TICK = 300
 
 local updater = Updater.new({ scriptName = "provider.lua" })
 
+-- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
+-- inside the updater would fail with literally no visible trace, making it
+-- indistinguishable from "nothing to do yet". This surfaces it instead.
+local function safeUpdaterCall(fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then print("[Updater] internal error: " .. tostring(err)) end
+end
+
 peripheral.find("modem", function(n) rednet.open(n) end)
 
 local broker
@@ -1597,7 +1605,7 @@ end
 -- "broker_online" rednet handler), which already tolerates broker == nil
 -- throughout (see send()) - so nothing here blocks, and this fires
 -- unconditionally, broker or no broker.
-pcall(updater.checkNow)
+safeUpdaterCall(updater.checkNow)
 
 showIdleScreen()
 
@@ -1653,8 +1661,15 @@ while true do
     dirty = true
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    pcall(updater.handleHttp, ev[1], ev[2], ev[3])
+    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
+
+  -- Runs every iteration (cheap - a clock read, maybe a comparison),
+  -- unlike checkNow() itself which only fires every UPDATE_TICK. Without
+  -- this, a check that gets stuck (see updater.tick()'s own comment)
+  -- would only be noticed - and cleared - the next time checkNow()
+  -- happened to run, which could be minutes away.
+  safeUpdaterCall(updater.tick)
 
   local t = os.clock()
   if #devices > 0 and t >= nextPub then
@@ -1678,7 +1693,7 @@ while true do
   end
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
-    pcall(updater.checkNow)
+    safeUpdaterCall(updater.checkNow)
     dirty = true
   end
 

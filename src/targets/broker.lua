@@ -105,6 +105,14 @@ local UPDATE_TICK = 300
 
 local updater = Updater.new({ scriptName = "broker.lua" })
 
+-- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
+-- inside the updater would fail with literally no visible trace, making it
+-- indistinguishable from "nothing to do yet". This surfaces it instead.
+local function safeUpdaterCall(fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then print("[Updater] internal error: " .. tostring(err)) end
+end
+
 local function now() return os.clock() end
 local bootTime = now()
 
@@ -919,7 +927,7 @@ end
 --------------------------------------------------------------------
 -- main loop
 --------------------------------------------------------------------
-pcall(updater.checkNow)
+safeUpdaterCall(updater.checkNow)
 rednet.broadcast({ type = "broker_online", id = os.getComputerID() }, PROTOCOL)
 redrawMonitor()
 redrawLogMonitor()
@@ -979,8 +987,13 @@ while true do
     end
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-    pcall(updater.handleHttp, ev[1], ev[2], ev[3])
+    safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
+
+  -- Runs every iteration (cheap), unlike checkNow() itself which only
+  -- fires every UPDATE_TICK - see updater.tick()'s own comment for why
+  -- that matters.
+  safeUpdaterCall(updater.tick)
 
   local t = now()
   if t >= nextTick then
@@ -1008,7 +1021,7 @@ while true do
 
   if t >= nextUpdate then
     nextUpdate = t + UPDATE_TICK
-    pcall(updater.checkNow)
+    safeUpdaterCall(updater.checkNow)
   end
 
   local iterMs = (now() - iterT0) * 1000

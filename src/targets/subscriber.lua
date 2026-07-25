@@ -120,6 +120,14 @@ local UPDATE_TICK = 300 -- GitHub auto-update check interval (s), staggered
 
 local updater = Updater.new({ scriptName = "subscriber.lua" })
 
+-- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
+-- inside the updater would fail with literally no visible trace, making it
+-- indistinguishable from "nothing to do yet". This surfaces it instead.
+local function safeUpdaterCall(fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then print("[Updater] internal error: " .. tostring(err)) end
+end
+
 --------------------------------------------------------------------
 -- broker communication + state
 --------------------------------------------------------------------
@@ -1670,6 +1678,11 @@ local function runDisplay()
   end
 
   local function tick()
+    -- Runs every iteration (cheap), unlike checkNow() itself which only
+    -- fires every UPDATE_TICK - see updater.tick()'s own comment for why
+    -- that matters.
+    safeUpdaterCall(updater.tick)
+
     local t = os.clock()
     if t >= nextDraw then
       for _, e in pairs(ents) do
@@ -1696,7 +1709,7 @@ local function runDisplay()
     end
     if t >= nextUpdate then
       nextUpdate = t + UPDATE_TICK
-      pcall(updater.checkNow)
+      safeUpdaterCall(updater.checkNow)
     end
     if consoleOn and t >= nextTermDraw then
       redrawSubscriberTerminal()
@@ -1739,7 +1752,7 @@ local function runDisplay()
       end
 
     elseif ev[1] == "http_success" or ev[1] == "http_failure" then
-      pcall(updater.handleHttp, ev[1], ev[2], ev[3])
+      safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
     end
 
     local ok, err = pcall(tick)
@@ -1751,7 +1764,7 @@ end
 -- main
 --------------------------------------------------------------------
 loadConfig()
-pcall(updater.checkNow)
+safeUpdaterCall(updater.checkNow)
 if args[1] == "setup" then
   runSetup()
 else
