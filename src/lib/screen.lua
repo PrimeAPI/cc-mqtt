@@ -52,7 +52,21 @@ Screen.clipPad = clipPad
 --   logMax         - capacity of the log() ring buffer. Defaults to 100.
 function Screen.new(dev, opts)
   opts = opts or {}
-  local self = { dev = dev }
+  local realDev = dev
+
+  -- Every draw below writes straight to `dev`. Without buffering that's
+  -- the real terminal/monitor, so clear() blanks the hardware and each
+  -- following write() paints it incrementally - on a real screen (and
+  -- especially a networked monitor) that gap is visible as a flash to
+  -- blank on every redraw. window.create(..., false) gives an off-screen
+  -- buffer that soaks up all those writes silently; setVisible(true) at
+  -- the end of a redraw blits the finished frame to hardware in one shot,
+  -- so the device only ever shows complete frames, never the in-between
+  -- clear.
+  local w, h = realDev.getSize()
+  dev = window.create(realDev, 1, 1, w, h, false)
+
+  local self = { dev = realDev }
 
   local views = {}
   local activeName = nil
@@ -202,8 +216,12 @@ function Screen.new(dev, opts)
     if dirty then
       dirty = false
       view._lastDrawAt = os.clock()
+      -- Draw the whole frame into the off-screen buffer first, then
+      -- reveal it in one blit - see the buffering note in Screen.new.
+      dev.setVisible(false)
       self.clear()
       if view.draw then view.draw(self) end
+      dev.setVisible(true)
     end
   end
 

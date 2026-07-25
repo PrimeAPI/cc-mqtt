@@ -979,6 +979,7 @@ end
 -- broker communication
 --------------------------------------------------------------------
 --[[@include lib/updater.lua as Updater]]
+--[[@include lib/screen.lua as Screen]]
 
 -- Routine re-check cadence, retry-after-failure backoff, and the
 -- computer-ID stagger that keeps a whole fleet of computers from bursting
@@ -995,6 +996,15 @@ local function safeUpdaterCall(fn, ...)
   local ok, err = pcall(fn, ...)
   if not ok then print("[Updater] internal error: " .. tostring(err)) end
 end
+
+-- Forward-declared: created below in the "interactive provider TUI"
+-- section, but handleCommand() (defined before that section) already
+-- wants to log into it. A local declared here and assigned later is
+-- still the same upvalue every closure defined in between sees - Lua
+-- resolves the variable lexically at definition time, but only reads
+-- its value when the closure actually runs, which is always after the
+-- assignment below has happened.
+local screen
 
 peripheral.find("modem", function(n) rednet.open(n) end)
 
@@ -1045,7 +1055,7 @@ end
 -- computer can run until it returns: not publishing another device, not
 -- answering a "command", nothing. That's a hard limit of the platform, not
 -- something this script can route around. What it CAN do is measure which
--- device is slow (surfaced in the terminal, see redrawTerminal) and back
+-- device is slow (surfaced in the terminal, see drawList) and back
 -- that specific device off so it stops eating a disproportionate share of
 -- every other device's round-robin turns - see nextPollIndex().
 local SLOW_COLLECT_MS = 1000
@@ -1083,7 +1093,9 @@ local function publish(dev)
   if dev.handler.safety then
     local ok2, alert = pcall(dev.handler.safety, dev.p, dev, data)
     if ok2 and alert then
-      print(("[%s] %s"):format(dev.entity, alert))
+      local line = ("[%s] %s"):format(dev.entity, alert)
+      print(line)
+      screen.log(line, true)
       send({ type = "publish", entity = dev.entity,
              topic = "alert/" .. dev.entity, data = { message = alert } })
     end
@@ -1121,8 +1133,10 @@ local function handleCommand(msg)
           action = msg.action, result = result, error = err,
         }, PROTOCOL)
       end
-      print(("[%s] cmd '%s' -> %s"):format(dev.entity, tostring(msg.action),
-                                           err or tostring(result)))
+      local line = ("[%s] cmd '%s' -> %s"):format(dev.entity, tostring(msg.action),
+                                                    err or tostring(result))
+      print(line)
+      screen.log(line, err ~= nil)
       return
     end
   end
@@ -1131,31 +1145,10 @@ end
 --------------------------------------------------------------------
 -- interactive provider TUI & simulation
 --------------------------------------------------------------------
-local viewMode            = "LIST" -- "LIST", "INSPECT", "INPUT"
 local selectedIndex       = 1
 local selectedActionIndex = 1
 local inputActionName     = nil
 local inputBuffer         = ""
-local statusBanner        = nil
-
--- The local terminal console only costs anything while it's actually being
--- looked at, and nobody stands at every provider computer all day. Starts
--- closed; any key/char opens it, [H] closes it again. Publishing/collecting
--- and command handling are unaffected either way.
-local consoleOn = false
-
-local function setBanner(msg, isError)
-  statusBanner = { text = msg, error = isError or false, time = os.clock() }
-end
-
--- drawn once (not on a redraw loop) whenever the console is closed
-local function showIdleScreen()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-  term.setCursorPos(1, 1)
-  term.setTextColor(colors.gray)
-  term.write(("cbus provider #%d - press any key for console"):format(os.getComputerID()))
-end
 
 local function simulateAction(dev, actionName, rawArgs)
   if not dev or not dev.actions then return false, "No actions available" end
@@ -1226,23 +1219,56 @@ end
 -- COLLECT times in the terminal stay low, the slowdown isn't any single
 -- peripheral - it's this computer (or the server) generally struggling,
 -- which points at server-side lag rather than a device to isolate.
--- Declared here (before redrawTerminal, which reads it) rather than down
--- by the main loop that updates it: redrawTerminal is a closure, and Lua
--- resolves the free variables in a closure's body against whatever locals
--- are already in scope at the point the closure is DEFINED in the source -
--- declaring this later would make redrawTerminal see a global (nil)
--- instead of this local, however early the assignment runs at runtime.
+-- Declared here (before drawList, which reads it) rather than down by the
+-- main loop that updates it: drawList is a closure, and Lua resolves the
+-- free variables in a closure's body against whatever locals are already
+-- in scope at the point the closure is DEFINED in the source - declaring
+-- this later would make drawList see a global (nil) instead of this
+-- local, however early the assignment runs at runtime.
 local providerStats = { lastIterMs = 0, maxIterMs = 0, statWindowStart = os.clock() }
 local STATS_WINDOW = 10
 
-local function redrawTerminal()
-  local w, h = term.getSize()
-  term.setBackgroundColor(colors.black)
-  term.clear()
+-- One row of the device list, handed to Screen.list below. x/y/w describe
+-- the row's own slice of the screen, so this stays reusable regardless of
+-- where the list is positioned - only the column widths within the row
+-- are provider-specific.
+local function drawDeviceRow(screen, dev, _index, x, y, w, selected)
+  local rowBg = selected and colors.gray or colors.black
 
-  if statusBanner and (os.clock() - statusBanner.time > 5) then
-    statusBanner = nil
+  local selChar = selected and ">" or " "
+  screen.write(x, y, selChar .. " ", colors.white, rowBg)
+
+  local padEnt = (dev.entity .. string.rep(" ", math.max(1, 14 - #dev.entity))):sub(1, 14)
+  screen.write(x + 2, y, padEnt, colors.white, rowBg)
+
+  local padTop = (dev.topic .. string.rep(" ", math.max(1, 17 - #dev.topic))):sub(1, 17)
+  screen.write(x + 16, y, padTop, colors.lightGray, rowBg)
+
+  local padTitle = ((dev.title or "?") .. string.rep(" ", math.max(1, 14 - #(dev.title or "?")))):sub(1, 14)
+  screen.write(x + 33, y, padTitle, colors.cyan, rowBg)
+
+  -- collect() timing for THIS device's last poll: how you actually see
+  -- which peripheral is dragging the whole computer down, since a slow
+  -- synchronous call here can't be diagnosed any other way. Red once
+  -- it's slow enough to trigger backoff (see SLOW_COLLECT_MS).
+  local backedOff = dev._backoffUntil and dev._backoffUntil > os.clock()
+  local collectText, collectColor
+  if dev._lastCollectMs then
+    collectText = ("%dms"):format(math.floor(dev._lastCollectMs)) .. (backedOff and " (backoff)" or "")
+    collectColor = dev._lastCollectMs > SLOW_COLLECT_MS and colors.red or colors.lime
+  else
+    collectText, collectColor = "-", colors.gray
   end
+  screen.write(x + 47, y, collectText, collectColor, rowBg)
+
+  local usedTo = x + 47 + #collectText - 1
+  local rowEndX = x + w - 1
+  if usedTo < rowEndX then screen.write(usedTo + 1, y, string.rep(" ", rowEndX - usedTo), colors.white, rowBg) end
+end
+
+local function drawList(screen)
+  local w, h = screen.size()
+  local banner = screen.currentBanner()
 
   if selectedIndex > #devices then selectedIndex = math.max(1, #devices) end
 
@@ -1250,328 +1276,222 @@ local function redrawTerminal()
   local annCd  = math.max(0, math.floor(nextAnn - os.clock()))
   local updCd  = updater.secondsUntilNextCheck()
 
-  if viewMode == "LIST" then
-    term.setCursorPos(1, 1)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    local headerText = (" cbus provider #%d (v:%s)"):format(os.getComputerID(), updater.getShortVer(updater.currentVersion))
-    local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
-    local space = math.max(1, w - #headerText - #brokerText)
-    term.write(headerText .. string.rep(" ", space) .. brokerText)
+  local headerText = (" cbus provider #%d (v:%s)"):format(os.getComputerID(), updater.getShortVer(updater.currentVersion))
+  local brokerText = ("-> Broker #%s "):format(broker and tostring(broker) or "?")
+  local space = math.max(1, w - #headerText - #brokerText)
+  screen.row(1, headerText .. string.rep(" ", space) .. brokerText, colors.white, colors.blue)
 
-    term.setCursorPos(1, 2)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    local timerText = (" Push:%.1fs Ann:%ds Upd:%s(%ds) Loop:%dms"):format(
-      pushCd, annCd, updater.status, updCd, math.floor(providerStats.maxIterMs))
-    term.write((timerText .. string.rep(" ", math.max(0, w - #timerText))):sub(1, w))
+  local timerText = (" Push:%.1fs Ann:%ds Upd:%s(%ds) Loop:%dms"):format(
+    pushCd, annCd, updater.status, updCd, math.floor(providerStats.maxIterMs))
+  screen.row(2, timerText, colors.white, colors.gray)
 
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.yellow)
-    term.write(" ENTITY          TOPIC             TYPE          COLLECT")
-    if w > 51 then term.write(string.rep(" ", w - 51)) end
+  screen.row(3, " ENTITY          TOPIC             TYPE          COLLECT", colors.yellow, colors.gray)
 
-    local listH = h - 4
-    if statusBanner then listH = listH - 1 end
-    local pageOffset = math.floor((selectedIndex - 1) / math.max(1, listH)) * listH
+  local listH = h - 4
+  if banner then listH = listH - 1 end
 
-    for i = 1, listH do
-      local idx = pageOffset + i
-      local rowY = 3 + i
-      if idx > #devices then break end
-      local dev = devices[idx]
+  Screen.list(screen, {
+    y = 4, h = listH,
+    items = devices,
+    selected = selectedIndex,
+    renderItem = drawDeviceRow,
+    emptyText = "No devices configured.",
+  })
 
-      term.setCursorPos(1, rowY)
-      if idx == selectedIndex then
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-      else
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.white)
-      end
+  if banner then
+    screen.row(h - 1, (banner.error and "[!] " or "[*] ") .. banner.text,
+      banner.error and colors.red or colors.lime)
+  end
 
-      local selChar = (idx == selectedIndex) and ">" or " "
-      term.write(selChar .. " ")
-      term.setTextColor(colors.white)
-      local padEnt = dev.entity .. string.rep(" ", math.max(1, 14 - #dev.entity))
-      term.write(padEnt:sub(1, 14))
+  -- [H]ide goes first, not last: a standard 51-col terminal is narrower
+  -- than the old text (54 chars), so the appended hint silently fell
+  -- off-screen. screen.row() clips to width as a backstop either way.
+  screen.row(h, " [H]ide  [Enter/C]Inspect&Act  [R]Push", colors.white, colors.blue)
+end
 
-      term.setTextColor(colors.lightGray)
-      local padTop = dev.topic .. string.rep(" ", math.max(1, 17 - #dev.topic))
-      term.write(padTop:sub(1, 17))
+local function drawInspect(screen)
+  local w, h = screen.size()
+  local banner = screen.currentBanner()
+  local dev = devices[selectedIndex]
 
-      term.setTextColor(colors.cyan)
-      local padTitle = (dev.title or "?") .. string.rep(" ", math.max(1, 14 - #(dev.title or "?")))
-      term.write(padTitle:sub(1, 14))
+  screen.row(1, " Inspect Device: " .. (dev and dev.entity or "?"), colors.white, colors.blue)
 
-      -- collect() timing for THIS device's last poll: how you actually
-      -- see which peripheral is dragging the whole computer down, since a
-      -- slow synchronous call here can't be diagnosed any other way. Red
-      -- once it's slow enough to trigger backoff (see SLOW_COLLECT_MS).
-      local backedOff = dev._backoffUntil and dev._backoffUntil > os.clock()
-      if dev._lastCollectMs then
-        term.setTextColor(dev._lastCollectMs > SLOW_COLLECT_MS and colors.red or colors.lime)
-        term.write(("%dms"):format(math.floor(dev._lastCollectMs)))
-        if backedOff then
-          term.setTextColor(colors.orange)
-          term.write(" (backoff)")
-        end
-      else
-        term.setTextColor(colors.gray)
-        term.write("-")
-      end
+  if not dev then
+    screen.write(2, 3, "Device no longer available.", colors.red)
+  else
+    screen.write(1, 2, ("Title: %s | Topic: %s"):format(dev.title or "?", dev.topic or "?"), colors.lightGray)
+    screen.write(1, 4, "--- CURRENT SENSOR VALUES ---", colors.cyan)
 
-      local cx, _ = term.getCursorPos()
-      if cx <= w then term.write(string.rep(" ", w - cx + 1)) end
+    local dataY = 5
+    local ok, data = pcall(dev.handler.collect, dev.p, dev)
+    if not ok or type(data) ~= "table" then data = { formed = false } end
+
+    local dataKeys = {}
+    for k in pairs(data) do
+      if k:sub(1, 1) ~= "_" then dataKeys[#dataKeys + 1] = k end
     end
+    table.sort(dataKeys)
 
-    if #devices == 0 then
-      term.setCursorPos(2, 5)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.gray)
-      term.write("No devices configured.")
-    end
-
-    if statusBanner then
-      term.setCursorPos(1, h - 1)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(statusBanner.error and colors.red or colors.lime)
-      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
-    end
-
-    term.setCursorPos(1, h)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    -- [H]ide goes first, not last: a standard 51-col terminal is narrower
-    -- than the old text (54 chars), so the appended hint silently fell
-    -- off-screen. :sub(1,w) as a backstop so it clips safely if it ever
-    -- doesn't fit rather than wrapping unexpectedly.
-    local footerText = " [H]ide  [Enter/C]Inspect&Act  [R]Push"
-    term.write((footerText .. string.rep(" ", math.max(0, w - #footerText))):sub(1, w))
-
-  elseif viewMode == "INSPECT" then
-    local dev = devices[selectedIndex]
-
-    term.setCursorPos(1, 1)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    local headerText = " Inspect Device: " .. (dev and dev.entity or "?")
-    term.write(headerText .. string.rep(" ", math.max(0, w - #headerText)))
-
-    if not dev then
-      term.setCursorPos(2, 3)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.red)
-      term.write("Device no longer available.")
+    if #dataKeys == 0 then
+      screen.write(2, dataY, "(no values collected)", colors.gray)
+      dataY = dataY + 1
     else
-      term.setCursorPos(1, 2)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.lightGray)
-      term.write(("Title: %s | Topic: %s"):format(dev.title or "?", dev.topic or "?"))
-
-      term.setCursorPos(1, 4)
-      term.setTextColor(colors.cyan)
-      term.write("--- CURRENT SENSOR VALUES ---")
-
-      local dataY = 5
-      local ok, data = pcall(dev.handler.collect, dev.p, dev)
-      if not ok or type(data) ~= "table" then data = { formed = false } end
-
-      local dataKeys = {}
-      for k, v in pairs(data) do
-        if k:sub(1, 1) ~= "_" then dataKeys[#dataKeys + 1] = k end
-      end
-      table.sort(dataKeys)
-
-      if #dataKeys == 0 then
-        term.setCursorPos(2, dataY)
-        term.setTextColor(colors.gray)
-        term.write("(no values collected)")
+      for i, k in ipairs(dataKeys) do
+        if dataY >= h - 6 then
+          screen.write(2, dataY, "... (" .. (#dataKeys - i + 1) .. " more values)", colors.gray)
+          dataY = dataY + 1
+          break
+        end
+        local v = data[k]
+        local vStr
+        if type(v) == "number" then
+          vStr = string.format(v == math.floor(v) and "%.0f" or "%.2f", v)
+        else
+          vStr = tostring(v)
+        end
+        screen.write(2, dataY, k .. ": ", colors.lightGray)
+        screen.write(2 + #k + 2, dataY, vStr, colors.white)
         dataY = dataY + 1
-      else
-        for i, k in ipairs(dataKeys) do
-          if dataY >= h - 6 then
-            term.setCursorPos(2, dataY)
-            term.setTextColor(colors.gray)
-            term.write("... (" .. (#dataKeys - i + 1) .. " more values)")
-            dataY = dataY + 1
-            break
-          end
-          term.setCursorPos(2, dataY)
-          term.setTextColor(colors.lightGray)
-          term.write(k .. ": ")
-          term.setTextColor(colors.white)
-          local v = data[k]
-          if type(v) == "number" then
-            term.write(string.format(v == math.floor(v) and "%.0f" or "%.2f", v))
-          else
-            term.write(tostring(v))
-          end
-          dataY = dataY + 1
-        end
-      end
-
-      dataY = dataY + 1
-      term.setCursorPos(1, dataY)
-      term.setTextColor(colors.yellow)
-      term.write("--- LOCAL ACTIONS ---")
-      dataY = dataY + 1
-
-      local actNames = getActionNames(dev)
-      if selectedActionIndex > #actNames then selectedActionIndex = math.max(1, #actNames) end
-
-      if #actNames == 0 then
-        term.setCursorPos(2, dataY)
-        term.setTextColor(colors.gray)
-        term.write("(no actions defined for this device)")
-      else
-        for j, act in ipairs(actNames) do
-          if dataY >= h - 2 then break end
-          term.setCursorPos(2, dataY)
-          if j == selectedActionIndex then
-            term.setBackgroundColor(colors.gray)
-            term.setTextColor(colors.white)
-            term.write("> " .. j .. ". " .. act .. " ")
-          else
-            term.setBackgroundColor(colors.black)
-            term.setTextColor(colors.white)
-            term.write("  " .. j .. ". " .. act .. " ")
-          end
-          dataY = dataY + 1
-        end
       end
     end
 
-    if statusBanner then
-      term.setCursorPos(1, h - 1)
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(statusBanner.error and colors.red or colors.lime)
-      term.write((statusBanner.error and "[!] " or "[*] ") .. statusBanner.text)
+    dataY = dataY + 1
+    screen.write(1, dataY, "--- LOCAL ACTIONS ---", colors.yellow)
+    dataY = dataY + 1
+
+    local actNames = getActionNames(dev)
+    if selectedActionIndex > #actNames then selectedActionIndex = math.max(1, #actNames) end
+
+    if #actNames == 0 then
+      screen.write(2, dataY, "(no actions defined for this device)", colors.gray)
+    else
+      for j, act in ipairs(actNames) do
+        if dataY >= h - 2 then break end
+        local selected = j == selectedActionIndex
+        local prefix = selected and "> " or "  "
+        screen.write(2, dataY, prefix .. j .. ". " .. act .. " ", colors.white, selected and colors.gray or colors.black)
+        dataY = dataY + 1
+      end
     end
-
-    term.setCursorPos(1, h)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    local footerText = " [Enter] Simulate Action  [B] Back"
-    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
-
-  elseif viewMode == "INPUT" then
-    local dev = devices[selectedIndex]
-
-    term.setCursorPos(1, 1)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    term.write((" Simulate Action: %s on %s"):format(tostring(inputActionName), dev and dev.entity or "?"))
-
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.yellow)
-    term.write("Enter argument for action '" .. tostring(inputActionName) .. "':")
-
-    term.setCursorPos(1, 4)
-    term.setTextColor(colors.gray)
-    term.write("(Press Enter with empty text for no args, or e.g. 40, IDLE, etc.)")
-
-    term.setCursorPos(1, 6)
-    term.setTextColor(colors.white)
-    term.write(" > " .. inputBuffer .. "_")
-
-    term.setCursorPos(1, h)
-    term.setBackgroundColor(colors.blue)
-    term.setTextColor(colors.white)
-    local footerText = " [Enter] Execute Simulation    [Tab] Cancel"
-    term.write(footerText .. string.rep(" ", math.max(0, w - #footerText)))
   end
+
+  if banner then
+    screen.row(h - 1, (banner.error and "[!] " or "[*] ") .. banner.text,
+      banner.error and colors.red or colors.lime)
+  end
+
+  screen.row(h, " [Enter] Simulate Action  [B] Back", colors.white, colors.blue)
 end
 
-local function handleTerminalKey(ev)
+local function drawInput(screen)
+  local _, h = screen.size()
+  local dev = devices[selectedIndex]
+
+  screen.row(1, (" Simulate Action: %s on %s"):format(tostring(inputActionName), dev and dev.entity or "?"),
+    colors.white, colors.blue)
+  screen.write(1, 3, "Enter argument for action '" .. tostring(inputActionName) .. "':", colors.yellow)
+  screen.write(1, 4, "(Press Enter with empty text for no args, or e.g. 40, IDLE, etc.)", colors.gray)
+  screen.write(1, 6, " > " .. inputBuffer .. "_", colors.white)
+  screen.row(h, " [Enter] Execute Simulation    [Tab] Cancel", colors.white, colors.blue)
+end
+
+local function listOnKey(screen, ev)
   local key = ev[2]
+  local nav = Screen.navigate(ev, selectedIndex, #devices)
+  if nav then
+    selectedIndex = nav
 
-  if viewMode == "LIST" then
-    if key == keys.up or key == keys.w then
-      selectedIndex = math.max(1, selectedIndex - 1)
-      redrawTerminal()
-
-    elseif key == keys.down or key == keys.s then
-      selectedIndex = math.min(#devices, selectedIndex + 1)
-      redrawTerminal()
-
-    elseif key == keys.enter or key == keys.right or key == keys.c then
-      if #devices > 0 and devices[selectedIndex] then
-        selectedActionIndex = 1
-        viewMode = "INSPECT"
-        redrawTerminal()
-      end
-
-    elseif key == keys.r then
-      for _, dev in ipairs(devices) do publish(dev) end
-      announceAll()
-      setBanner("Forced immediate publish & re-announce", false)
-      redrawTerminal()
-
-    elseif key == keys.h then
-      consoleOn = false
-      showIdleScreen()
+  elseif key == keys.enter or key == keys.right or key == keys.c then
+    if #devices > 0 and devices[selectedIndex] then
+      selectedActionIndex = 1
+      screen.show("inspect")
     end
 
-  elseif viewMode == "INSPECT" then
+  elseif key == keys.r then
+    for _, dev in ipairs(devices) do publish(dev) end
+    announceAll()
+    screen.banner("Forced immediate publish & re-announce", false)
+
+  elseif key == keys.h then
+    screen.enterScreensaver()
+  end
+end
+
+local function inspectOnKey(screen, ev)
+  local key = ev[2]
+  local dev = devices[selectedIndex]
+  local actNames = dev and getActionNames(dev) or {}
+
+  local nav = Screen.navigate(ev, selectedActionIndex, #actNames)
+  if nav then
+    selectedActionIndex = nav
+
+  -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
+  -- before it ever reaches CC:Tweaked as a "key" event
+  elseif key == keys.backspace or key == keys.b or key == keys.left then
+    screen.show("list")
+
+  elseif key == keys.enter then
+    if #actNames > 0 and actNames[selectedActionIndex] then
+      inputActionName = actNames[selectedActionIndex]
+      inputBuffer = ""
+      screen.show("input")
+    end
+  end
+end
+
+local function inputOnKey(screen, ev)
+  local key = ev[2]
+  -- Tab, not Escape: same reason, and letters must stay typeable here
+  -- for action args, so no letter key can double as "cancel".
+  if key == keys.tab then
+    screen.show("inspect")
+
+  elseif key == keys.backspace then
+    inputBuffer = inputBuffer:sub(1, -2)
+
+  elseif key == keys.enter then
     local dev = devices[selectedIndex]
-    local actNames = dev and getActionNames(dev) or {}
-
-    if key == keys.up or key == keys.w then
-      selectedActionIndex = math.max(1, selectedActionIndex - 1)
-      redrawTerminal()
-
-    elseif key == keys.down or key == keys.s then
-      selectedActionIndex = math.min(#actNames, selectedActionIndex + 1)
-      redrawTerminal()
-
-    -- no keys.escape here: Minecraft eats Escape to close the terminal GUI
-    -- before it ever reaches CC:Tweaked as a "key" event
-    elseif key == keys.backspace or key == keys.b or key == keys.left then
-      viewMode = "LIST"
-      redrawTerminal()
-
-    elseif key == keys.enter then
-      if #actNames > 0 and actNames[selectedActionIndex] then
-        inputActionName = actNames[selectedActionIndex]
-        inputBuffer = ""
-        viewMode = "INPUT"
-        redrawTerminal()
-      end
-    end
-
-  elseif viewMode == "INPUT" then
-    -- Tab, not Escape: same reason, and letters must stay typeable here
-    -- for action args, so no letter key can double as "cancel".
-    if key == keys.tab then
-      viewMode = "INSPECT"
-      redrawTerminal()
-
-    elseif key == keys.backspace then
-      inputBuffer = inputBuffer:sub(1, -2)
-      redrawTerminal()
-
-    elseif key == keys.enter then
-      local dev = devices[selectedIndex]
-      local ok, msg = simulateAction(dev, inputActionName, inputBuffer)
-      setBanner(msg, not ok)
-      viewMode = "INSPECT"
-      redrawTerminal()
-    end
+    local ok, msg = simulateAction(dev, inputActionName, inputBuffer)
+    screen.banner(msg, not ok)
+    screen.show("inspect")
   end
 end
 
-local function handleTerminalChar(ev)
-  if viewMode == "INPUT" then
-    local ch = ev[2]
-    if ch and #ch == 1 then
-      inputBuffer = inputBuffer .. ch
-      redrawTerminal()
-    end
+local function inputOnChar(screen, ev)
+  local ch = ev[2]
+  if ch and #ch == 1 then
+    inputBuffer = inputBuffer .. ch
   end
 end
+
+-- The local terminal console only costs anything while it's actually
+-- being looked at, and nobody stands at every provider computer all day -
+-- 20s of no key/char swaps to the screensaver below; any input swaps
+-- back. Starts in the screensaver too (see the startup section), same as
+-- every target's previous "closed until first key" behavior.
+screen = Screen.new(term, { defaultView = "list", idleSeconds = 20 })
+
+-- redrawInterval, not a dirty flag fed by every publish/rednet event: the
+-- countdowns and per-device collect-ms stats in drawList are cheap reads
+-- of already-collected numbers, so keeping them visually live while this
+-- view is open just needs its own steady cadence, decoupled from network
+-- activity - see screen.tick()'s comment on why the screensaver
+-- deliberately does NOT also get driven by those same events.
+screen.registerView("list", { draw = drawList, onKey = listOnKey, redrawInterval = 0.5 })
+screen.registerView("inspect", { draw = drawInspect, onKey = inspectOnKey })
+screen.registerView("input", { draw = drawInput, onKey = inputOnKey, onChar = inputOnChar })
+
+-- Screensaver: the passive view shown once idle, built from the activity
+-- log fed by screen.log()/screen.banner() calls elsewhere (handleCommand,
+-- the safety watchdog, forced pushes, simulated actions). Deliberately no
+-- statusLine/countdown here - the whole point of a screensaver is to sit
+-- idle, so it only redraws when a new log entry actually arrives, not on
+-- a timer (see Screen.logView's redrawInterval comment).
+screen.registerView("screensaver", Screen.logView({
+  header = ("cbus provider #%d - press any key for console"):format(os.getComputerID()),
+}))
+screen.setScreensaver("screensaver")
 
 --------------------------------------------------------------------
 -- main
@@ -1599,13 +1519,13 @@ end
 -- unconditionally, broker or no broker.
 safeUpdaterCall(updater.checkNow)
 
-showIdleScreen()
+screen.show("list")
+screen.enterScreensaver()
 
 while true do
   os.startTimer(0.5)
   local ev = { os.pullEvent() }
   local iterT0 = os.clock()
-  local dirty = false
 
   if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
     local msg = ev[3]
@@ -1630,27 +1550,12 @@ while true do
         end
       end
     end
-    dirty = true
 
-  elseif ev[1] == "key" then
-    if not consoleOn then
-      consoleOn = true
-      redrawTerminal()
-    else
-      handleTerminalKey(ev)
-    end
-
-  elseif ev[1] == "char" then
-    if not consoleOn then
-      consoleOn = true
-      redrawTerminal()
-    else
-      handleTerminalChar(ev)
-    end
+  elseif ev[1] == "key" or ev[1] == "char" or ev[1] == "mouse_click" or ev[1] == "mouse_scroll" then
+    screen.handleEvent(ev)
 
   elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
-    setBanner("Peripheral change detected - reboot to rescan", true)
-    dirty = true
+    screen.banner("Peripheral change detected - reboot to rescan", true)
 
   elseif ev[1] == "http_success" or ev[1] == "http_failure" then
     safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
@@ -1665,7 +1570,6 @@ while true do
     publish(devices[pollIndex])
     pollIndex = nextPollIndex(pollIndex)
     nextPub = t + (INTERVAL / #devices)
-    dirty = true
   end
   if t >= nextAnn then
     -- only look the broker up if we don't already have one - rednet.lookup()
@@ -1678,13 +1582,14 @@ while true do
     if not broker then findBroker(true) end
     announceAll()
     nextAnn = t + ANNOUNCE
-    dirty = true
   end
-  -- the console only gets redrawn if it's actually open - a provider
-  -- computer nobody is standing at doesn't need term I/O recomputed on
-  -- every publish cycle (which, with several devices, can be several
-  -- times a second)
-  if dirty and consoleOn then redrawTerminal() end
+  -- Redraws only if the active view is actually dirty, or (LIST/the
+  -- screensaver) it's due for its own redrawInterval refresh - see
+  -- screen.tick()'s own comment. Runs every iteration regardless of
+  -- whether the console is open: while idle this just keeps the
+  -- screensaver's countdown/log current on its own ~1s cadence, far
+  -- cheaper than the LIST view's full redraw.
+  screen.tick()
 
   local iterMs = (os.clock() - iterT0) * 1000
   providerStats.lastIterMs = iterMs
