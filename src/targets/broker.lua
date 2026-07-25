@@ -5,9 +5,14 @@
 -- * Subscribers SUBSCRIBE with topic patterns (MQTT style: +, #)
 -- * Commands are routed broker -> provider ("command" messages)
 -- * Terminal runs interactive Entity Browser (inspect telemetry, purge offline, trigger actions)
--- * First connected monitor (if present) lists all known entities;
---   a second monitor (if present) shows a timestamped rolling log of
---   every action triggered, newest at the bottom
+-- * Every attached monitor gets a role assigned by MEASURED WIDTH, not
+--   discovery order - narrowest gets the most compact display, widest
+--   gets the one that benefits most from extra room:
+--     status monitor (narrowest) - compact at-a-glance health tiles
+--     log monitor (middle)       - rolling action log, newest at the bottom
+--     entity monitor (widest)    - full multi-column entity grid
+--   With fewer than 3 monitors, the least space-hungry role (status) is
+--   dropped first, then log - see ROLE_ORDER below.
 --
 -- Save as startup.lua on the broker computer. Needs a modem.
 --------------------------------------------------------------------
@@ -20,10 +25,11 @@ local TICK          = 2    -- monitor refresh / prune interval
 peripheral.find("modem", function(n) rednet.open(n) end)
 rednet.host(PROTOCOL, HOSTNAME)
 
--- discover every attached monitor by name (no assumptions about
--- peripheral.find's return order), sort so the assignment is stable
--- across reboots, then take the first for the entity list and the
--- second (if any) for the action log
+-- discover every attached monitor, wrap + scale them all first (so
+-- getSize() below reflects the real character width each one ends up
+-- with), then sort by that measured width - least to most space-hungry
+-- role goes to narrowest to widest. Sorted by name first only to keep
+-- ties (identically-sized monitors) stable across reboots.
 local monitorNames = {}
 for _, name in ipairs(peripheral.getNames()) do
   if peripheral.getType(name) == "monitor" then
@@ -32,21 +38,39 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 table.sort(monitorNames)
 
-local mon      = monitorNames[1] and peripheral.wrap(monitorNames[1])
-local logMon   = monitorNames[2] and peripheral.wrap(monitorNames[2])
-local debugMon = monitorNames[3] and peripheral.wrap(monitorNames[3])
-if mon then mon.setTextScale(0.5) end
-if logMon then logMon.setTextScale(0.5) end
-if debugMon then debugMon.setTextScale(0.5) end
-
-print(("[monitors] found %d: %s"):format(#monitorNames, table.concat(monitorNames, ", ")))
-if mon then print("  " .. monitorNames[1] .. " -> entity list") end
-if logMon then print("  " .. monitorNames[2] .. " -> action log") end
-if debugMon then
-  print("  " .. monitorNames[3] .. " -> diagnostics (msg/s, redraw & loop timing)")
-elseif mon and not logMon then
-  print("  (only one monitor found - action log & diagnostics disabled)")
+local wrapped = {}
+for _, name in ipairs(monitorNames) do
+  local m = peripheral.wrap(name)
+  m.setTextScale(0.5)
+  wrapped[#wrapped + 1] = { name = name, mon = m, w = m.getSize() }
 end
+table.sort(wrapped, function(a, b) return a.w < b.w end)
+
+-- least -> most space-hungry/valuable-alone. With K monitors present,
+-- the LAST K roles here are the ones assigned (narrowest monitor gets
+-- the first of those K) - so 1 monitor is always "entities" (most
+-- useful on its own), 2 are "log"+"entities", and only with all 3
+-- present does "status" show up at all.
+local ROLE_ORDER = { "status", "log", "entities" }
+local roles = {}
+-- clamped to 1: with MORE monitors than roles (unlikely, but shouldn't
+-- crash if it happens) the extra widest ones beyond the 3rd simply don't
+-- get a role, rather than indexing ROLE_ORDER out of bounds.
+local roleStart = math.max(1, #ROLE_ORDER - #wrapped + 1)
+for i, w in ipairs(wrapped) do
+  if i > #ROLE_ORDER then break end
+  roles[ROLE_ORDER[roleStart + i - 1]] = w
+end
+
+local statusMon = roles.status and roles.status.mon
+local logMon    = roles.log and roles.log.mon
+local entMon    = roles.entities and roles.entities.mon
+
+print(("[monitors] found %d, assigned narrowest -> widest:"):format(#wrapped))
+if roles.status then print(("  %s (%dc wide) -> status"):format(roles.status.name, roles.status.w)) end
+if roles.log then print(("  %s (%dc wide) -> action log"):format(roles.log.name, roles.log.w)) end
+if roles.entities then print(("  %s (%dc wide) -> entity grid"):format(roles.entities.name, roles.entities.w)) end
+if #wrapped == 0 then print("  (none found)") end
 
 local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, online}
 local subs      = {}   -- computerId -> {patterns, name}
@@ -89,16 +113,17 @@ local stats = {
 --[[@include lib/updater.lua as Updater]]
 --[[@include lib/screen.lua as Screen]]
 --[[@include lib/util.lua as Util]]
+--[[@include lib/monitor.lua as Monitor]]
 
--- Each connected monitor gets its own double-buffered Screen (see
--- src/lib/screen.lua) - views registered further down, once their draw
--- functions exist. Unlike the terminal console these have no
+-- Each connected monitor gets its own double-buffered, header-having
+-- Screen (see src/lib/monitor.lua) - views registered further down, once
+-- their draw functions exist. Unlike the terminal console these have no
 -- screensaver/idle view: a monitor is a passive display someone in the
 -- world might be looking at any time, not something a nearby player
 -- steps away from.
-local monScreen      = mon and Screen.new(mon, {})
-local logMonScreen   = logMon and Screen.new(logMon, {})
-local debugMonScreen = debugMon and Screen.new(debugMon, {})
+local statusMonScreen = statusMon and Monitor.new(statusMon, { title = "cbus status" })
+local logMonScreen    = logMon and Monitor.new(logMon, { title = "cbus action log" })
+local entMonScreen    = entMon and Monitor.new(entMon, { title = "cbus entities" })
 
 -- Routine re-check cadence, retry-after-failure backoff, and the
 -- computer-ID stagger that keeps a whole fleet of computers from bursting
@@ -115,6 +140,16 @@ local function logAction(text, isError)
   actionLog[#actionLog + 1] = { time = os.date("%H:%M:%S"), text = text, error = isError or false }
   if #actionLog > LOG_MAX then table.remove(actionLog, 1) end
   termScreen.log(text, isError)
+end
+
+-- Numeric action args/results embedded in a log line get SI-formatted
+-- just like everywhere else a value is displayed (see Util.si) - a
+-- literal "setLimit(50000000)" is exactly as unreadable in a log entry
+-- as it would be on a gauge, and worse here since the log monitor is the
+-- narrowest of the three that actually show free text.
+local function fmtArg(v)
+  if type(v) == "number" then return Util.si(v) end
+  return tostring(v or "")
 end
 
 local function split(s)
@@ -199,7 +234,7 @@ local function sendCommand(entName, actionName, rawArgs)
     args = parsedArgs,
     from = os.getComputerID(),
   })
-  logAction(("[local] %s -> %s(%s)"):format(entName, actionName, tostring(parsedArgs or "")))
+  logAction(("[local] %s -> %s(%s)"):format(entName, actionName, fmtArg(parsedArgs)))
   return true, ("Sent '%s' to %s"):format(actionName, entName)
 end
 
@@ -227,48 +262,62 @@ end
 --------------------------------------------------------------------
 -- monitor display
 --------------------------------------------------------------------
-local function drawEntities(screen)
-  local w, h = screen.size()
-  screen.write(1, 1, "cbus broker  #" .. os.getComputerID(), colors.yellow)
-  screen.write(1, 2, string.rep("-", w), colors.gray)
-
-  local names = {}
-  for n in pairs(entities) do names[#names + 1] = n end
-  table.sort(names)
-
-  local y = 3
-  for _, n in ipairs(names) do
-    if y > h then break end
-    local e = entities[n]
-    screen.write(1, y, e.online and "\7 " or "x ", e.online and colors.lime or colors.red)
-    screen.write(3, y, n, colors.white)
-    local tag = " [" .. (e.kind or "?") .. "] v:" .. updater.getShortVer(e.version)
-    if #n + 2 + #tag <= w then
-      screen.write(3 + #n, y, tag, colors.lightGray)
-    end
-    y = y + 1
-  end
-  if #names == 0 then
-    screen.write(1, 3, "no entities connected", colors.gray)
-  end
+local function formatAge(age)
+  if age < 60 then return ("%ds"):format(math.floor(age)) end
+  return ("%dm%02ds"):format(math.floor(age / 60), math.floor(age % 60))
 end
 
--- second monitor (if present): rolling action log, newest at the
--- bottom - as new entries arrive the oldest ones simply scroll off
--- the top since we only ever draw the tail that fits
+-- status monitor (narrowest of the three, if present): the smallest
+-- surface gets the fewest, biggest-signal numbers rather than a cramped
+-- version of what the other two already show in full - online count,
+-- throughput, loop health and update status, two rows per stat stacked
+-- in a single column since there's rarely width for more than one.
+local function drawStatus(screen)
+  local w, h = screen.size()
+
+  local online, total = 0, 0
+  for _, e in pairs(entities) do
+    total = total + 1
+    if e.online then online = online + 1 end
+  end
+
+  screen.header()
+
+  local y = 2
+  local function stat(label, value, color)
+    if y + 1 > h then return end
+    screen.write(1, y, label, colors.lightGray)
+    screen.write(1, y + 1, value, color or colors.white)
+    y = y + 2
+  end
+
+  stat("Entities", ("%d/%d online"):format(online, total),
+    (total > 0 and online < total) and colors.orange or colors.lime)
+  stat("Messages/sec", ("%.1f"):format(stats.msgPerSec))
+  stat("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
+    stats.maxIterMs > 500 and colors.red or colors.lime)
+  stat("Update", ("%s (v:%s)"):format(updater.status, updater.getShortVer(updater.currentVersion)))
+  stat("Uptime", formatAge(now() - bootTime))
+end
+
+-- log monitor (middle width, if present): rolling action log, newest at
+-- the bottom - as new entries arrive the oldest ones simply scroll off
+-- the top since we only ever draw the tail that fits. Log text is built
+-- with Util.si()-formatted numeric args (see logAction's callers), so a
+-- "setLimit(50000000)" shows as "setLimit(50.00M)" instead of a wall of
+-- digits that doesn't fit this monitor's width anyway.
 local function drawActionLog(screen)
   local w, h = screen.size()
-  screen.write(1, 1, "cbus action log", colors.yellow)
-  screen.write(1, 2, string.rep("-", w), colors.gray)
+  screen.header(("%d entries"):format(#actionLog))
 
   if #actionLog == 0 then
-    screen.write(1, 3, "no actions triggered yet", colors.gray)
+    screen.write(1, 2, "no actions triggered yet", colors.gray)
     return
   end
 
-  local rows = h - 2
+  local rows = h - 1
   local startIdx = math.max(1, #actionLog - rows + 1)
-  local y = 3
+  local y = 2
   for i = startIdx, #actionLog do
     local entry = actionLog[i]
     local stamp = "[" .. entry.time .. "] "
@@ -278,107 +327,50 @@ local function drawActionLog(screen)
   end
 end
 
--- optional 3rd monitor: live diagnostics, so "is the broker/network slow,
--- and why" is something you can read off a screen instead of guessing.
--- Redrawn on its own (slower) cadence from the main loop, same as the
--- entity list and action log - never redrawn per-message.
---
--- Laid out as a grid of tiles rather than one stat per 3 rows: these
--- monitors tend to be wide and short (e.g. an 8x2-block strip), and a
--- single stacked column only ever fills the first couple of rows before
--- running out of height while leaving nearly the whole width blank. Tiling
--- left-to-right, wrapping to a new row only when a row of tiles is full,
--- uses the actual shape of the screen and leaves room to show every
--- entity individually instead of just a single "oldest" summary.
-local function formatAge(age)
-  if age < 60 then return ("%ds"):format(math.floor(age)) end
-  return ("%dm%02ds"):format(math.floor(age / 60), math.floor(age % 60))
-end
+-- entity monitor (widest, if present): the one view that most benefits
+-- from extra width, so it's the one full-detail view instead of the
+-- narrowest monitor's cramped compact summary AND a second, separate
+-- entity breakdown, which used to both exist and show overlapping
+-- information across two different monitors. A multi-column grid rather
+-- than one entity per row - a wide-but-short monitor (these are all 2
+-- blocks tall, whatever their width) only ever gets a handful of rows,
+-- so packing left-to-right is what actually uses the extra width for
+-- something (many more entities visible at once) instead of leaving it
+-- blank past whatever the longest name needs.
+local ENT_CELL_W = 30
 
-local function drawDebug(screen)
+local function drawEntities(screen)
   local w, h = screen.size()
 
-  local t = now()
-  local online, total = 0, 0
-  local entList = {}
-  for name, e in pairs(entities) do
-    total = total + 1
-    if e.online then online = online + 1 end
-    entList[#entList + 1] = { name = name, e = e, age = t - e.lastSeen }
-  end
-  -- most at-risk (oldest/offline) first, so problems are what you see first
-  table.sort(entList, function(a, b)
-    if a.e.online ~= b.e.online then return not a.e.online end
-    return a.age > b.age
-  end)
+  -- Util.sortedKeys(entities) directly, not the sortedEntityNames()
+  -- wrapper below - that's declared further down in the file (in the
+  -- terminal browser section) and closures only see locals already in
+  -- scope at the point they're DEFINED, not called.
+  local names = Util.sortedKeys(entities)
 
-  local subCount, topicCount = 0, 0
-  for _ in pairs(subs) do subCount = subCount + 1 end
-  for _ in pairs(retained) do topicCount = topicCount + 1 end
+  local online = 0
+  for _, e in pairs(entities) do if e.online then online = online + 1 end end
+  screen.header(("%d/%d online"):format(online, #names))
 
-  local header = (" cbus diagnostics #%d"):format(os.getComputerID())
-  local upStr = ("up %s "):format(formatAge(t - bootTime))
-  screen.row(1, header .. string.rep(" ", math.max(1, w - #header - #upStr)) .. upStr, colors.white, colors.blue)
-
-  -- tile grid: each tile is a fixed-width label/value pair, packed
-  -- left-to-right and wrapped to fill however wide the monitor is
-  local TILE_W = 17
-  local cols = math.max(1, math.floor(w / TILE_W))
-  local tileIdx = 0
-  local function tile(label, value, color)
-    local col = tileIdx % cols
-    local row = math.floor(tileIdx / cols)
-    local x, y = 1 + col * TILE_W, 3 + row * 2
-    if y + 1 <= h then
-      screen.write(x, y, label:sub(1, TILE_W - 1), colors.lightGray)
-      screen.write(x, y + 1, value:sub(1, TILE_W - 1), color or colors.white)
-    end
-    tileIdx = tileIdx + 1
+  if #names == 0 then
+    screen.write(1, 2, "no entities connected", colors.gray)
+    return
   end
 
-  tile("Entities", ("%d/%d online"):format(online, total))
-  tile("Subscribers", tostring(subCount))
-  tile("Retained topics", tostring(topicCount))
-  tile("Action log", tostring(#actionLog))
-  tile("Messages/sec", ("%.1f"):format(stats.msgPerSec))
-  tile("Redraw ms", ("%d (max %d)"):format(math.floor(stats.lastRedrawMs), math.floor(stats.maxRedrawMs)),
-    stats.maxRedrawMs > 300 and colors.red or colors.lime)
-  tile("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
-    stats.maxIterMs > 500 and colors.red or colors.lime)
-  tile("Update check", updater.getShortVer(updater.currentVersion))
-
-  local tileRows = math.ceil(tileIdx / cols)
-  local listY = 3 + tileRows * 2 + 1
-  if listY > h then return end
-
-  screen.write(1, listY, ("ENTITIES (%d)"):format(#entList), colors.yellow)
-  listY = listY + 1
-
-  -- one line per entity: status dot, name, age - packed the same way as
-  -- the tiles above but denser (1 row instead of 2), so as many entities
-  -- as possible are visible without scrolling
-  local ENT_W = 16
-  local entCols = math.max(1, math.floor(w / ENT_W))
-  local entRows = math.max(0, h - listY + 1)
-  local maxShown = entCols * entRows
-  for i, item in ipairs(entList) do
-    if i > maxShown then
-      local more = #entList - maxShown + 1
-      screen.write(1 + ((i - 1) % entCols) * ENT_W, listY + math.floor((i - 1) / entCols),
-        ("+%d more"):format(more), colors.gray)
-      break
-    end
-    local col = (i - 1) % entCols
-    local row = math.floor((i - 1) / entCols)
-    local x, y = 1 + col * ENT_W, listY + row
+  local cols = math.max(1, math.floor(w / ENT_CELL_W))
+  local y0 = 2
+  for i, n in ipairs(names) do
+    local col = (i - 1) % cols
+    local row = math.floor((i - 1) / cols)
+    local x, y = 1 + col * ENT_CELL_W, y0 + row
     if y > h then break end
-    screen.write(x, y, item.e.online and "\7" or "x", item.e.online and colors.lime or colors.red)
-    local ageStr = formatAge(item.age)
-    local nameW = ENT_W - 1 - #ageStr - 2
-    local name = item.name:sub(1, math.max(1, nameW))
-    local nameField = " " .. name .. string.rep(" ", math.max(0, nameW - #name)) .. " "
-    screen.write(x + 1, y, nameField, colors.white)
-    screen.write(x + 1 + #nameField, y, ageStr, colors.gray)
+
+    local e = entities[n]
+    screen.write(x, y, e.online and "\7 " or "x ", e.online and colors.lime or colors.red)
+    local padName = (n .. string.rep(" ", math.max(1, 14 - #n))):sub(1, 14)
+    screen.write(x + 2, y, padName, colors.white)
+    local tag = ("[%s] v:%s"):format(e.kind or "?", updater.getShortVer(e.version))
+    screen.write(x + 16, y, tag:sub(1, ENT_CELL_W - 16), colors.lightGray)
   end
 end
 
@@ -386,20 +378,20 @@ end
 -- paint their first frame immediately (Screen.tick() only redraws when
 -- dirty/due, and a freshly registered view doesn't draw itself until the
 -- first tick) so a monitor isn't left blank until the next throttled pass.
-if monScreen then
-  monScreen.registerView("main", { draw = drawEntities })
-  monScreen.show("main")
-  monScreen.tick()
+if statusMonScreen then
+  statusMonScreen.registerView("main", { draw = drawStatus })
+  statusMonScreen.show("main")
+  statusMonScreen.tick()
 end
 if logMonScreen then
   logMonScreen.registerView("main", { draw = drawActionLog })
   logMonScreen.show("main")
   logMonScreen.tick()
 end
-if debugMonScreen then
-  debugMonScreen.registerView("main", { draw = drawDebug })
-  debugMonScreen.show("main")
-  debugMonScreen.tick()
+if entMonScreen then
+  entMonScreen.registerView("main", { draw = drawEntities })
+  entMonScreen.show("main")
+  entMonScreen.tick()
 end
 
 --------------------------------------------------------------------
@@ -769,7 +761,7 @@ local function handle(id, msg)
                    action = msg.action, args = msg.args, from = id })
       send(id, { type = "ack", of = "command" })
       logAction(("[%s] %s -> %s(%s)"):format(
-        requester, msg.entity, msg.action, tostring(msg.args ~= nil and msg.args or "")))
+        requester, msg.entity, msg.action, fmtArg(msg.args)))
     else
       send(id, { type = "error", of = "command",
                  reason = "unknown or offline entity: " .. tostring(msg.entity) })
@@ -778,8 +770,8 @@ local function handle(id, msg)
     end
 
   elseif msg.type == "cmdResult" then
-    termScreen.banner(("Result [%s]: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
-    logAction(("%s result: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result)), msg.error ~= nil)
+    termScreen.banner(("Result [%s]: %s"):format(tostring(msg.entity), fmtArg(msg.error or msg.result)), msg.error ~= nil)
+    logAction(("%s result: %s"):format(tostring(msg.entity), fmtArg(msg.error or msg.result)), msg.error ~= nil)
 
   elseif msg.type == "heartbeat" then
     touch(msg.entity)
@@ -855,9 +847,9 @@ while true do
 
   if dirty and t >= nextRedraw then
     local redrawT0 = now()
-    if monScreen then monScreen.markDirty(); monScreen.tick() end
+    if statusMonScreen then statusMonScreen.markDirty(); statusMonScreen.tick() end
     if logMonScreen then logMonScreen.markDirty(); logMonScreen.tick() end
-    if debugMonScreen then debugMonScreen.markDirty(); debugMonScreen.tick() end
+    if entMonScreen then entMonScreen.markDirty(); entMonScreen.tick() end
     local redrawMs = (now() - redrawT0) * 1000
     stats.lastRedrawMs = redrawMs
     if redrawMs > stats.maxRedrawMs then stats.maxRedrawMs = redrawMs end

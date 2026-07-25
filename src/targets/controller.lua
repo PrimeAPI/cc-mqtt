@@ -46,6 +46,7 @@ local termScreen
 --[[@include lib/updater.lua as Updater]]
 --[[@include lib/screen.lua as Screen]]
 --[[@include lib/util.lua as Util]]
+--[[@include lib/monitor.lua as Monitor]]
 
 local updater = Updater.new({ scriptName = "controller.lua" })
 
@@ -519,10 +520,8 @@ end
 local function drawMonitor(screen)
   local w, h = screen.size()
 
-  local title = (" cbus automation controller #%d"):format(os.getComputerID())
-  local statusStr = broker and (" [ONLINE] rules:%d "):format(#rules) or " [OFFLINE] "
-  local pad = math.max(0, w - #title - #statusStr)
-  screen.row(1, title .. string.rep(" ", pad) .. statusStr, colors.white, colors.blue)
+  local statusStr = broker and ("[ONLINE] rules:%d"):format(#rules) or "[OFFLINE]"
+  screen.header(statusStr)
 
   screen.row(2, " AUTOMATION RULES & TRIGGERS", colors.yellow, colors.gray)
 
@@ -591,10 +590,10 @@ local function drawMonitor(screen)
   end
 end
 
--- Double-buffered like the terminal console below (see src/lib/screen.lua)
--- - no screensaver/idle view, since a monitor is a passive display someone
+-- Double-buffered, with the standard header (see src/lib/monitor.lua) -
+-- no screensaver/idle view, since a monitor is a passive display someone
 -- in the world might be looking at any time.
-local monScreen = mon and Screen.new(mon, {})
+local monScreen = mon and Monitor.new(mon, { title = ("cbus controller #%d"):format(os.getComputerID()) })
 if monScreen then
   monScreen.registerView("main", { draw = drawMonitor })
   monScreen.show("main")
