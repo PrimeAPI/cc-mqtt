@@ -349,6 +349,10 @@ local function drawStatus(screen)
   stat("Loop ms", ("%d (max %d)"):format(math.floor(stats.lastIterMs), math.floor(stats.maxIterMs)),
     stats.maxIterMs > 500 and colors.red or colors.lime)
   stat("Update", ("%s (v:%s)"):format(updater.status, updater.getShortVer(updater.currentVersion)))
+  stat("Next Check", Util.formatDuration(updater.secondsUntilNextCheck()))
+  stat("Last Checked", updater.lastCheckedAt
+    and (Util.formatDuration((os.epoch("utc") - updater.lastCheckedAt) / 1000) .. " ago")
+    or "never")
   -- only shown while an update is actually pending (see updater.lua's
   -- notePendingTag) - clears itself back to nothing once applied, since
   -- the broker reboots right after anyway

@@ -231,6 +231,17 @@ function Updater.new(opts)
     end
   end
 
+  -- os.epoch("utc") of the last time a check against GitHub actually
+  -- resolved a definitive answer (current tag vs. latest tag), whether
+  -- that came from the "release" stage or a "fallback" stage that still
+  -- learned the real tag - as opposed to merely being attempted. A
+  -- rate-limited/failed/timed-out check does NOT move this. In-memory
+  -- only, like updateDetectedAt above - a routine check reoccurs every
+  -- updateTick regardless of a reboot, so nothing is lost by not
+  -- persisting it. Used by a status monitor to show "last successful
+  -- check" alongside self.secondsUntilNextCheck()'s "next check" timer.
+  self.lastCheckedAt = nil
+
   -- Short status word for a terminal/monitor header line, plus a full
   -- message printed to the console log. Checks used to fail completely
   -- silently, which made "http blocked" and "not due yet" indistinguishable.
@@ -584,6 +595,7 @@ function Updater.new(opts)
         return
       end
       notePendingTag(tagName)
+      self.lastCheckedAt = os.epoch("utc")
       if tagName == self.currentVersion then
         self.status = "up to date"
         state = nil
@@ -657,6 +669,7 @@ function Updater.new(opts)
       -- stage may simply succeed next time.
       local version = state.tagName
       state = nil
+      if version then self.lastCheckedAt = os.epoch("utc") end
       if not version then
         self.status = "check failed"
         debugPrint("fallback content fetched, but no real release tag was ever learned - not applying (would require a made-up version), will retry")
