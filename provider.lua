@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v5 | commit 7d739e9 | built 2026-07-25T00:16:03Z
+-- cc-mqtt provider.lua | release dev | commit c04f427 | built 2026-07-25T00:29:55Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus provider  --  multi-device edition
@@ -1098,7 +1098,44 @@ function Updater.new(opts)
   -- below would then silently no-op on every future call, including every
   -- later periodic tick. This bounds how long an in-flight check is
   -- trusted before checkNow() treats it as abandoned and starts fresh.
-  local STATE_TIMEOUT = 20
+  --
+  -- 60s, not the 20s this started at: the releases/latest API response is a
+  -- few KB of JSON and consistently resolves quickly, but both the release
+  -- asset AND the raw-content fallback - the two paths that actually
+  -- transfer a full ~50-80KB compiled script - have been observed timing
+  -- out with literally no response at all, on a server where the small
+  -- JSON request never has trouble. That pattern (small = fine, large =
+  -- hangs) looks like a slow/throttled connection to GitHub's content-CDN
+  -- hosts rather than either host being actively blocked (a real block
+  -- fails fast, it doesn't hang silently for 20+ seconds) - so it's worth
+  -- giving a genuinely-slow-but-succeeding transfer more room to finish
+  -- before this gives up on it.
+  local STATE_TIMEOUT = 60
+  -- A failed/timed-out check is quite possibly transient (exactly the kind
+  -- of slow-connection hiccup STATE_TIMEOUT above is guarding against) -
+  -- retrying soon costs nothing extra against GitHub's rate limit (still
+  -- well under 60 requests/hour even retrying every 30s) and means a
+  -- transient failure recovers in under a minute instead of making the
+  -- user wait out a full, unrelated updateTick (routine-check interval,
+  -- e.g. 300s) to find out whether trying again would just have worked.
+  local FAILURE_RETRY = 30
+  local updateTick = opts.updateTick or 300
+  -- Due immediately, staggered by computer ID - a whole fleet of computers
+  -- rebooting together (e.g. after a server restart) shouldn't all burst
+  -- their first ROUTINE recheck in the same second once up and running.
+  -- The very first check (explicitly fired by the caller at startup, not
+  -- by this schedule) is intentionally NOT staggered - "always check on
+  -- startup" - this only affects when the next one after that is due.
+  local nextCheckAt = os.getComputerID() % updateTick
+
+  local function scheduleNext()
+    nextCheckAt = os.clock() + (self.status == "check failed" and FAILURE_RETRY or updateTick)
+  end
+
+  -- For a terminal/monitor countdown display, e.g. "Update: 42s".
+  function self.secondsUntilNextCheck()
+    return math.max(0, math.floor(nextCheckAt - os.clock()))
+  end
 
   local function applyUpdate(version, code)
     local target = shell and shell.getRunningProgram() or "startup.lua"
@@ -1165,20 +1202,7 @@ function Updater.new(opts)
       self.status = "check failed"
       print(("[Updater] %s check failed: %s"):format(stage, reason))
       state = nil
-    end
-  end
-
-  -- Cheap enough to call on every single main-loop iteration (a clock read
-  -- and maybe a comparison) - and needs to be, since checkNow() itself is
-  -- only invoked every UPDATE_TICK by the caller's own periodic timer
-  -- (up to 300s). Without a separate, frequently-polled watchdog, a stuck
-  -- state would only ever get noticed - and cleared - the next time
-  -- checkNow() happened to run, which could be minutes away. Calling this
-  -- every iteration instead means a hang is noticed within STATE_TIMEOUT
-  -- regardless of how far off the next scheduled check is.
-  function self.tick()
-    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
-      handleFailure("timed out, no response")
+      scheduleNext()
     end
   end
 
@@ -1195,12 +1219,29 @@ function Updater.new(opts)
       end
       return
     end
-    self.tick()
     if state then return end -- already checking
     self.status = "checking"
     state = { stage = "release", url = releaseUrl() }
     stateStartedAt = os.clock()
     http.request(state.url, nil, HTTP_HEADERS)
+  end
+
+  -- Cheap enough to call on every single main-loop iteration (a clock read
+  -- and maybe a comparison), and meant to be - it's now the ONLY thing
+  -- driving routine/retry checks (see nextCheckAt/scheduleNext above), a
+  -- target no longer needs its own "if t >= nextUpdate" timer block at
+  -- all, just this one call every iteration plus one checkNow() at
+  -- startup. Also the stuck-request watchdog: without a separate,
+  -- frequently-polled check like this, a hung request would only ever be
+  -- noticed - and cleared - the next time a check happened to run, which
+  -- without this could be minutes away.
+  function self.tick()
+    if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
+      handleFailure("timed out, no response")
+    end
+    if not state and http and os.clock() >= nextCheckAt then
+      self.checkNow()
+    end
   end
 
   -- fed http_success/http_failure events from the caller's main loop.
@@ -1226,6 +1267,7 @@ function Updater.new(opts)
       if tagName == self.currentVersion then
         self.status = "up to date"
         state = nil
+        scheduleNext()
         return
       end
       self.status = "updating"
@@ -1265,6 +1307,7 @@ function Updater.new(opts)
         self.status = "check failed"
         print("[Updater] fallback response looked invalid")
         state = nil
+        scheduleNext()
         return
       end
       local etag = headers and (headers["ETag"] or headers["etag"] or headers["Etag"])
@@ -1273,9 +1316,10 @@ function Updater.new(opts)
       state = nil
       if version == self.currentVersion then
         self.status = "up to date"
+        scheduleNext()
       else
         self.status = "updating"
-        applyUpdate(version, code)
+        applyUpdate(version, code) -- reboots, does not return
       end
     end
   end
@@ -1290,7 +1334,11 @@ function Updater.new(opts)
     if not http then
       return false, "http disabled"
     end
-    timeoutSec = timeoutSec or 10
+    -- Same 60s reasoning as STATE_TIMEOUT above: the release-metadata
+    -- request is small and fast, but the asset/fallback requests transfer
+    -- a full compiled script and have been observed needing much longer
+    -- than a short timeout allows on a slow/throttled connection.
+    timeoutSec = timeoutSec or 60
 
     local function awaitHttp(url)
       http.request(url, nil, HTTP_HEADERS)
@@ -1346,17 +1394,12 @@ end
 return Updater
 end)()
 
--- GitHub's unauthenticated API allows 60 requests/hour - PER SOURCE IP, and
--- every CC:Tweaked computer on this Minecraft server shares the server's
--- one outbound IP. At the old 60s tick, just 2 always-running scripts
--- checking in parallel already exceeds that budget, so most checks were
--- silently rate-limited and falling back to fetching main's raw file by
--- BRANCH name - which lags behind GitHub's raw-content CDN by several
--- minutes. 300s cuts total request volume 5x; the computer-ID-based
--- stagger applied to nextUpdate below spreads checks across that window
--- instead of every computer bursting at once.
-local UPDATE_TICK = 300
-
+-- Routine re-check cadence, retry-after-failure backoff, and the
+-- computer-ID stagger that keeps a whole fleet of computers from bursting
+-- GitHub requests in the same second are all handled internally by the
+-- updater module now (see nextCheckAt/scheduleNext in src/lib/updater.lua)
+-- - updater.tick(), called every main-loop iteration below, is the only
+-- thing needed to drive it.
 local updater = Updater.new({ scriptName = "provider.lua" })
 
 -- Bare pcall(updater.xxx, ...) silently discards its error result - a bug
@@ -1562,9 +1605,6 @@ local nextPub = 0
 -- delay entering the loop itself (see the startup section for why that
 -- matters for the update checker too).
 local nextAnn = 0
--- staggered by computer ID so a whole fleet of computers doesn't burst
--- its GitHub requests in the same second and blow the shared rate limit
-local nextUpdate = os.clock() + (os.getComputerID() % UPDATE_TICK)
 
 -- Devices are polled one at a time, round-robin, instead of all in one
 -- synchronous burst every INTERVAL. Every peripheral call here is a real
@@ -1622,7 +1662,7 @@ local function redrawTerminal()
 
   local pushCd = math.max(0, math.floor((nextPub - os.clock()) * 10) / 10)
   local annCd  = math.max(0, math.floor(nextAnn - os.clock()))
-  local updCd  = math.max(0, math.floor(nextUpdate - os.clock()))
+  local updCd  = updater.secondsUntilNextCheck()
 
   if viewMode == "LIST" then
     term.setCursorPos(1, 1)
@@ -2030,11 +2070,8 @@ while true do
     safeUpdaterCall(updater.handleHttp, ev[1], ev[2], ev[3])
   end
 
-  -- Runs every iteration (cheap - a clock read, maybe a comparison),
-  -- unlike checkNow() itself which only fires every UPDATE_TICK. Without
-  -- this, a check that gets stuck (see updater.tick()'s own comment)
-  -- would only be noticed - and cleared - the next time checkNow()
-  -- happened to run, which could be minutes away.
+  -- Drives all update-check scheduling (routine checks, failure retries,
+  -- stuck-request recovery) - see updater.tick()'s own comment.
   safeUpdaterCall(updater.tick)
 
   local t = os.clock()
@@ -2057,12 +2094,6 @@ while true do
     nextAnn = t + ANNOUNCE
     dirty = true
   end
-  if t >= nextUpdate then
-    nextUpdate = t + UPDATE_TICK
-    safeUpdaterCall(updater.checkNow)
-    dirty = true
-  end
-
   -- the console only gets redrawn if it's actually open - a provider
   -- computer nobody is standing at doesn't need term I/O recomputed on
   -- every publish cycle (which, with several devices, can be several
