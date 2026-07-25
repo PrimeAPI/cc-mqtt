@@ -1,4 +1,4 @@
--- cc-mqtt controller.lua | release dev | commit 6d46e0a | built 2026-07-25T00:15:51Z
+-- cc-mqtt controller.lua | release v5 | commit 7d739e9 | built 2026-07-25T00:16:03Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus controller  --  automation & control server for CC:Tweaked

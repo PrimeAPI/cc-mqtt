@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release dev | commit 6d46e0a | built 2026-07-25T00:15:51Z
+-- cc-mqtt broker.lua | release v5 | commit 7d739e9 | built 2026-07-25T00:16:03Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 --------------------------------------------------------------------
 -- cbus broker  --  MQTT-like broker for CC:Tweaked (with interactive browser)
