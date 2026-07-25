@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release v23 | commit b64c20f | built 2026-07-25T21:14:52Z
+-- cc-mqtt broker.lua | release v24 | commit ebe5719 | built 2026-07-25T22:50:52Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -108,14 +108,13 @@ local function escapePattern(s)
   return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
 end
 
--- Parses a releases/latest API response body. Returns tagName, assetUrl,
--- checksum (checksum may be nil if the release body didn't have a parsable
--- line for this script - that's not fatal, see stage "asset" above).
-local function parseReleaseResponse(raw, scriptName)
-  local data = textutils.unserializeJSON(raw)
-  if type(data) ~= "table" or type(data.tag_name) ~= "string" or type(data.assets) ~= "table" then
-    return nil
-  end
+-- Extracts (assetUrl, checksum) for one script name out of an
+-- already-decoded releases/latest response body - split out of
+-- parseReleaseResponse below so a caller that needs info for MULTIPLE
+-- script names (the broker relaying update info to the rest of the
+-- fleet, see opts.relayFor) can decode the JSON once and call this once
+-- per name, instead of re-decoding the same body per name.
+local function assetInfoFromData(data, scriptName)
   local assetUrl
   for _, a in ipairs(data.assets) do
     if type(a) == "table" and a.name == scriptName then
@@ -127,6 +126,19 @@ local function parseReleaseResponse(raw, scriptName)
   if type(data.body) == "string" then
     checksum = data.body:match(escapePattern(scriptName) .. ":%s*(%x+)")
   end
+  return assetUrl, checksum
+end
+
+-- Parses a releases/latest API response body. Returns tagName, assetUrl,
+-- checksum (checksum may be nil if the release body didn't have a parsable
+-- line for this script - that's not fatal, see stage "asset" above).
+local function parseReleaseResponse(raw, scriptName)
+  local data = textutils.unserializeJSON(raw)
+  if type(data) ~= "table" or type(data.tag_name) ~= "string" or type(data.assets) ~= "table" then
+    return nil
+  end
+  local assetUrl, checksum = assetInfoFromData(data, scriptName)
+  if not assetUrl then return nil end
   return data.tag_name, assetUrl, checksum
 end
 
@@ -171,6 +183,13 @@ function Updater.new(opts)
   local repoName    = opts.repoName or "cc-mqtt"
   local repoBranch  = opts.repoBranch or "main"
   local versionFile = opts.versionFile or ".version"
+  -- Only ever set by the broker: the other script names it should also
+  -- extract asset/checksum info for on every successful release check, so
+  -- it can relay "vNN is out, here's your asset URL + checksum" to the
+  -- rest of the fleet over rednet instead of every computer hitting
+  -- GitHub's rate-limited releases/latest endpoint itself. See
+  -- self.relayInfo / self.getRelayInfo below.
+  local relayFor = opts.relayFor
 
   self.currentVersion = "dev"
   if fs.exists(versionFile) then
@@ -186,6 +205,38 @@ function Updater.new(opts)
   -- silently, which made "http blocked" and "not due yet" indistinguishable.
   self.status = "never checked"
   local httpDisabledWarned = false
+
+  -- Populated after every successful "release"-stage response, when
+  -- relayFor is set - {tagName, scripts = {[scriptName] = {assetUrl,
+  -- checksum}, ...}}. nil until the first successful check. See
+  -- handleHttp()'s "release" stage below for where this gets filled in.
+  self.relayInfo = nil
+
+  function self.getRelayInfo(name)
+    return self.relayInfo and self.relayInfo.scripts and self.relayInfo.scripts[name]
+      and { tagName = self.relayInfo.tagName,
+            assetUrl = self.relayInfo.scripts[name].assetUrl,
+            checksum = self.relayInfo.scripts[name].checksum }
+      or nil
+  end
+
+  -- os.clock() timestamp of the last time this target heard update info
+  -- from a broker (via its announce/subscribe ack), whether or not that
+  -- ack actually carried a new version - just hearing from a relay-capable
+  -- broker at all is enough to suppress this target's own direct GitHub
+  -- polling, see self.tick() below.
+  local lastRelaySeenAt = nil
+  function self.noteRelaySeen()
+    lastRelaySeenAt = os.clock()
+  end
+
+  -- How long to keep trusting a broker's relay before falling back to
+  -- checking GitHub directly again - comfortably above the 15s
+  -- announce/resubscribe cadence every target already runs on, so a live
+  -- broker's relay always arrives well before this expires, while losing
+  -- the broker for longer than this self-heals back to today's
+  -- direct-check behavior with no version negotiation needed.
+  local RELAY_GRACE = 60
 
   -- { stage = "release"|"asset"|"fallback", url, tagName, checksum }
   local state = nil
@@ -349,6 +400,28 @@ function Updater.new(opts)
     end
   end
 
+  -- Fast-path applied when a broker's ack carries {tagName, assetUrl,
+  -- checksum} instead of this target having queried GitHub's
+  -- releases/latest itself - skips straight to the "asset" stage (the
+  -- checksum-verified download itself is CDN traffic, not subject to
+  -- api.github.com's rate limit, so only the small releases/latest lookup
+  -- needed centralizing on the broker). Declared here, after `state`/
+  -- `stateStartedAt`/REQUEST_TIMEOUT are already in scope as locals -
+  -- same reason checkNow/tick/handleHttp all live below that point too.
+  function self.applyFromRelay(tagName, assetUrl, checksum)
+    if not http then return end
+    if state then return end -- already checking
+    if not tagName or tagName == self.currentVersion then
+      self.status = "up to date"
+      return
+    end
+    self.status = "updating"
+    print(("[Updater] New version relayed by broker (%s -> %s)!"):format(getShortVer(self.currentVersion), getShortVer(tagName)))
+    state = { stage = "asset", url = assetUrl, tagName = tagName, checksum = checksum }
+    stateStartedAt = os.clock()
+    httpRequest(state.url, nil, REQUEST_TIMEOUT)
+  end
+
   function self.checkNow()
     if not http then
       self.status = "http disabled"
@@ -382,7 +455,15 @@ function Updater.new(opts)
     if state and stateStartedAt and (os.clock() - stateStartedAt) > STATE_TIMEOUT then
       handleFailure("timed out, no response")
     end
-    if not state and http and os.clock() >= nextCheckAt then
+    -- relayFor is only set on the broker's own Updater instance - it must
+    -- always keep checking GitHub directly, since it's the one thing every
+    -- other target's relay ultimately depends on. Every other target only
+    -- self-checks when it hasn't heard from a relaying broker recently
+    -- (see self.noteRelaySeen/RELAY_GRACE above) - this is what actually
+    -- cuts the fleet-wide request volume against GitHub's shared-IP rate
+    -- limit, while still self-healing if the broker goes away.
+    local dueForOwnCheck = relayFor or not lastRelaySeenAt or (os.clock() - lastRelaySeenAt) > RELAY_GRACE
+    if not state and http and dueForOwnCheck and os.clock() >= nextCheckAt then
       self.checkNow()
     end
   end
@@ -439,7 +520,25 @@ function Updater.new(opts)
         nextCheckAt = os.clock() + waitSec
         return
       end
-      local tagName, assetUrl, checksum = parseReleaseResponse(raw, scriptName)
+      local data = textutils.unserializeJSON(raw)
+      local tagName, assetUrl, checksum
+      if type(data) == "table" and type(data.tag_name) == "string" and type(data.assets) == "table" then
+        tagName = data.tag_name
+        assetUrl, checksum = assetInfoFromData(data, scriptName)
+        if not assetUrl then tagName = nil end -- no asset for our own script - same as an unparsed response
+        -- Populated on every successful check, own-version-changed or not
+        -- - other targets may well be behind even when the broker itself
+        -- is up to date, so this can't be gated behind the up-to-date
+        -- early return just below.
+        if relayFor and tagName then
+          local scripts = {}
+          for _, name in ipairs(relayFor) do
+            local rAssetUrl, rChecksum = assetInfoFromData(data, name)
+            if rAssetUrl then scripts[name] = { assetUrl = rAssetUrl, checksum = rChecksum } end
+          end
+          self.relayInfo = { tagName = tagName, scripts = scripts }
+        end
+      end
       if not tagName then
         debugPrint("release response didn't parse as expected (bad JSON, or no matching asset for %s)", scriptName)
         startFallback()
@@ -1101,6 +1200,20 @@ function Util.fmtUnit(n, unit, forceSign)
   return sign .. num .. " " .. prefix .. (unit or "")
 end
 
+-- Compact duration: 45 -> "45s", 750 -> "12m30s", 5400 -> "1h30m". Used for
+-- both "last seen Ns ago" style ages and forecast ETAs (see subscriber.lua's
+-- gauge-field forecast rendering), which is why hours are handled too -
+-- an ETA can run much longer than anything else in this codebase times.
+function Util.formatDuration(seconds)
+  if type(seconds) ~= "number" or seconds ~= seconds then return "?" end
+  seconds = math.max(0, math.floor(seconds))
+  if seconds < 60 then return seconds .. "s" end
+  if seconds < 3600 then
+    return ("%dm%02ds"):format(math.floor(seconds / 60), seconds % 60)
+  end
+  return ("%dh%02dm"):format(math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+end
+
 -- Sorted, de-duplicated keys across any number of tables - the
 -- "an entity might be known from live telemetry, the broker's registry,
 -- or both" merge every target with more than one entity cache needed at
@@ -1363,7 +1476,31 @@ local entMonScreen    = entMon and Monitor.new(entMon, { title = "cbus entities"
 -- updater module now (see nextCheckAt/scheduleNext in src/lib/updater.lua)
 -- - updater.tick(), called every main-loop iteration below, is the only
 -- thing needed to drive it.
-local updater = Updater.new({ scriptName = "broker.lua" })
+-- relayFor: the broker is the only computer in the fleet that checks
+-- GitHub's releases/latest directly on a routine schedule - every other
+-- target instead learns "vNN is out, here's your asset URL + checksum"
+-- from the broker's announce/subscribe ack (see relayInfoForKind() and
+-- its two call sites below) and suppresses its own direct polling while
+-- that keeps arriving (src/lib/updater.lua's RELAY_GRACE). This is what
+-- keeps the fleet under GitHub's 60-req/hour-per-IP limit regardless of
+-- how many providers/subscribers/controllers are running - they all share
+-- this server's one outbound IP.
+local RELAY_SCRIPTS = { "broker.lua", "provider.lua", "subscriber.lua", "controller.lua", "tablet.lua" }
+local updater = Updater.new({ scriptName = "broker.lua", relayFor = RELAY_SCRIPTS })
+
+-- Every entity kind maps 1:1 onto the script that produces it (see
+-- handle()'s "announce"/"subscribe" branches below for where kind comes
+-- from) - so the broker can look up relay info by kind without needing a
+-- separate scriptName field on the wire.
+local KIND_TO_SCRIPT = {
+  provider = "provider.lua", subscriber = "subscriber.lua",
+  controller = "controller.lua", tablet = "tablet.lua",
+}
+
+local function relayInfoForKind(kind)
+  local scriptName = KIND_TO_SCRIPT[kind]
+  return scriptName and updater.getRelayInfo(scriptName) or nil
+end
 
 local function now() return os.clock() end
 local bootTime = now()
@@ -1993,7 +2130,7 @@ local function handle(id, msg)
       lastSeen = now(),
       online = true,
     }
-    send(id, { type = "ack", of = "announce" })
+    send(id, { type = "ack", of = "announce", update = relayInfoForKind(msg.kind or "provider") })
 
   elseif msg.type == "publish" then
     if msg.entity then
@@ -2035,7 +2172,7 @@ local function handle(id, msg)
     -- which all send this same message shape - "subscriber" is only a
     -- fallback for an older client that predates the field existing.
     entities[name] = { id = id, kind = msg.kind or "subscriber", version = msg.version or "dev", lastSeen = now(), online = true }
-    send(id, { type = "ack", of = "subscribe" })
+    send(id, { type = "ack", of = "subscribe", update = relayInfoForKind(msg.kind or "subscriber") })
     for topic, m in pairs(retained) do
       for _, pat in ipairs(subs[id].patterns) do
         if topicMatches(pat, topic) then send(id, m) break end
