@@ -1,4 +1,4 @@
--- cc-mqtt subscriber.lua | release v28 | commit 4b48ce4 | built 2026-07-25T23:48:15Z
+-- cc-mqtt subscriber.lua | release v29 | commit ae083c6 | built 2026-07-26T12:15:20Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -2245,7 +2245,9 @@ end
 
 -- regenerates panel placement + group titles from scratch; keeps any
 -- per-panel field selections (matched by entity name) and leaves
--- manually placed buttons/titles/lines untouched
+-- manually placed titles/lines untouched. Buttons are NOT left alone -
+-- they're folded into the grouping/packing below same as panels, since
+-- auto-layout is expected to reposition/resize them like everything else.
 local HGAP = 1              -- horizontal gap between panels on a shelf
 local STRETCH_MAX_W = 44     -- don't let a single panel get absurdly wide
 
@@ -2273,40 +2275,89 @@ local function distributeShelfWidths(shelf, W, gap)
   end
 end
 
-local function autoLayout()
+-- Auto-layout is a wizard, not a one-shot regen:
+--   1. buildAutoLayoutPlan() sizes every panel from what it actually has
+--      to show (panelSize(), unchanged) and groups entities - and any
+--      buttons you've placed - by guessGroup().
+--   2. autoLayoutReviewScreen() (below, once pickList/prompt exist) shows
+--      that plan and lets you rename groups, move panels/buttons between
+--      them, and add empty groups - nothing on the monitor changes yet.
+--   3. applyAutoLayoutPlan() only runs once you confirm, and does the
+--      actual shelf-packing + save.
+local function buildAutoLayoutPlan()
+  local plan = { order = {}, groups = {}, nextId = 1 }
+
+  local function newGroup(label)
+    local id = plan.nextId
+    plan.nextId = id + 1
+    plan.groups[id] = { id = id, label = label, panels = {}, buttons = {} }
+    plan.order[#plan.order + 1] = id
+    return plan.groups[id]
+  end
+
+  local byKey = {}
+  local function groupForKey(key)
+    if not byKey[key] then byKey[key] = newGroup(titleCase(key)) end
+    return byKey[key]
+  end
+
+  local entNames = {}
+  for name in pairs(cfg.entities) do entNames[#entNames + 1] = name end
+  table.sort(entNames)
+  for _, name in ipairs(entNames) do
+    if cfg.entities[name].enabled then
+      table.insert(groupForKey(guessGroup(name)).panels, name)
+    end
+  end
+
+  for _, item in ipairs(cfg.layout) do
+    if item.type == "button" then
+      local key = (item.entity and item.entity ~= "") and guessGroup(item.entity) or "misc"
+      table.insert(groupForKey(key).buttons, item)
+    end
+  end
+
+  table.sort(plan.order, function(a, b) return plan.groups[a].label < plan.groups[b].label end)
+  return plan
+end
+
+local function resortGroupOrder(plan)
+  table.sort(plan.order, function(a, b) return plan.groups[a].label < plan.groups[b].label end)
+end
+
+-- sized the same way a button is sized when first created ('k' in
+-- layoutScreen): wide enough for its label, fixed height
+local function buttonSize(item)
+  local label = item.label or item.action or "?"
+  return math.max(10, #label + 4), 3
+end
+
+local function applyAutoLayoutPlan(plan)
   local oldFields = {}
   for _, item in ipairs(cfg.layout) do
     if item.type == "panel" and item.fields then oldFields[item.entity] = item.fields end
   end
 
+  -- panels and buttons are entirely re-derived from the plan below;
+  -- only manually placed titles/lines survive untouched
   local kept = {}
   for _, item in ipairs(cfg.layout) do
-    if item.type ~= "panel" and not item.autoGroup then
+    if item.type == "line" or (item.type == "title" and not item.autoGroup) then
       kept[#kept + 1] = item
     end
   end
-
-  local groups, groupOrder = {}, {}
-  for name, c in pairs(cfg.entities) do
-    if c.enabled then
-      local g = guessGroup(name)
-      if not groups[g] then groups[g] = {} groupOrder[#groupOrder + 1] = g end
-      groups[g][#groups[g] + 1] = name
-    end
-  end
-  table.sort(groupOrder)
-  for _, list in pairs(groups) do table.sort(list) end
 
   local W, H = mon.getSize()
   local cursorY = 1 + STATUS_ROWS
   local newItems = {}
   local GAP = 1
 
-  for _, g in ipairs(groupOrder) do
-    local list = groups[g]
-    if #list > 0 then
+  for _, gid in ipairs(plan.order) do
+    local g = plan.groups[gid]
+    local count = #g.panels + #g.buttons
+    if count > 0 then
       newItems[#newItems + 1] = {
-        type = "title", text = ("%s (%d)"):format(titleCase(g), #list),
+        type = "title", text = ("%s (%d)"):format(g.label, count),
         x = 1, y = cursorY, w = W, h = 1, autoGroup = true,
       }
       cursorY = cursorY + 1
@@ -2315,25 +2366,41 @@ local function autoLayout()
         if #shelf == 0 then return end
         distributeShelfWidths(shelf, W, HGAP)
         for _, it in ipairs(shelf) do
-          local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
-          if oldFields[it.name] then item.fields = oldFields[it.name] end
-          newItems[#newItems + 1] = item
+          if it.kind == "panel" then
+            local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
+            if oldFields[it.name] then item.fields = oldFields[it.name] end
+            newItems[#newItems + 1] = item
+          else
+            local item = it.ref
+            item.x, item.y, item.w, item.h = it.x, cursorY, it.w, shelfH
+            item.autoGroup = true
+            newItems[#newItems + 1] = item
+          end
         end
         cursorY = cursorY + shelfH + GAP
       end
 
-      local shelf, usedW, shelfH = {}, 0, 0
-      for _, name in ipairs(list) do
+      local cells = {}
+      for _, name in ipairs(g.panels) do
         local w, h = panelSize(name)
-        local addW = (#shelf == 0) and w or (HGAP + w)
+        cells[#cells + 1] = { kind = "panel", name = name, w = w, h = h }
+      end
+      for _, item in ipairs(g.buttons) do
+        local w, h = buttonSize(item)
+        cells[#cells + 1] = { kind = "button", ref = item, w = w, h = h }
+      end
+
+      local shelf, usedW, shelfH = {}, 0, 0
+      for _, cell in ipairs(cells) do
+        local addW = (#shelf == 0) and cell.w or (HGAP + cell.w)
         if #shelf > 0 and usedW + addW > W then
           flushShelf(shelf, shelfH)
           shelf, usedW, shelfH = {}, 0, 0
-          addW = w
+          addW = cell.w
         end
-        shelf[#shelf + 1] = { name = name, w = w, h = h }
+        shelf[#shelf + 1] = cell
         usedW = usedW + addW
-        shelfH = math.max(shelfH, h)
+        shelfH = math.max(shelfH, cell.h)
       end
       flushShelf(shelf, shelfH)
       cursorY = cursorY + 1
@@ -2425,7 +2492,13 @@ local function pickList(title, items, allowCustom, colorFn, currentValue)
       if v == currentValue then sel = i break end
     end
   end
-  setupDraw = function(scr)
+  -- setupDraw is a single upvalue shared by every setup-mode screen (see
+  -- the docstring above setupScreen's declaration) - each screen that owns
+  -- it keeps its own draw closure in a local (myDraw here) and restores
+  -- setupDraw = myDraw right before every redraw it triggers, so returning
+  -- from a nested screen (e.g. pickList's own "<custom...>" prompt) can
+  -- never leave a stale closure behind for this screen to render.
+  local function myDraw(scr)
     local w, h = scr.size()
     scr.row(1, title, colors.yellow)
     scr.row(2, string.rep("-", w), colors.gray)
@@ -2444,7 +2517,7 @@ local function pickList(title, items, allowCustom, colorFn, currentValue)
     end
     scr.row(h, "up/down:sel enter:pick b:cancel", colors.lightGray)
   end
-  local function draw() setupRedraw() end
+  local function draw() setupDraw = myDraw setupRedraw() end
 
   draw()
   while true do
@@ -2480,7 +2553,7 @@ local function entityScreen()
   local sel, offset = 1, 0
   local nextReg = 0   -- deadline-based, immune to swallowed timer events
 
-  setupDraw = function(scr)
+  local function myDraw(scr)
     local w, h = scr.size()
     scr.row(1, "cbus setup - entities", colors.yellow)
     scr.row(2, string.rep("-", w), colors.gray)
@@ -2509,7 +2582,7 @@ local function entityScreen()
     scr.row(h - 1, "space: toggle  r: rename  enter: layout editor", colors.lightGray)
     scr.row(h, "q: save & exit setup", colors.lightGray)
   end
-  local function draw() setupRedraw() end
+  local function draw() setupDraw = myDraw setupRedraw() end
 
   draw()
   while true do
@@ -2569,7 +2642,7 @@ end
 
 -- interactive move/resize of one item, live on the monitor
 local function editItem(item)
-  setupDraw = function(scr)
+  local function myDraw(scr)
     local w, h = scr.size()
     scr.row(1, "editing: " .. itemLabel(item), colors.yellow)
     scr.row(2, string.rep("-", w), colors.gray)
@@ -2578,7 +2651,7 @@ local function editItem(item)
     scr.row(7, "a/d: width -/+   w/s: height -/+", colors.lightGray)
     scr.row(h, "enter: done", colors.lightGray)
   end
-  local function drawTerm() setupRedraw() end
+  local function drawTerm() setupDraw = myDraw setupRedraw() end
   local function drawMon()
     clearMonitor()
     renderAll(item)
@@ -2711,7 +2784,7 @@ local function fieldsScreen(item)
     cf.graph = not cf.graph or nil
   end
 
-  setupDraw = function(scr)
+  local function myDraw(scr)
     local w, h = scr.size()
     scr.row(1, "fields: " .. entityTitle(item.entity), colors.yellow)
     scr.row(2, string.rep("-", w), colors.gray)
@@ -2745,7 +2818,7 @@ local function fieldsScreen(item)
     scr.row(h - 1, "spc:toggle f:fcst g:graph c:+calc x:del r:reset", colors.lightGray)
     scr.row(h, "enter/b: back", colors.lightGray)
   end
-  local function drawTerm() setupRedraw() end
+  local function drawTerm() setupDraw = myDraw setupRedraw() end
 
   local function drawMon()
     clearMonitor()
@@ -2863,11 +2936,178 @@ local function editItemProperties(item)
   end
 end
 
+--------------------------------------------------------------------
+-- auto-layout review: shows the grouping buildAutoLayoutPlan() came up
+-- with and lets the user fix it up (rename groups, move panels/buttons
+-- between groups, add empty groups) before anything on the monitor
+-- actually changes - applyAutoLayoutPlan() only runs once confirmed.
+--------------------------------------------------------------------
+local function autoLayoutPlanRows(plan)
+  local rows = {}
+  for _, gid in ipairs(plan.order) do
+    local g = plan.groups[gid]
+    rows[#rows + 1] = { kind = "group", gid = gid }
+    for _, name in ipairs(g.panels) do
+      rows[#rows + 1] = { kind = "panel", gid = gid, entity = name }
+    end
+    for _, item in ipairs(g.buttons) do
+      rows[#rows + 1] = { kind = "button", gid = gid, item = item }
+    end
+  end
+  return rows
+end
+
+local function removeRowFromGroup(plan, row)
+  local g = plan.groups[row.gid]
+  if row.kind == "panel" then
+    for i, name in ipairs(g.panels) do
+      if name == row.entity then table.remove(g.panels, i) break end
+    end
+  elseif row.kind == "button" then
+    for i, item in ipairs(g.buttons) do
+      if item == row.item then table.remove(g.buttons, i) break end
+    end
+  end
+end
+
+local function moveRowToGroup(plan, row, targetGid)
+  removeRowFromGroup(plan, row)
+  local g = plan.groups[targetGid]
+  if row.kind == "panel" then
+    table.insert(g.panels, row.entity)
+  else
+    table.insert(g.buttons, row.item)
+  end
+end
+
+local function addPlanGroup(plan, label)
+  local id = plan.nextId
+  plan.nextId = id + 1
+  plan.groups[id] = { id = id, label = label, panels = {}, buttons = {} }
+  plan.order[#plan.order + 1] = id
+  return id
+end
+
+-- returns true if the plan was confirmed & applied, false if cancelled
+local function autoLayoutReviewScreen(plan)
+  local sel, offset = 1, 0
+
+  local function myDraw(scr)
+    local w, h = scr.size()
+    scr.row(1, "cbus setup - auto-layout groups", colors.yellow)
+    scr.row(2, string.rep("-", w), colors.gray)
+    local rows = autoLayoutPlanRows(plan)
+    if sel > #rows then sel = math.max(1, #rows) end
+    local listH = h - 5
+    if sel - offset > listH then offset = sel - listH end
+    if sel - offset < 1 then offset = sel - 1 end
+    for i = 1, listH do
+      local idx = i + offset
+      local row = rows[idx]
+      if not row then break end
+      local line
+      if row.kind == "group" then
+        local g = plan.groups[row.gid]
+        line = ("%s (%d)"):format(g.label, #g.panels + #g.buttons)
+      elseif row.kind == "panel" then
+        local pw, ph = panelSize(row.entity)
+        line = ("   panel  %s (%dx%d)"):format(entityTitle(row.entity), pw, ph)
+      else
+        line = ("   button %s"):format(row.item.label or row.item.action or "?")
+      end
+      if idx == sel then
+        scr.row(2 + i, line, colors.black, colors.yellow)
+      else
+        scr.row(2 + i, line, row.kind == "group" and colors.cyan or colors.white)
+      end
+    end
+    if #rows == 0 then scr.row(4, "nothing to lay out - enable some entities first", colors.gray) end
+    scr.row(h - 2, "enter: rename group / move item   n: new group", colors.lightGray)
+    scr.row(h - 1, "x: dissolve group into misc", colors.lightGray)
+    scr.row(h, "c: confirm & apply    b: cancel", colors.lightGray)
+  end
+  local function draw() setupDraw = myDraw setupRedraw() end
+
+  draw()
+  while true do
+    os.startTimer(1)   -- guaranteed wake-up, see runDisplay
+    local ev = { os.pullEvent() }
+    local rows = autoLayoutPlanRows(plan)
+
+    if ev[1] == "key" then
+      local k = ev[2]
+      if k == keys.up then sel = math.max(1, sel - 1) draw()
+      elseif k == keys.down then sel = math.min(math.max(1, #rows), sel + 1) draw()
+      elseif k == keys.enter then
+        local row = rows[sel]
+        if row and row.kind == "group" then
+          local name = prompt("group name: ", plan.groups[row.gid].label)
+          if name ~= "" then
+            plan.groups[row.gid].label = name
+            resortGroupOrder(plan)
+          end
+          draw()
+        elseif row then
+          local labels = {}
+          for _, gid in ipairs(plan.order) do labels[#labels + 1] = plan.groups[gid].label end
+          local choice = pickList("move to group:", labels, true, nil, plan.groups[row.gid].label)
+          if choice then
+            local targetGid = nil
+            for _, gid in ipairs(plan.order) do
+              if plan.groups[gid].label == choice then targetGid = gid break end
+            end
+            targetGid = targetGid or addPlanGroup(plan, choice)
+            moveRowToGroup(plan, row, targetGid)
+            resortGroupOrder(plan)
+          end
+          draw()
+        end
+      end
+    elseif ev[1] == "char" then
+      local c = ev[2]
+      if c == "n" then
+        local name = prompt("new group name: ", "")
+        if name ~= "" then
+          addPlanGroup(plan, name)
+          resortGroupOrder(plan)
+        end
+        draw()
+      elseif c == "x" then
+        local row = rows[sel]
+        if row and row.kind == "group" and #plan.order > 1 then
+          local miscGid = nil
+          for _, gid in ipairs(plan.order) do
+            if gid ~= row.gid and plan.groups[gid].label:lower() == "misc" then miscGid = gid break end
+          end
+          miscGid = miscGid or addPlanGroup(plan, "Misc")
+          local g = plan.groups[row.gid]
+          for _, name in ipairs(g.panels) do table.insert(plan.groups[miscGid].panels, name) end
+          for _, item in ipairs(g.buttons) do table.insert(plan.groups[miscGid].buttons, item) end
+          for i, gid in ipairs(plan.order) do
+            if gid == row.gid then table.remove(plan.order, i) break end
+          end
+          plan.groups[row.gid] = nil
+          resortGroupOrder(plan)
+        end
+        draw()
+      elseif c == "c" then
+        applyAutoLayoutPlan(plan)
+        return true
+      elseif c == "b" then
+        return false
+      end
+    elseif ev[1] == "rednet_message" and ev[4] == PROTOCOL then
+      pcall(handleNet, ev[3])
+      draw()
+    end
+  end
+end
+
 local function layoutScreen()
   ensurePanels()
   local sel, offset = 1, 0
 
-  setupDraw = function(scr)
+  local function myDraw(scr)
     local w, h = scr.size()
     local W, H = mon.getSize()
     scr.row(1, ("cbus setup - layout (monitor %dx%d)"):format(W, H), colors.yellow)
@@ -2894,7 +3134,7 @@ local function layoutScreen()
     scr.row(h - 1, "t:title l:line k:button f:fields", colors.lightGray)
     scr.row(h, "g:auto-layout b:back q:save&exit", colors.lightGray)
   end
-  local function draw() setupRedraw() end
+  local function draw() setupDraw = myDraw setupRedraw() end
 
   local function preview(withSel)
     clearMonitor()
@@ -2999,7 +3239,11 @@ local function layoutScreen()
               pcall(handleNet, ev2[3])
             end
           end
-          autoLayout()
+          -- size + group first, then let the user review/fix the
+          -- grouping; applyAutoLayoutPlan() (the actual repack + save)
+          -- only runs if autoLayoutReviewScreen() returns confirmed
+          local plan = buildAutoLayoutPlan()
+          autoLayoutReviewScreen(plan)
         end
         draw()
         preview(true)

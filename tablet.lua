@@ -1,4 +1,4 @@
--- cc-mqtt tablet.lua | release v28 | commit 4b48ce4 | built 2026-07-25T23:48:15Z
+-- cc-mqtt tablet.lua | release v29 | commit ae083c6 | built 2026-07-26T12:15:20Z
 -- Generated from src/targets/tablet.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------

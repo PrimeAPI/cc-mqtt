@@ -1,4 +1,4 @@
--- cc-mqtt controller.lua | release v28 | commit 4b48ce4 | built 2026-07-25T23:48:15Z
+-- cc-mqtt controller.lua | release v29 | commit ae083c6 | built 2026-07-26T12:15:20Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -2117,9 +2117,17 @@ local function wizardPhaseTitle(w)
   local p = w.phase
   if p == "cond_entity" or p == "cond_prop" or p == "cond_op" then
     return ("Condition %d"):format(#w.conditions + 1)
+  elseif p == "cond_edit" then
+    return ("Edit Condition %d"):format(w.editCondIndex or 0)
   elseif p == "action_entity" or p == "action_name" or p == "action_args" then
+    if w.editActionIndex then
+      return ("Edit Action %d"):format(w.editActionIndex)
+    end
     return ("Action %d"):format(#w.actions + 1)
   elseif p == "else_entity" or p == "else_name" or p == "else_args" then
+    if w.editElseActionIndex then
+      return ("Edit Else Action %d"):format(w.editElseActionIndex)
+    end
     return ("Else Action %d"):format(#w.elseActionsList + 1)
   end
   return WIZARD_PHASE_TITLES[p] or p
@@ -2150,12 +2158,15 @@ local function startWizard(existingRuleIndex)
       conditions = { { raw = r.condition or "" } },
       joiners = {},
       curCond = newCondClause(),
+      editCondIndex = nil,
       mode = r.mode or "edge",
       actions = actionsCopy,
       curAction = { entity = "", action = "", args = "" },
+      editActionIndex = nil,
       hasElse = not not (r.elseActions and #r.elseActions > 0),
       elseActionsList = elseCopy,
       curElseAction = { entity = "", action = "", args = "" },
+      editElseActionIndex = nil,
       inputBuffer = r.name or r.id or "",
       listScroll = 0,
     }
@@ -2167,12 +2178,15 @@ local function startWizard(existingRuleIndex)
       conditions = {},
       joiners = {},
       curCond = newCondClause(),
+      editCondIndex = nil,
       mode = "edge",
       actions = {},
       curAction = { entity = "", action = "", args = "" },
+      editActionIndex = nil,
       hasElse = false,
       elseActionsList = {},
       curElseAction = { entity = "", action = "", args = "" },
+      editElseActionIndex = nil,
       inputBuffer = "",
       listScroll = 0,
     }
@@ -2407,16 +2421,36 @@ local function drawWizard(screen)
     screen.write(1, 11, ("For %s.%s, e.g. >20, ==true, ==RUNNING:"):format(wizardData.curCond.ent, wizardData.curCond.prop), colors.yellow)
     screen.write(1, 12, wizardData.inputBuffer .. "_", colors.white)
 
+  elseif wizardData.phase == "cond_edit" then
+    screen.write(1, 5, ("Edit Condition %d text:"):format(wizardData.editCondIndex or 0), colors.white)
+    screen.write(1, 7, "Any valid rule expression, e.g. reactor1.fillPercent > 50", colors.gray)
+    screen.write(1, 9, "Cond: ", colors.yellow)
+    screen.write(7, 9, wizardData.inputBuffer .. "_", colors.white)
+
   elseif wizardData.phase == "cond_more" then
-    screen.write(1, 5, "Condition so far:", colors.cyan)
-    local condPreview = buildConditionString(wizardData.conditions, wizardData.joiners)
-    screen.write(1, 6, (condPreview ~= "" and condPreview or "(none)"):sub(1, w), colors.white)
+    screen.write(1, 5, "Conditions so far:", colors.cyan)
+    local y = 6
+    for i, c in ipairs(wizardData.conditions) do
+      if y >= 10 then break end
+      if i > 1 then
+        screen.write(1, y, ("   %s"):format((wizardData.joiners[i - 1] or "and"):upper()), colors.gray)
+        y = y + 1
+      end
+      screen.write(1, y, (" %d. %s"):format(i, condClauseToString(c)):sub(1, w), colors.white)
+      y = y + 1
+    end
+    if #wizardData.conditions == 0 then
+      screen.write(1, y, " (none)", colors.gray)
+      y = y + 1
+    end
 
-    screen.write(1, 8, "[1] No  - Continue to Execution Mode", colors.lime)
-    screen.write(1, 9, "[2] Yes - AND another condition (all must be true)", colors.lime)
-    screen.write(1, 10, "[3] Yes - OR another condition (either can be true)", colors.lime)
+    y = y + 1
+    screen.write(1, y, "[1] No  - Continue to Execution Mode", colors.lime); y = y + 1
+    screen.write(1, y, "[2] Yes - AND another condition (all must be true)", colors.lime); y = y + 1
+    screen.write(1, y, "[3] Yes - OR another condition (either can be true)", colors.lime); y = y + 1
 
-    screen.write(1, 12, "Press 1, 2, or 3.", colors.yellow)
+    y = y + 1
+    screen.write(1, y, "Press 1, 2, or 3. Type e1 to edit #1, d1 to delete #1.", colors.yellow)
 
   elseif wizardData.phase == "mode" then
     screen.write(1, 5, "Select Execution Mode:", colors.white)
@@ -2434,7 +2468,8 @@ local function drawWizard(screen)
     screen.write(12, 11, buildConditionString(wizardData.conditions, wizardData.joiners):sub(1, w - 11), colors.cyan)
 
   elseif wizardData.phase == "action_entity" then
-    local prefix = ("Action %d: "):format(#wizardData.actions + 1)
+    local prefix = wizardData.editActionIndex and ("Edit Action %d: "):format(wizardData.editActionIndex)
+      or ("Action %d: "):format(#wizardData.actions + 1)
     screen.write(1, 5, prefix, colors.cyan)
     screen.write(1 + #prefix, 5, "Select Action Target Entity:", colors.white)
 
@@ -2449,7 +2484,8 @@ local function drawWizard(screen)
     screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "action_name" then
-    local prefix = ("Action %d: "):format(#wizardData.actions + 1)
+    local prefix = wizardData.editActionIndex and ("Edit Action %d: "):format(wizardData.editActionIndex)
+      or ("Action %d: "):format(#wizardData.actions + 1)
     screen.write(1, 5, prefix, colors.cyan)
     screen.write(1 + #prefix, 5, "Select Method for " .. wizardData.curAction.entity .. ":", colors.white)
 
@@ -2469,7 +2505,8 @@ local function drawWizard(screen)
     screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "action_args" then
-    local prefix = ("Action %d: "):format(#wizardData.actions + 1)
+    local prefix = wizardData.editActionIndex and ("Edit Action %d: "):format(wizardData.editActionIndex)
+      or ("Action %d: "):format(#wizardData.actions + 1)
     screen.write(1, 5, prefix, colors.cyan)
     screen.write(1 + #prefix, 5, "Arguments (math/units/string):", colors.white)
 
@@ -2487,11 +2524,15 @@ local function drawWizard(screen)
       screen.write(1, y, (" %d. %s"):format(i, actionToString(a)):sub(1, w), colors.white)
       y = y + 1
     end
+    if #wizardData.actions == 0 then
+      screen.write(1, y, " (none)", colors.gray)
+      y = y + 1
+    end
 
     screen.write(1, 10, "[1] No  - Continue", colors.lime)
     screen.write(1, 11, "[2] Yes - Add another action to fire at the same time", colors.lime)
 
-    screen.write(1, 13, "Press 1 or 2.", colors.yellow)
+    screen.write(1, 13, "Press 1 or 2. Type e1 to edit #1, d1 to delete #1.", colors.yellow)
 
   elseif wizardData.phase == "else_prompt" then
     screen.write(1, 5, "Configure Else Actions (when condition is false)?", colors.white)
@@ -2500,7 +2541,8 @@ local function drawWizard(screen)
     screen.write(1, 10, "Press 1 or 2.", colors.yellow)
 
   elseif wizardData.phase == "else_entity" then
-    local prefix = ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
+    local prefix = wizardData.editElseActionIndex and ("Edit Else Action %d: "):format(wizardData.editElseActionIndex)
+      or ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
     screen.write(1, 5, prefix, colors.cyan)
     screen.write(1 + #prefix, 5, "Target Entity:", colors.white)
 
@@ -2515,7 +2557,8 @@ local function drawWizard(screen)
     screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "else_name" then
-    local prefix = ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
+    local prefix = wizardData.editElseActionIndex and ("Edit Else Action %d: "):format(wizardData.editElseActionIndex)
+      or ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
     screen.write(1, 5, prefix, colors.cyan)
     screen.write(1 + #prefix, 5, "Method for " .. wizardData.curElseAction.entity .. ":", colors.white)
 
@@ -2535,7 +2578,8 @@ local function drawWizard(screen)
     screen.write(1 + #prompt, promptY, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "else_args" then
-    local prefix = ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
+    local prefix = wizardData.editElseActionIndex and ("Edit Else Action %d: "):format(wizardData.editElseActionIndex)
+      or ("Else Action %d: "):format(#wizardData.elseActionsList + 1)
     screen.write(1, 5, prefix, colors.cyan)
     screen.write(1 + #prefix, 5, "Arguments:", colors.white)
 
@@ -2553,16 +2597,25 @@ local function drawWizard(screen)
       screen.write(1, y, (" %d. %s"):format(i, actionToString(a)):sub(1, w), colors.white)
       y = y + 1
     end
+    if #wizardData.elseActionsList == 0 then
+      screen.write(1, y, " (none)", colors.gray)
+      y = y + 1
+    end
 
     screen.write(1, 10, "[1] No  - Finish and save rule", colors.lime)
     screen.write(1, 11, "[2] Yes - Add another else action", colors.lime)
 
-    screen.write(1, 13, "Press 1 or 2.", colors.yellow)
+    screen.write(1, 13, "Press 1 or 2. Type e1 to edit #1, d1 to delete #1.", colors.yellow)
   end
 
-  local ctrlStr = WIZARD_LIST_PHASES[wizardData.phase]
-    and " [Up/Down]Scroll [Enter]Next [Tab]Cancel"
-    or " [Enter]Next Step [Tab]Cancel Wizard"
+  local ctrlStr
+  if WIZARD_LIST_PHASES[wizardData.phase] then
+    ctrlStr = " [Up/Down]Scroll [Enter]Next [Tab]Cancel"
+  elseif wizardData.phase == "cond_more" or wizardData.phase == "action_more" or wizardData.phase == "else_more" then
+    ctrlStr = " [Enter]Next Step  e#=Edit d#=Delete  [Tab]Cancel"
+  else
+    ctrlStr = " [Enter]Next Step [Tab]Cancel Wizard"
+  end
   drawFooter(screen, w, h, ctrlStr)
 end
 
@@ -2698,15 +2751,47 @@ local function handleWizardInput(val)
     wizardData.inputBuffer = ""
 
   elseif phase == "cond_more" then
-    if val == "2" or val:lower() == "and" then
+    local editNum = tonumber(val:match("^[Ee](%d+)$") or "")
+    local delNum = tonumber(val:match("^[Dd](%d+)$") or "")
+    if editNum then
+      if wizardData.conditions[editNum] then
+        wizardData.editCondIndex = editNum
+        wizardData.inputBuffer = condClauseToString(wizardData.conditions[editNum])
+        wizardData.phase = "cond_edit"
+      else
+        wizardData.inputBuffer = ""
+      end
+    elseif delNum then
+      -- refuse to delete the last remaining clause: an empty condition
+      -- string fails safeEval() every evaluation tick and permanently
+      -- parks the rule in ERR status
+      if wizardData.conditions[delNum] and #wizardData.conditions > 1 then
+        table.remove(wizardData.conditions, delNum)
+        if #wizardData.joiners > 0 then
+          table.remove(wizardData.joiners, math.min(delNum, #wizardData.joiners))
+        end
+      end
+      wizardData.inputBuffer = ""
+    elseif val == "2" or val:lower() == "and" then
       table.insert(wizardData.joiners, "and")
       wizardData.phase = "cond_entity"
+      wizardData.inputBuffer = ""
     elseif val == "3" or val:lower() == "or" then
       table.insert(wizardData.joiners, "or")
       wizardData.phase = "cond_entity"
+      wizardData.inputBuffer = ""
     else
       wizardData.phase = "mode"
+      wizardData.inputBuffer = ""
     end
+
+  elseif phase == "cond_edit" then
+    local n = wizardData.editCondIndex
+    if n and wizardData.conditions[n] and val ~= "" then
+      wizardData.conditions[n] = { raw = val }
+    end
+    wizardData.editCondIndex = nil
+    wizardData.phase = "cond_more"
     wizardData.inputBuffer = ""
 
   elseif phase == "mode" then
@@ -2727,7 +2812,7 @@ local function handleWizardInput(val)
       wizardData.curAction.entity = val
     end
     wizardData.phase = "action_name"
-    wizardData.inputBuffer = ""
+    wizardData.inputBuffer = wizardData.editActionIndex and (wizardData.curAction.action or "") or ""
 
   elseif phase == "action_name" then
     local acts = getDiscoveredActionsFor(wizardData.curAction.entity)
@@ -2742,13 +2827,35 @@ local function handleWizardInput(val)
 
   elseif phase == "action_args" then
     wizardData.curAction.args = val
-    table.insert(wizardData.actions, wizardData.curAction)
+    if wizardData.editActionIndex then
+      wizardData.actions[wizardData.editActionIndex] = wizardData.curAction
+      wizardData.editActionIndex = nil
+    else
+      table.insert(wizardData.actions, wizardData.curAction)
+    end
     wizardData.curAction = { entity = "", action = "", args = "" }
     wizardData.phase = "action_more"
     wizardData.inputBuffer = ""
 
   elseif phase == "action_more" then
-    if val == "2" or val:lower() == "y" or val:lower() == "yes" then
+    local editNum = tonumber(val:match("^[Ee](%d+)$") or "")
+    local delNum = tonumber(val:match("^[Dd](%d+)$") or "")
+    if editNum then
+      local a = wizardData.actions[editNum]
+      if a then
+        wizardData.editActionIndex = editNum
+        wizardData.curAction = { entity = a.entity, action = a.action, args = a.args }
+        wizardData.phase = "action_entity"
+        wizardData.inputBuffer = a.entity or ""
+      else
+        wizardData.inputBuffer = ""
+      end
+    elseif delNum then
+      if wizardData.actions[delNum] then
+        table.remove(wizardData.actions, delNum)
+      end
+      wizardData.inputBuffer = ""
+    elseif val == "2" or val:lower() == "y" or val:lower() == "yes" then
       wizardData.phase = "action_entity"
       wizardData.inputBuffer = ""
     else
@@ -2775,7 +2882,7 @@ local function handleWizardInput(val)
       wizardData.curElseAction.entity = val
     end
     wizardData.phase = "else_name"
-    wizardData.inputBuffer = ""
+    wizardData.inputBuffer = wizardData.editElseActionIndex and (wizardData.curElseAction.action or "") or ""
 
   elseif phase == "else_name" then
     local acts = getDiscoveredActionsFor(wizardData.curElseAction.entity)
@@ -2790,14 +2897,36 @@ local function handleWizardInput(val)
 
   elseif phase == "else_args" then
     wizardData.curElseAction.args = val
-    table.insert(wizardData.elseActionsList, wizardData.curElseAction)
+    if wizardData.editElseActionIndex then
+      wizardData.elseActionsList[wizardData.editElseActionIndex] = wizardData.curElseAction
+      wizardData.editElseActionIndex = nil
+    else
+      table.insert(wizardData.elseActionsList, wizardData.curElseAction)
+    end
     wizardData.curElseAction = { entity = "", action = "", args = "" }
     wizardData.hasElse = true
     wizardData.phase = "else_more"
     wizardData.inputBuffer = ""
 
   elseif phase == "else_more" then
-    if val == "2" or val:lower() == "y" or val:lower() == "yes" then
+    local editNum = tonumber(val:match("^[Ee](%d+)$") or "")
+    local delNum = tonumber(val:match("^[Dd](%d+)$") or "")
+    if editNum then
+      local a = wizardData.elseActionsList[editNum]
+      if a then
+        wizardData.editElseActionIndex = editNum
+        wizardData.curElseAction = { entity = a.entity, action = a.action, args = a.args }
+        wizardData.phase = "else_entity"
+        wizardData.inputBuffer = a.entity or ""
+      else
+        wizardData.inputBuffer = ""
+      end
+    elseif delNum then
+      if wizardData.elseActionsList[delNum] then
+        table.remove(wizardData.elseActionsList, delNum)
+      end
+      wizardData.inputBuffer = ""
+    elseif val == "2" or val:lower() == "y" or val:lower() == "yes" then
       wizardData.phase = "else_entity"
       wizardData.inputBuffer = ""
     else
