@@ -829,6 +829,26 @@ local WIZARD_LIST_PHASES = {
   else_entity = true, else_name = true,
 }
 
+-- Numbered menu phases ("[1] ... [2] ... [3] ..."): pressing a digit key
+-- submits immediately, no Enter needed, as long as nothing's been typed
+-- yet this phase (see wizardOnChar) - matches what the menu actually
+-- looks like instead of silently requiring "type digit, then Enter" with
+-- no visual feedback either way. Once something IS typed (e.g. the "e" of
+-- an "e1" edit command), digits go back to being ordinary characters so
+-- multi-digit indices like "e12" still work.
+local WIZARD_MENU_PHASES = {
+  cond_more = true, action_more = true, else_more = true,
+  mode = true, else_prompt = true,
+}
+
+-- cond_op's "[1] > ... [6] != ..." menu is a shortcut for typing the
+-- operator symbol itself, not a full submit - the threshold still needs
+-- to be typed after it - so a fresh digit press there inserts the symbol
+-- into the input buffer instead of calling handleWizardInput().
+local COND_OP_DIGIT_SHORTCUTS = {
+  ["1"] = ">", ["2"] = "<", ["3"] = ">=", ["4"] = "<=", ["5"] = "==", ["6"] = "!=",
+}
+
 -- Draws a numbered option list from `startY` up to (excluding) `maxY`,
 -- with a trailing "type custom" entry, honoring wizardData.listScroll so
 -- lists longer than the available rows can be scrolled into view instead
@@ -1008,8 +1028,9 @@ local function drawWizard(screen)
     screen.write(1, 8, "[3] >= (Greater/Equal)  [4] <= (Less/Equal)", colors.lime)
     screen.write(1, 9, "[5] == (Equal to)       [6] != (Not Equal)", colors.lime)
 
-    screen.write(1, 11, ("For %s.%s, e.g. >20, ==true, ==RUNNING:"):format(wizardData.curCond.ent, wizardData.curCond.prop), colors.yellow)
-    screen.write(1, 12, wizardData.inputBuffer .. "_", colors.white)
+    screen.write(1, 11, ("For %s.%s - press 1-6 to insert the symbol, then type the value:"):format(wizardData.curCond.ent, wizardData.curCond.prop):sub(1, w), colors.yellow)
+    screen.write(1, 12, "Cond: ", colors.yellow)
+    screen.write(7, 12, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "cond_edit" then
     screen.write(1, 5, ("Edit Condition %d text:"):format(wizardData.editCondIndex or 0), colors.white)
@@ -1040,7 +1061,10 @@ local function drawWizard(screen)
     screen.write(1, y, "[3] Yes - OR another condition (either can be true)", colors.lime); y = y + 1
 
     y = y + 1
-    screen.write(1, y, "Press 1, 2, or 3. Type e1 to edit #1, d1 to delete #1.", colors.yellow)
+    screen.write(1, y, "Press 1/2/3 now, or type e1/d1 + Enter to edit/delete #1:", colors.yellow)
+    y = y + 1
+    screen.write(1, y, "Cmd: ", colors.yellow)
+    screen.write(6, y, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "mode" then
     screen.write(1, 5, "Select Execution Mode:", colors.white)
@@ -1122,7 +1146,9 @@ local function drawWizard(screen)
     screen.write(1, 10, "[1] No  - Continue", colors.lime)
     screen.write(1, 11, "[2] Yes - Add another action to fire at the same time", colors.lime)
 
-    screen.write(1, 13, "Press 1 or 2. Type e1 to edit #1, d1 to delete #1.", colors.yellow)
+    screen.write(1, 13, "Press 1/2 now, or type e1/d1 + Enter to edit/delete #1:", colors.yellow)
+    screen.write(1, 14, "Cmd: ", colors.yellow)
+    screen.write(6, 14, wizardData.inputBuffer .. "_", colors.white)
 
   elseif wizardData.phase == "else_prompt" then
     screen.write(1, 5, "Configure Else Actions (when condition is false)?", colors.white)
@@ -1195,14 +1221,16 @@ local function drawWizard(screen)
     screen.write(1, 10, "[1] No  - Finish and save rule", colors.lime)
     screen.write(1, 11, "[2] Yes - Add another else action", colors.lime)
 
-    screen.write(1, 13, "Press 1 or 2. Type e1 to edit #1, d1 to delete #1.", colors.yellow)
+    screen.write(1, 13, "Press 1/2 now, or type e1/d1 + Enter to edit/delete #1:", colors.yellow)
+    screen.write(1, 14, "Cmd: ", colors.yellow)
+    screen.write(6, 14, wizardData.inputBuffer .. "_", colors.white)
   end
 
   local ctrlStr
   if WIZARD_LIST_PHASES[wizardData.phase] then
     ctrlStr = " [Up/Down]Scroll [Enter]Next [Tab]Cancel"
   elseif wizardData.phase == "cond_more" or wizardData.phase == "action_more" or wizardData.phase == "else_more" then
-    ctrlStr = " [Enter]Next Step  e#=Edit d#=Delete  [Tab]Cancel"
+    ctrlStr = " [1/2/3]Pick now   [Enter]Submit typed cmd   [Tab]Cancel"
   else
     ctrlStr = " [Enter]Next Step [Tab]Cancel Wizard"
   end
@@ -1655,9 +1683,19 @@ end
 local function wizardOnChar(screen, ev)
   if not wizardData then return end
   local ch = ev[2]
-  if ch and #ch == 1 then
-    wizardData.inputBuffer = wizardData.inputBuffer .. ch
+  if not (ch and #ch == 1) then return end
+
+  if WIZARD_MENU_PHASES[wizardData.phase] and wizardData.inputBuffer == "" and ch:match("%d") then
+    handleWizardInput(ch)
+    return
   end
+
+  if wizardData.phase == "cond_op" and wizardData.inputBuffer == "" and COND_OP_DIGIT_SHORTCUTS[ch] then
+    wizardData.inputBuffer = COND_OP_DIGIT_SHORTCUTS[ch]
+    return
+  end
+
+  wizardData.inputBuffer = wizardData.inputBuffer .. ch
 end
 
 -- The local terminal console only costs anything while it's actually
