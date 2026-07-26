@@ -1043,47 +1043,75 @@ local function applyAutoLayoutPlan(plan)
       }
       cursorY = cursorY + 1
 
-      local function flushShelf(shelf, shelfH)
+      -- panels: shelf-packed and stretched to fill the row (unchanged) -
+      -- more info is worth the extra space
+      local function flushPanelShelf(shelf, shelfH)
         if #shelf == 0 then return end
         distributeShelfWidths(shelf, W, HGAP)
         for _, it in ipairs(shelf) do
-          if it.kind == "panel" then
-            local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
-            if oldFields[it.name] then item.fields = oldFields[it.name] end
-            newItems[#newItems + 1] = item
-          else
-            local item = it.ref
-            item.x, item.y, item.w, item.h = it.x, cursorY, it.w, shelfH
-            item.autoGroup = true
-            newItems[#newItems + 1] = item
-          end
+          local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
+          if oldFields[it.name] then item.fields = oldFields[it.name] end
+          newItems[#newItems + 1] = item
         end
         cursorY = cursorY + shelfH + GAP
       end
 
-      local cells = {}
+      local pshelf, pUsedW, pShelfH = {}, 0, 0
       for _, name in ipairs(g.panels) do
         local w, h = panelSize(name)
-        cells[#cells + 1] = { kind = "panel", name = name, w = w, h = h }
+        local addW = (#pshelf == 0) and w or (HGAP + w)
+        if #pshelf > 0 and pUsedW + addW > W then
+          flushPanelShelf(pshelf, pShelfH)
+          pshelf, pUsedW, pShelfH = {}, 0, 0
+          addW = w
+        end
+        pshelf[#pshelf + 1] = { name = name, w = w, h = h }
+        pUsedW = pUsedW + addW
+        pShelfH = math.max(pShelfH, h)
       end
-      for _, item in ipairs(g.buttons) do
-        local w, h = buttonSize(item)
-        cells[#cells + 1] = { kind = "button", ref = item, w = w, h = h }
+      flushPanelShelf(pshelf, pShelfH)
+
+      -- buttons: packed separately from panels, at their own natural
+      -- size - NOT stretched to fill the row width or match panel
+      -- height, that's what was making them huge. Every button in the
+      -- group shares one width (the widest label's, capped so one long
+      -- label can't blow the rest up) for a tidy grid look, and rows
+      -- wrap at that width - so narrower buttons naturally stack under
+      -- each other instead of being stretched wide to fill the shelf.
+      local function flushButtonRow(row, rowH)
+        if #row == 0 then return end
+        local x = 1
+        for _, it in ipairs(row) do
+          local item = it.ref
+          item.x, item.y, item.w, item.h = x, cursorY, it.w, it.h
+          item.autoGroup = true
+          newItems[#newItems + 1] = item
+          x = x + it.w + HGAP
+        end
+        cursorY = cursorY + rowH + GAP
       end
 
-      local shelf, usedW, shelfH = {}, 0, 0
-      for _, cell in ipairs(cells) do
-        local addW = (#shelf == 0) and cell.w or (HGAP + cell.w)
-        if #shelf > 0 and usedW + addW > W then
-          flushShelf(shelf, shelfH)
-          shelf, usedW, shelfH = {}, 0, 0
-          addW = cell.w
-        end
-        shelf[#shelf + 1] = cell
-        usedW = usedW + addW
-        shelfH = math.max(shelfH, cell.h)
+      local btnW = 0
+      for _, item in ipairs(g.buttons) do
+        btnW = math.max(btnW, (buttonSize(item)))
       end
-      flushShelf(shelf, shelfH)
+      btnW = math.min(btnW, STRETCH_MAX_W)
+
+      local brow, bUsedW, browH = {}, 0, 0
+      for _, item in ipairs(g.buttons) do
+        local _, h = buttonSize(item)
+        local addW = (#brow == 0) and btnW or (HGAP + btnW)
+        if #brow > 0 and bUsedW + addW > W then
+          flushButtonRow(brow, browH)
+          brow, bUsedW, browH = {}, 0, 0
+          addW = btnW
+        end
+        brow[#brow + 1] = { ref = item, w = btnW, h = h }
+        bUsedW = bUsedW + addW
+        browH = math.max(browH, h)
+      end
+      flushButtonRow(brow, browH)
+
       cursorY = cursorY + 1
     end
   end
@@ -1704,7 +1732,7 @@ local function autoLayoutReviewScreen(plan)
     end
     if #rows == 0 then scr.row(4, "nothing to lay out - enable some entities first", colors.gray) end
     scr.row(h - 2, "enter: rename group / move item   n: new group", colors.lightGray)
-    scr.row(h - 1, "x: dissolve group into misc", colors.lightGray)
+    scr.row(h - 1, "x: delete group (into misc if not empty)", colors.lightGray)
     scr.row(h, "c: confirm & apply    b: cancel", colors.lightGray)
   end
   local function draw() setupDraw = myDraw setupRedraw() end
@@ -1756,18 +1784,28 @@ local function autoLayoutReviewScreen(plan)
       elseif c == "x" then
         local row = rows[sel]
         if row and row.kind == "group" and #plan.order > 1 then
-          local miscGid = nil
-          for _, gid in ipairs(plan.order) do
-            if gid ~= row.gid and plan.groups[gid].label:lower() == "misc" then miscGid = gid break end
-          end
-          miscGid = miscGid or addPlanGroup(plan, "Misc")
           local g = plan.groups[row.gid]
-          for _, name in ipairs(g.panels) do table.insert(plan.groups[miscGid].panels, name) end
-          for _, item in ipairs(g.buttons) do table.insert(plan.groups[miscGid].buttons, item) end
-          for i, gid in ipairs(plan.order) do
-            if gid == row.gid then table.remove(plan.order, i) break end
+          -- an empty group has nothing to dissolve into misc - just
+          -- remove it outright instead of creating/growing a Misc group
+          -- for no reason
+          if #g.panels == 0 and #g.buttons == 0 then
+            for i, gid in ipairs(plan.order) do
+              if gid == row.gid then table.remove(plan.order, i) break end
+            end
+            plan.groups[row.gid] = nil
+          else
+            local miscGid = nil
+            for _, gid in ipairs(plan.order) do
+              if gid ~= row.gid and plan.groups[gid].label:lower() == "misc" then miscGid = gid break end
+            end
+            miscGid = miscGid or addPlanGroup(plan, "Misc")
+            for _, name in ipairs(g.panels) do table.insert(plan.groups[miscGid].panels, name) end
+            for _, item in ipairs(g.buttons) do table.insert(plan.groups[miscGid].buttons, item) end
+            for i, gid in ipairs(plan.order) do
+              if gid == row.gid then table.remove(plan.order, i) break end
+            end
+            plan.groups[row.gid] = nil
           end
-          plan.groups[row.gid] = nil
           resortGroupOrder(plan)
         end
         draw()
