@@ -85,7 +85,7 @@ listed in the release notes.
 * **Features**:
   * **Interactive Setup Mode (`startup setup`)**:
     1. **Entity Selector**: Enable/disable discovered entities and configure custom display aliases.
-    2. **Visual Layout Editor**: Reposition and resize panels directly on the monitor using WASD/arrow keys, add group headers, and insert separator lines.
+    2. **Visual Layout Editor**: Reposition and resize panels directly on the monitor using WASD/arrow keys, add group headers, and insert separator lines. `[g]` runs **Auto-Layout**: it sizes every panel to fit what it actually shows, groups entities (and any buttons you've placed) by kind, then shows an editable review screen - rename groups, move panels/buttons between them, add new groups - before packing and saving anything.
   * **Live Display**: Formats energy (FE, J), flow rates (mB/t), fluid contents, percentages, and status alerts with color coding and auto-stale warnings.
 
 ### 4. `controller.lua` — Automation & Control Server
@@ -98,7 +98,7 @@ listed in the release notes.
   * **Monitor Status & Audit Log**: Renders rule health badges (`[OK]`, `[TRIG]`, `[ACT]`, `[OFF]`, `[ERR]`, `[STALE]`) and a real-time scrolling audit log of invoked actions.
   * **Interactive Terminal TUI**:
     * `[N]`: Launch **Interactive Rule Creator Wizard** to add a new automation rule step-by-step.
-    * `[E]` / `[Enter]`: Launch **Interactive Rule Editor Wizard** to edit the selected rule.
+    * `[E]` / `[Enter]`: Launch **Interactive Rule Editor Wizard** to edit the selected rule - condition clauses and actions can each be edited or deleted in place (type `e1`/`d1` etc. next to the numbered list), not just appended to.
     * `[D]` / `[Del]`: Delete the selected rule (with `[Y]` confirmation).
     * `[Space]`: Toggle individual automation rules on/off.
     * `[T]`: Force test/trigger selected rule manually.
