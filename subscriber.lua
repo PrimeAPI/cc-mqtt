@@ -1,4 +1,4 @@
--- cc-mqtt subscriber.lua | release v33 | commit 045c099 | built 2026-07-27T21:26:48Z
+-- cc-mqtt subscriber.lua | release v34 | commit a1a1eb4 | built 2026-07-27T21:47:32Z
 -- Generated from src/targets/subscriber.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
