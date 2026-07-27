@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v31 | commit 65cee56 | built 2026-07-26T15:13:41Z
+-- cc-mqtt provider.lua | release v32 | commit 7df9a31 | built 2026-07-27T19:30:54Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -1328,6 +1328,8 @@ end)()
 -- Supported handlers:
 --   * Induction Matrix (incl. MekanismExtras tiers - matched by name)
 --   * Dynamic Tank (via Dynamic Valve) - fluids & chemicals
+--   * Chemical Tank / Fluid Tank - standalone, any tier, Mekanism or
+--       MekanismExtra (matched by name, same as Induction Matrix)
 --   * Fission Reactor (via Logic Adapter or Reactor Port)
 --       actions: activate, scram, setBurnRate + auto-scram watchdog
 --   * Industrial Turbine (Turbine Valve)
@@ -1394,6 +1396,32 @@ end
 local function isFormed(p)
   local f = tryCall(p, "isFormed")
   return f == true
+end
+
+-- Shared by the standalone Chemical Tank / Fluid Tank handlers below: both
+-- block families (any tier - basic/advanced/elite/ultimate/creative, from
+-- Mekanism or MekanismExtra) expose the same getStored/getCapacity/
+-- getFilledPercentage trio as the Dynamic Tank multiblock, just without
+-- isFormed() since they're single blocks, not a multiblock structure.
+local TANK_FIELDS = {
+  { key = "content",  label = "Content",  type = "text" },
+  { key = "percent",  label = "Fill",     type = "gauge" },
+  { key = "amount",   label = "Amount",   type = "text" },
+  { key = "capacity", label = "Capacity", type = "text" },
+}
+
+local function collectStandaloneTank(p)
+  local stored = tryCall(p, "getStored")   -- {name=..., amount=...} table
+  local cap = tryCall(p, { "getCapacity", "getTankCapacity", "getChemicalTankCapacity" })
+  local amount = (type(stored) == "table" and stored.amount) or 0
+  local pct = tryCall(p, "getFilledPercentage")
+  if pct == nil and cap and cap > 0 then pct = amount / cap end
+  return {
+    content = amount > 0 and prettyId(stored.name) or "Empty",
+    percent = pct or 0,
+    amount = fmtSI(amount, "mB"),
+    capacity = cap and fmtSI(cap, "mB") or "?",
+  }
 end
 
 --------------------------------------------------------------------
@@ -1466,6 +1494,30 @@ local HANDLERS = {
         capacity = cap and fmtSI(cap, "mB") or "?",
       }
     end,
+  },
+
+  ------------------------------------------------------------------
+  -- Standalone Chemical Tank (Basic/Advanced/Elite/Ultimate/Creative -
+  -- Mekanism or MekanismExtra tiers, matched by name like the Induction
+  -- Matrix above). Single block, not a multiblock - no isFormed() gate.
+  { id = "chemical_tank", kind = "tank", title = "Chemical Tank",
+    match = function(t) local l = t:lower()
+                        return l:find("chemical_tank") ~= nil
+                            or l:find("chemicaltank") ~= nil end,
+    fields = TANK_FIELDS,
+    collect = collectStandaloneTank,
+  },
+
+  ------------------------------------------------------------------
+  -- Standalone Fluid Tank (Basic/Advanced/Elite/Ultimate/Creative -
+  -- Mekanism or MekanismExtra tiers). Single block, not a multiblock -
+  -- no isFormed() gate.
+  { id = "fluid_tank", kind = "tank", title = "Fluid Tank",
+    match = function(t) local l = t:lower()
+                        return l:find("fluid_tank") ~= nil
+                            or l:find("fluidtank") ~= nil end,
+    fields = TANK_FIELDS,
+    collect = collectStandaloneTank,
   },
 
   ------------------------------------------------------------------
