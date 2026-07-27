@@ -9,8 +9,9 @@
 -- Supported handlers:
 --   * Induction Matrix (incl. MekanismExtras tiers - matched by name)
 --   * Dynamic Tank (via Dynamic Valve) - fluids & chemicals
---   * Chemical Tank / Fluid Tank - standalone, any tier, Mekanism or
---       MekanismExtra (matched by name, same as Induction Matrix)
+--   * Chemical Tank / Fluid Tank / Radioactive Waste Barrel - standalone,
+--       any tier, Mekanism or MekanismExtra (matched by name, same as
+--       Induction Matrix)
 --   * Fission Reactor (via Logic Adapter or Reactor Port)
 --       actions: activate, scram, setBurnRate + auto-scram watchdog
 --   * Industrial Turbine (Turbine Valve)
@@ -197,6 +198,19 @@ local HANDLERS = {
     match = function(t) local l = t:lower()
                         return l:find("fluid_tank") ~= nil
                             or l:find("fluidtank") ~= nil end,
+    fields = TANK_FIELDS,
+    collect = collectStandaloneTank,
+  },
+
+  ------------------------------------------------------------------
+  -- Radioactive Waste Barrel - stores a ChemicalStack via the same
+  -- getStored/getCapacity/getFilledPercentage API as the tanks above.
+  -- Vanilla Mekanism ships one tier; matched by name (not exact type)
+  -- so any bigger MekanismExtra barrel tier is picked up automatically.
+  { id = "waste_barrel", kind = "tank", title = "Waste Barrel",
+    match = function(t) local l = t:lower()
+                        return l:find("waste_barrel") ~= nil
+                            or l:find("wastebarrel") ~= nil end,
     fields = TANK_FIELDS,
     collect = collectStandaloneTank,
   },
