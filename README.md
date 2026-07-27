@@ -73,7 +73,7 @@ listed in the release notes.
 * **Features**:
   * **Auto-Discovery & Naming**: Scans all attached peripherals (wired or wireless). Prompts for friendly names on first detection and saves mappings to `devices.cfg`.
   * **Supported Handlers out-of-the-box**:
-    * **Mekanism**: Induction Matrix, Dynamic Tank, standalone Chemical Tank, Fluid Tank & Radioactive Waste Barrel (any tier, incl. MekanismExtra), Fission Reactor, Industrial Turbine, Thermoelectric Boiler, Fusion Reactor, Supercritical Phase Shifter (SPS), Energy Cubes.
+    * **Mekanism**: Induction Matrix, Dynamic Tank, standalone Chemical Tank, Fluid Tank, Radioactive Waste Barrel & Pressurized Tube network buffer (any tier, incl. MekanismExtra), Fission Reactor, Industrial Turbine, Thermoelectric Boiler, Fusion Reactor, Supercritical Phase Shifter (SPS), Energy Cubes.
     * **Create**: Train Station (status, train count, state).
     * **Advanced Peripherals**: Energy Detector (inline power meter).
     * **Generic Fallback**: Introspects any unhandled peripheral with `get*` and `is*` methods automatically.
@@ -254,7 +254,7 @@ The rules below are illustrative use cases only, written here to describe the ki
 
 ### Topic Structure
 * `energy/<entity_name>` — Energy storage devices (Induction Matrix, Energy Cubes)
-* `tank/<entity_name>` — Fluid and chemical tanks (Dynamic Tank, standalone Chemical/Fluid Tank, Waste Barrel)
+* `tank/<entity_name>` — Fluid and chemical tanks (Dynamic Tank, standalone Chemical/Fluid Tank, Waste Barrel, Pressurized Tube network)
 * `reactor/<entity_name>` — Fission & Fusion reactors
 * `sps/<entity_name>` — Supercritical Phase Shifter
 * `train/<entity_name>` — Create Train Stations

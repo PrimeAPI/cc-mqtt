@@ -9,9 +9,9 @@
 -- Supported handlers:
 --   * Induction Matrix (incl. MekanismExtras tiers - matched by name)
 --   * Dynamic Tank (via Dynamic Valve) - fluids & chemicals
---   * Chemical Tank / Fluid Tank / Radioactive Waste Barrel - standalone,
---       any tier, Mekanism or MekanismExtra (matched by name, same as
---       Induction Matrix)
+--   * Chemical Tank / Fluid Tank / Radioactive Waste Barrel / Pressurized
+--       Tube (chemical network buffer) - standalone, any tier, Mekanism or
+--       MekanismExtra (matched by name, same as Induction Matrix)
 --   * Fission Reactor (via Logic Adapter or Reactor Port)
 --       actions: activate, scram, setBurnRate + auto-scram watchdog
 --   * Industrial Turbine (Turbine Valve)
@@ -80,11 +80,17 @@ local function isFormed(p)
   return f == true
 end
 
--- Shared by the standalone Chemical Tank / Fluid Tank handlers below: both
--- block families (any tier - basic/advanced/elite/ultimate/creative, from
--- Mekanism or MekanismExtra) expose the same getStored/getCapacity/
--- getFilledPercentage trio as the Dynamic Tank multiblock, just without
--- isFormed() since they're single blocks, not a multiblock structure.
+-- Shared by the standalone Chemical Tank / Fluid Tank / Waste Barrel /
+-- Pressurized Tube handlers below: all of these block families (any tier -
+-- basic/advanced/elite/ultimate/creative, from Mekanism or MekanismExtra)
+-- expose the same getCapacity/getFilledPercentage pair as the Dynamic Tank
+-- multiblock, just without isFormed() since they're single blocks, not a
+-- multiblock structure. The one difference is the tanks/barrel report their
+-- own contents via getStored(), while a tube/pipe segment instead reports
+-- getBuffer() - the current contents of the WHOLE connected network, not
+-- just that one segment (Mekanism's transporter networks share one buffer
+-- across every connected tube) - tryCall tries getStored first and only
+-- falls through to getBuffer if the peripheral doesn't have getStored.
 local TANK_FIELDS = {
   { key = "content",  label = "Content",  type = "text" },
   { key = "percent",  label = "Fill",     type = "gauge" },
@@ -93,7 +99,7 @@ local TANK_FIELDS = {
 }
 
 local function collectStandaloneTank(p)
-  local stored = tryCall(p, "getStored")   -- {name=..., amount=...} table
+  local stored = tryCall(p, { "getStored", "getBuffer" })   -- {name=..., amount=...} table
   local cap = tryCall(p, { "getCapacity", "getTankCapacity", "getChemicalTankCapacity" })
   local amount = (type(stored) == "table" and stored.amount) or 0
   local pct = tryCall(p, "getFilledPercentage")
@@ -211,6 +217,25 @@ local HANDLERS = {
     match = function(t) local l = t:lower()
                         return l:find("waste_barrel") ~= nil
                             or l:find("wastebarrel") ~= nil end,
+    fields = TANK_FIELDS,
+    collect = collectStandaloneTank,
+  },
+
+  ------------------------------------------------------------------
+  -- Pressurized Tube - a chemical transport network segment (Mekanism's
+  -- gas/infuse-type/pigment/slurry pipe). Every tube in one connected
+  -- network shares a single buffer, so a modem on ANY tube segment of a
+  -- network reads that whole network's current contents/capacity via
+  -- getBuffer/getCapacity/getFilledPercentage - there is no per-segment
+  -- reading. Matched by name so any MekanismExtra tier is picked up too.
+  -- Two tube runs stay separate networks as long as they don't connect
+  -- (leave a gap/non-tube block between them, or use a Configurator:
+  -- shift-right-click the connection point between them and cycle it to
+  -- "None" to sever that link without removing the tube).
+  { id = "pressurized_tube", kind = "tank", title = "Pressurized Tube",
+    match = function(t) local l = t:lower()
+                        return l:find("pressurized_tube") ~= nil
+                            or l:find("pressurizedtube") ~= nil end,
     fields = TANK_FIELDS,
     collect = collectStandaloneTank,
   },
