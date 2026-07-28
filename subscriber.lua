@@ -2243,11 +2243,12 @@ local function panelSize(name)
   return w, h
 end
 
--- regenerates panel placement + group titles from scratch; keeps any
--- per-panel field selections (matched by entity name) and leaves
--- manually placed titles/lines untouched. Buttons are NOT left alone -
--- they're folded into the grouping/packing below same as panels, since
--- auto-layout is expected to reposition/resize them like everything else.
+-- regroups panels + buttons and regenerates group titles from scratch,
+-- but only actually re-packs placement/size for items that don't
+-- already have some (ie. genuinely new panels/buttons); anything with
+-- prior geometry keeps its exact spot, the same way per-panel field
+-- selections (matched by entity name) already survive regeneration.
+-- Manually placed titles/lines are left untouched throughout.
 local HGAP = 1              -- horizontal gap between panels on a shelf
 local STRETCH_MAX_W = 44     -- don't let a single panel get absurdly wide
 
@@ -2334,12 +2335,25 @@ end
 
 local function applyAutoLayoutPlan(plan)
   local oldFields = {}
+  -- geometry a panel/button already had gets carried forward the same
+  -- way its config does below - only items with no prior placement (ie.
+  -- genuinely new) get freshly packed, so regenerating to fold in one
+  -- new entity doesn't also fling every existing panel/button around.
+  local oldGeom = {}
+  local oldButtonGeom = {}
   for _, item in ipairs(cfg.layout) do
     if item.type == "panel" and item.fields then oldFields[item.entity] = item.fields end
+    if item.type == "panel" and item.x then
+      oldGeom[item.entity] = { x = item.x, y = item.y, w = item.w, h = item.h }
+    end
+    if item.type == "button" and item.x then
+      oldButtonGeom[item] = { x = item.x, y = item.y, w = item.w, h = item.h }
+    end
   end
 
-  -- panels and buttons are entirely re-derived from the plan below;
-  -- only manually placed titles/lines survive untouched
+  -- panels and buttons are re-derived from the plan below (regrouped,
+  -- and freshly sized/positioned if new); only manually placed
+  -- titles/lines survive untouched
   local kept = {}
   for _, item in ipairs(cfg.layout) do
     if item.type == "line" or (item.type == "title" and not item.autoGroup) then
@@ -2370,6 +2384,8 @@ local function applyAutoLayoutPlan(plan)
         for _, it in ipairs(shelf) do
           local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
           if oldFields[it.name] then item.fields = oldFields[it.name] end
+          local g2 = oldGeom[it.name]
+          if g2 then item.x, item.y, item.w, item.h = g2.x, g2.y, g2.w, g2.h end
           newItems[#newItems + 1] = item
         end
         cursorY = cursorY + shelfH + GAP
@@ -2402,7 +2418,12 @@ local function applyAutoLayoutPlan(plan)
         local x = 1
         for _, it in ipairs(row) do
           local item = it.ref
-          item.x, item.y, item.w, item.h = x, cursorY, it.w, it.h
+          local bg = oldButtonGeom[item]
+          if bg then
+            item.x, item.y, item.w, item.h = bg.x, bg.y, bg.w, bg.h
+          else
+            item.x, item.y, item.w, item.h = x, cursorY, it.w, it.h
+          end
           item.autoGroup = true
           newItems[#newItems + 1] = item
           x = x + it.w + HGAP
