@@ -1,4 +1,4 @@
--- cc-mqtt controller.lua | release v35 | commit 95c473a | built 2026-07-28T20:54:25Z
+-- cc-mqtt controller.lua | release v36 | commit 5b1e031 | built 2026-07-28T21:12:06Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
