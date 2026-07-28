@@ -875,7 +875,10 @@ local function ensurePanels()
         if item.type == "panel" and item.entity == name then found = true break end
       end
       if not found then
-        local item = { type = "panel", entity = name, x = 1, y = 1, w = 26, h = 12 }
+        -- autoDefault marks this spot as a throwaway drop, not a
+        -- deliberate placement - applyAutoLayoutPlan() must never treat
+        -- it as something worth preserving (see there for why)
+        local item = { type = "panel", entity = name, x = 1, y = 1, w = 26, h = 12, autoDefault = true }
         autoPlace(item)
         clampItem(item)
         cfg.layout[#cfg.layout + 1] = item
@@ -1027,7 +1030,11 @@ local function applyAutoLayoutPlan(plan)
   local oldButtonGeom = {}
   for _, item in ipairs(cfg.layout) do
     if item.type == "panel" and item.fields then oldFields[item.entity] = item.fields end
-    if item.type == "panel" and item.x then
+    -- autoDefault panels only ever sat wherever ensurePanels() happened to
+    -- drop them (never confirmed by a user or a prior auto-layout run) -
+    -- restoring that would just fight the fresh pack below with a
+    -- meaningless position, which is what made regenerating look broken
+    if item.type == "panel" and item.x and not item.autoDefault then
       oldGeom[item.entity] = { x = item.x, y = item.y, w = item.w, h = item.h }
     end
     if item.type == "button" and item.x then
@@ -1133,13 +1140,20 @@ local function applyAutoLayoutPlan(plan)
     end
   end
 
-  -- Opportunistically restore each panel/button's prior spot over the
-  -- freshly packed one - but ONLY where doing so doesn't overlap
-  -- anything else in the final layout (other restored items, still-fresh
-  -- items, or manually kept titles/lines). The fresh pack above is
-  -- already guaranteed overlap-free by construction, so any substitution
-  -- that fails this check is skipped and that one item just keeps its
-  -- freshly packed spot instead - never a broken/overlapping result.
+  -- Opportunistically restore each panel/button's prior deliberate spot
+  -- (never an autoDefault one, see above) over its freshly packed one -
+  -- but ONLY where doing so keeps at least the usual 1-cell gap (same
+  -- margin the fresh pack itself uses via HGAP/GAP) from everything else
+  -- in the final layout: other restored items, still-fresh items, and
+  -- manually kept titles/lines. The fresh pack above is already
+  -- guaranteed overlap-free (with proper margins) by construction, so
+  -- any substitution that fails this check is skipped and that one item
+  -- just keeps its freshly packed spot instead - never a broken,
+  -- cramped, or overlapping result.
+  local function tooClose(a, b, gap)
+    return not (a.x + a.w - 1 + gap < b.x or b.x + b.w - 1 + gap < a.x
+             or a.y + a.h - 1 + gap < b.y or b.y + b.h - 1 + gap < a.y)
+  end
   for _, item in ipairs(newItems) do
     local old = item.type == "panel" and oldGeom[item.entity]
       or item.type == "button" and oldButtonGeom[item]
@@ -1148,11 +1162,11 @@ local function applyAutoLayoutPlan(plan)
       local cand = { x = old.x, y = old.y, w = old.w, h = old.h }
       local safe = true
       for _, other in ipairs(newItems) do
-        if other ~= item and overlaps(cand, other) then safe = false break end
+        if other ~= item and tooClose(cand, other, GAP) then safe = false break end
       end
       if safe then
         for _, other in ipairs(kept) do
-          if overlaps(cand, other) then safe = false break end
+          if tooClose(cand, other, GAP) then safe = false break end
         end
       end
       if safe then item.x, item.y, item.w, item.h = cand.x, cand.y, cand.w, cand.h end
@@ -1434,6 +1448,7 @@ local function editItem(item)
       pcall(handleNet, ev[3])
     end
     if changed then
+      item.autoDefault = nil   -- user positioned it deliberately now
       clampItem(item)
       drawTerm()
       drawMon()
