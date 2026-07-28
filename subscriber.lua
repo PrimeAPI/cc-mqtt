@@ -2244,10 +2244,14 @@ local function panelSize(name)
 end
 
 -- regroups panels + buttons and regenerates group titles from scratch,
--- but only actually re-packs placement/size for items that don't
--- already have some (ie. genuinely new panels/buttons); anything with
--- prior geometry keeps its exact spot, the same way per-panel field
--- selections (matched by entity name) already survive regeneration.
+-- packing every panel/button into a fresh, guaranteed overlap-free shelf
+-- layout first - then, as a second pass, opportunistically swaps each
+-- item back to its prior placement wherever that spot is still free,
+-- the same way per-panel field selections (matched by entity name)
+-- already survive regeneration. An item only keeps its freshly packed
+-- spot when restoring the old one would overlap something else, so
+-- regenerating can never produce an overlapping layout even after
+-- several rounds of entities/groups being added, renamed or removed.
 -- Manually placed titles/lines are left untouched throughout.
 local HGAP = 1              -- horizontal gap between panels on a shelf
 local STRETCH_MAX_W = 44     -- don't let a single panel get absurdly wide
@@ -2335,10 +2339,9 @@ end
 
 local function applyAutoLayoutPlan(plan)
   local oldFields = {}
-  -- geometry a panel/button already had gets carried forward the same
-  -- way its config does below - only items with no prior placement (ie.
-  -- genuinely new) get freshly packed, so regenerating to fold in one
-  -- new entity doesn't also fling every existing panel/button around.
+  -- snapshot of geometry each panel/button had before this regen - used
+  -- below to try to restore it after the fresh pack, but only where
+  -- that's actually collision-safe (see the pass after newItems is built)
   local oldGeom = {}
   local oldButtonGeom = {}
   for _, item in ipairs(cfg.layout) do
@@ -2384,8 +2387,6 @@ local function applyAutoLayoutPlan(plan)
         for _, it in ipairs(shelf) do
           local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
           if oldFields[it.name] then item.fields = oldFields[it.name] end
-          local g2 = oldGeom[it.name]
-          if g2 then item.x, item.y, item.w, item.h = g2.x, g2.y, g2.w, g2.h end
           newItems[#newItems + 1] = item
         end
         cursorY = cursorY + shelfH + GAP
@@ -2418,12 +2419,7 @@ local function applyAutoLayoutPlan(plan)
         local x = 1
         for _, it in ipairs(row) do
           local item = it.ref
-          local bg = oldButtonGeom[item]
-          if bg then
-            item.x, item.y, item.w, item.h = bg.x, bg.y, bg.w, bg.h
-          else
-            item.x, item.y, item.w, item.h = x, cursorY, it.w, it.h
-          end
+          item.x, item.y, item.w, item.h = x, cursorY, it.w, it.h
           item.autoGroup = true
           newItems[#newItems + 1] = item
           x = x + it.w + HGAP
@@ -2453,6 +2449,32 @@ local function applyAutoLayoutPlan(plan)
       flushButtonRow(brow, browH)
 
       cursorY = cursorY + 1
+    end
+  end
+
+  -- Opportunistically restore each panel/button's prior spot over the
+  -- freshly packed one - but ONLY where doing so doesn't overlap
+  -- anything else in the final layout (other restored items, still-fresh
+  -- items, or manually kept titles/lines). The fresh pack above is
+  -- already guaranteed overlap-free by construction, so any substitution
+  -- that fails this check is skipped and that one item just keeps its
+  -- freshly packed spot instead - never a broken/overlapping result.
+  for _, item in ipairs(newItems) do
+    local old = item.type == "panel" and oldGeom[item.entity]
+      or item.type == "button" and oldButtonGeom[item]
+    if old and old.x >= 1 and old.y >= 1 + STATUS_ROWS
+       and old.x + old.w - 1 <= W and old.y + old.h - 1 <= H then
+      local cand = { x = old.x, y = old.y, w = old.w, h = old.h }
+      local safe = true
+      for _, other in ipairs(newItems) do
+        if other ~= item and overlaps(cand, other) then safe = false break end
+      end
+      if safe then
+        for _, other in ipairs(kept) do
+          if overlaps(cand, other) then safe = false break end
+        end
+      end
+      if safe then item.x, item.y, item.w, item.h = cand.x, cand.y, cand.w, cand.h end
     end
   end
 
