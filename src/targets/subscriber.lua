@@ -940,19 +940,26 @@ end
 local HGAP = 1              -- horizontal gap between panels on a shelf
 local STRETCH_MAX_W = 44     -- don't let a single panel get absurdly wide
 
--- once a shelf's members are fixed, grow them to actually use the
--- monitor's width instead of leaving a big empty strip on the right -
--- this is what makes the dashboard fill available space
+-- once a shelf's members are fixed, grow the stretchable ones (panels)
+-- to actually use the monitor's width instead of leaving a big empty
+-- strip on the right - this is what makes the dashboard fill available
+-- space. Buttons never stretch (it.stretch is unset/false for them) -
+-- they keep their shared natural width whether they're sharing a row
+-- with panels or packed into a row of their own.
 local function distributeShelfWidths(shelf, W, gap)
   local n = #shelf
   if n == 0 then return end
   local used = gap * (n - 1)
   for _, it in ipairs(shelf) do used = used + it.w end
   local leftover = W - used
-  if leftover > 0 then
-    local share = math.floor(leftover / n)
-    local rem = leftover - share * n
-    for i, it in ipairs(shelf) do
+  local stretchable = {}
+  for _, it in ipairs(shelf) do
+    if it.stretch then stretchable[#stretchable + 1] = it end
+  end
+  if leftover > 0 and #stretchable > 0 then
+    local share = math.floor(leftover / #stretchable)
+    local rem = leftover - share * #stretchable
+    for i, it in ipairs(stretchable) do
       local grow = share + (i <= rem and 1 or 0)
       it.w = math.min(STRETCH_MAX_W, it.w + grow)
     end
@@ -1067,52 +1074,32 @@ local function applyAutoLayoutPlan(plan)
       }
       cursorY = cursorY + 1
 
-      -- panels: shelf-packed and stretched to fill the row (unchanged) -
-      -- more info is worth the extra space
-      local function flushPanelShelf(shelf, shelfH)
+      -- panels and buttons are packed into the same shelf rows, left to
+      -- right, panels first then buttons - so a trailing button squeezes
+      -- into whatever width a panel row has left over instead of always
+      -- being pushed onto a row of its own below every panel (which
+      -- wasted vertical space on shorter monitors). Panels stretch to
+      -- fill any leftover row width same as always; buttons never
+      -- stretch (they share one natural width per group, the widest
+      -- label's, capped so one long label can't blow the rest up) and
+      -- never grow to match a taller panel sharing their row - they
+      -- just sit at their own natural height, top-aligned in the row.
+      local function flushShelf(shelf, shelfH)
         if #shelf == 0 then return end
         distributeShelfWidths(shelf, W, HGAP)
         for _, it in ipairs(shelf) do
-          local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
-          if oldFields[it.name] then item.fields = oldFields[it.name] end
-          newItems[#newItems + 1] = item
+          if it.kind == "panel" then
+            local item = { type = "panel", entity = it.name, x = it.x, y = cursorY, w = it.w, h = shelfH }
+            if oldFields[it.name] then item.fields = oldFields[it.name] end
+            newItems[#newItems + 1] = item
+          else
+            local item = it.ref
+            item.x, item.y, item.w, item.h = it.x, cursorY, it.w, it.h
+            item.autoGroup = true
+            newItems[#newItems + 1] = item
+          end
         end
         cursorY = cursorY + shelfH + GAP
-      end
-
-      local pshelf, pUsedW, pShelfH = {}, 0, 0
-      for _, name in ipairs(g.panels) do
-        local w, h = panelSize(name)
-        local addW = (#pshelf == 0) and w or (HGAP + w)
-        if #pshelf > 0 and pUsedW + addW > W then
-          flushPanelShelf(pshelf, pShelfH)
-          pshelf, pUsedW, pShelfH = {}, 0, 0
-          addW = w
-        end
-        pshelf[#pshelf + 1] = { name = name, w = w, h = h }
-        pUsedW = pUsedW + addW
-        pShelfH = math.max(pShelfH, h)
-      end
-      flushPanelShelf(pshelf, pShelfH)
-
-      -- buttons: packed separately from panels, at their own natural
-      -- size - NOT stretched to fill the row width or match panel
-      -- height, that's what was making them huge. Every button in the
-      -- group shares one width (the widest label's, capped so one long
-      -- label can't blow the rest up) for a tidy grid look, and rows
-      -- wrap at that width - so narrower buttons naturally stack under
-      -- each other instead of being stretched wide to fill the shelf.
-      local function flushButtonRow(row, rowH)
-        if #row == 0 then return end
-        local x = 1
-        for _, it in ipairs(row) do
-          local item = it.ref
-          item.x, item.y, item.w, item.h = x, cursorY, it.w, it.h
-          item.autoGroup = true
-          newItems[#newItems + 1] = item
-          x = x + it.w + HGAP
-        end
-        cursorY = cursorY + rowH + GAP
       end
 
       local btnW = 0
@@ -1121,20 +1108,29 @@ local function applyAutoLayoutPlan(plan)
       end
       btnW = math.min(btnW, STRETCH_MAX_W)
 
-      local brow, bUsedW, browH = {}, 0, 0
+      local entries = {}
+      for _, name in ipairs(g.panels) do
+        local w, h = panelSize(name)
+        entries[#entries + 1] = { kind = "panel", name = name, w = w, h = h, stretch = true }
+      end
       for _, item in ipairs(g.buttons) do
         local _, h = buttonSize(item)
-        local addW = (#brow == 0) and btnW or (HGAP + btnW)
-        if #brow > 0 and bUsedW + addW > W then
-          flushButtonRow(brow, browH)
-          brow, bUsedW, browH = {}, 0, 0
-          addW = btnW
-        end
-        brow[#brow + 1] = { ref = item, w = btnW, h = h }
-        bUsedW = bUsedW + addW
-        browH = math.max(browH, h)
+        entries[#entries + 1] = { kind = "button", ref = item, w = btnW, h = h }
       end
-      flushButtonRow(brow, browH)
+
+      local shelf, usedW, shelfH = {}, 0, 0
+      for _, it in ipairs(entries) do
+        local addW = (#shelf == 0) and it.w or (HGAP + it.w)
+        if #shelf > 0 and usedW + addW > W then
+          flushShelf(shelf, shelfH)
+          shelf, usedW, shelfH = {}, 0, 0
+          addW = it.w
+        end
+        shelf[#shelf + 1] = it
+        usedW = usedW + addW
+        shelfH = math.max(shelfH, it.h)
+      end
+      flushShelf(shelf, shelfH)
 
       cursorY = cursorY + 1
     end
