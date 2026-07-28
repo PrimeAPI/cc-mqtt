@@ -1,4 +1,4 @@
--- cc-mqtt provider.lua | release v37 | commit 054d543 | built 2026-07-28T21:25:08Z
+-- cc-mqtt provider.lua | release v38 | commit b08e419 | built 2026-07-28T21:37:36Z
 -- Generated from src/targets/provider.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
