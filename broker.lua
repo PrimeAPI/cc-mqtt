@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release dev | commit c63c8b9 | built 2026-08-03T18:25:19Z
+-- cc-mqtt broker.lua | release v39 | commit ef09b07 | built 2026-08-03T18:25:54Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
