@@ -1001,6 +1001,46 @@ end
 
 local devices = {}   -- list of {pname, ptype, p, handler, entity, topic, options, actions, fields}
 
+-- Shared by scan() (initial wrap) and ensureWrapped() (re-wrap after a
+-- presence gap, below) so both build a device's actions table the exact
+-- same way - a handler's actions closures capture the peripheral handle
+-- they're built with directly, not dev.p, so re-wrapping dev.p alone on
+-- recovery would fix telemetry but silently leave every action still
+-- bound to the OLD (dead) handle.
+local function buildActions(dev, p)
+  local acts = dev.handler.actions and dev.handler.actions(p, dev) or {}
+  acts.ping = acts.ping or function() return "pong from " .. dev.entity end
+  return acts
+end
+
+-- Peripheral references can go stale: a multiblock (reactor/matrix/
+-- turbine/...) temporarily unforming and reforming, or a wired modem link
+-- blipping, can leave peripheral.wrap()'s original handle from scan()
+-- pointing at a peripheral that's no longer really there - all while
+-- announce()/publish() keep firing on schedule, so the broker still shows
+-- the entity ONLINE the whole time even though its data (and any action
+-- run through it) has gone stale or wrong. publish() calls this before
+-- every collect() to catch that gap and re-wrap once the peripheral comes
+-- back, instead of trusting a handle that's been dead for who knows how
+-- long. Returns false while the peripheral is currently absent (caller
+-- should publish {formed=false} rather than call collect() at all).
+local function ensureWrapped(dev)
+  if dev._isVirtual then return true end
+  if not peripheral.isPresent(dev.pname) then
+    dev._wasAbsent = true
+    return false
+  end
+  if dev._wasAbsent then
+    local ok, newP = pcall(peripheral.wrap, dev.pname)
+    if ok and newP then
+      dev.p = newP
+      dev.actions = buildActions(dev, newP)
+    end
+    dev._wasAbsent = false
+  end
+  return true
+end
+
 local function scan()
   for _, pname in ipairs(peripheral.getNames()) do
     local ptype = peripheral.getType(pname)
@@ -1039,8 +1079,7 @@ local function scan()
           dev.fields = h.fields
         end
         if h == GENERIC then setupGeneric(dev) end
-        dev.actions = h.actions and h.actions(p, dev) or {}
-        dev.actions.ping = dev.actions.ping or function() return "pong from " .. dev.entity end
+        dev.actions = buildActions(dev, p)
         devices[#devices + 1] = dev
       end
     end
@@ -1057,10 +1096,9 @@ local function scan()
         pname = key, ptype = "redstone (local)", p = redstone, handler = h,
         entity = c.entity, options = c.options or {},
         topic = "redstone/" .. c.entity, title = "Redstone",
-        fields = nil,
+        fields = nil, _isVirtual = true,
       }
-      dev.actions = h.actions(redstone, dev)
-      dev.actions.ping = function() return "pong from " .. dev.entity end
+      dev.actions = buildActions(dev, redstone)
       devices[#devices + 1] = dev
     end
   end
@@ -1146,6 +1184,14 @@ local SLOW_COLLECT_MS = 1000
 local BACKOFF_SECONDS = 8
 
 local function publish(dev)
+  if not ensureWrapped(dev) then
+    send({
+      type = "publish", entity = dev.entity, topic = dev.topic,
+      data = { formed = false }, actions = getActionNames(dev), version = updater.currentVersion,
+    })
+    return
+  end
+
   local collectT0 = os.clock()
   local ok, data = pcall(dev.handler.collect, dev.p, dev)
   local collectMs = (os.clock() - collectT0) * 1000
@@ -1200,16 +1246,56 @@ local function publish(dev)
   })
 end
 
+-- Dedupes a command the broker retried because our cmdAck (below) never
+-- made it back - without this, a retried "scram" would run twice. Keyed
+-- by cmdId, cached long enough to outlast the broker's whole retry window
+-- (see broker.lua's CMD_RETRY_TIMEOUT * CMD_MAX_ATTEMPTS) and swept
+-- periodically in the main loop so it can't grow unbounded over a
+-- long-running provider.
+local recentCmdIds = {}   -- cmdId -> { result, error, at }
+local RECENT_CMD_TTL = 30 -- seconds
+
+local function purgeRecentCmdIds()
+  local t = os.clock()
+  for id, rec in pairs(recentCmdIds) do
+    if t - rec.at > RECENT_CMD_TTL then recentCmdIds[id] = nil end
+  end
+end
+
 local function handleCommand(msg)
+  -- Ack the broker immediately, before running the (possibly slow - see
+  -- SLOW_COLLECT_MS above) peripheral call below. This is what lets the
+  -- broker's retry logic (checkCommandRetries() in broker.lua) tell
+  -- "provider never got this" (worth retrying) apart from "provider got
+  -- it, just still working on it" (not worth retrying/duplicating).
+  if msg.cmdId and broker then
+    rednet.send(broker, { type = "cmdAck", cmdId = msg.cmdId }, PROTOCOL)
+  end
+
+  if msg.cmdId and recentCmdIds[msg.cmdId] then
+    local cached = recentCmdIds[msg.cmdId]
+    if msg.from then
+      rednet.send(msg.from, { type = "cmdResult", entity = msg.entity,
+        action = msg.action, result = cached.result, error = cached.error }, PROTOCOL)
+    end
+    return
+  end
+
   for _, dev in ipairs(devices) do
     if dev.entity == msg.entity then
-      local fn = dev.actions[msg.action or ""]
+      local present = ensureWrapped(dev)
+      local fn = present and dev.actions[msg.action or ""]
       local result, err
-      if fn then
+      if not present then
+        err = "peripheral not present"
+      elseif fn then
         local ok, res, e = pcall(fn, msg.args)
         if ok then result, err = res, e else err = tostring(res) end
       else
         err = "unknown action: " .. tostring(msg.action)
+      end
+      if msg.cmdId then
+        recentCmdIds[msg.cmdId] = { result = result, error = err, at = os.clock() }
       end
       if msg.from then
         rednet.send(msg.from, {
@@ -1223,6 +1309,15 @@ local function handleCommand(msg)
       screen.log(line, err ~= nil)
       return
     end
+  end
+
+  -- No device on THIS provider owns that entity name - previously this
+  -- just silently did nothing at all (no result, no log line), which from
+  -- the requester's side looked identical to a dropped packet.
+  local err = "entity not handled by this provider: " .. tostring(msg.entity)
+  if msg.cmdId then recentCmdIds[msg.cmdId] = { error = err, at = os.clock() } end
+  if msg.from then
+    rednet.send(msg.from, { type = "cmdResult", entity = msg.entity, action = msg.action, error = err }, PROTOCOL)
   end
 end
 
@@ -1260,6 +1355,7 @@ local nextPub = 0
 -- delay entering the loop itself (see the startup section for why that
 -- matters for the update checker too).
 local nextAnn = 0
+local nextCmdPurge = os.clock() + RECENT_CMD_TTL
 
 -- Devices are polled one at a time, round-robin, instead of all in one
 -- synchronous burst every INTERVAL. Every peripheral call here is a real
@@ -1670,6 +1766,10 @@ while true do
     if not broker then findBroker(true) end
     announceAll()
     nextAnn = t + ANNOUNCE
+  end
+  if t >= nextCmdPurge then
+    purgeRecentCmdIds()
+    nextCmdPurge = t + RECENT_CMD_TTL
   end
   -- Redraws only if the active view is actually dirty, or (LIST/the
   -- screensaver) it's due for its own redrawInterval refresh - see

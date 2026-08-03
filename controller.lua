@@ -1,4 +1,4 @@
--- cc-mqtt controller.lua | release v38 | commit b08e419 | built 2026-07-28T21:37:36Z
+-- cc-mqtt controller.lua | release dev | commit c63c8b9 | built 2026-08-03T18:25:19Z
 -- Generated from src/targets/controller.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -3186,6 +3186,19 @@ local function handleMessage(srcId, msg)
         entities[n] = e
       end
     end
+
+  -- sendCommand() only ever knew "did I have a broker to send this to",
+  -- never whether the command actually landed - every automation-fired
+  -- action was logged "OK" the instant it was sent, rednet drop or
+  -- provider rejection or not. This is the broker's real answer (see
+  -- broker.lua's dispatchCommand()/checkCommandRetries(), which now
+  -- retries the provider hop before giving up and reporting this),
+  -- surfaced as its own audit entry so a silently-failed automation
+  -- action is actually visible instead of looking identical to a
+  -- successful one.
+  elseif msg.type == "error" and msg.of == "command" then
+    addAudit(nil, "broker", msg.entity or "?", msg.action or "?", nil,
+      "ERR: " .. tostring(msg.reason or "failed"))
   end
 end
 

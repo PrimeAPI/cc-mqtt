@@ -51,6 +51,29 @@ if not mon then error("No monitor found!", 0) end
 -- not whatever window currently wraps it.
 local realMon = mon
 
+-- Multiblock monitors (and even a single block reconnecting after a
+-- server restart) don't always report their FINAL size the instant
+-- peripheral.find() above runs - neighboring monitor blocks can still be
+-- attaching for a moment, especially right after a server restart when a
+-- whole fleet of computers/monitors comes back at once. Reading a
+-- transiently wrong (usually smaller) size here used to feed straight
+-- into ensurePanels()'s clamp-and-save pass below, which shrank every
+-- saved panel position to fit and PERSISTED that shrunk layout to disk -
+-- permanently wrecking it even once the monitor caught up to its real
+-- size a few seconds later. Wait for two consecutive reads to agree
+-- (a few seconds' budget) before trusting it for anything.
+local function waitForStableMonitorSize(m)
+  local w, h = m.getSize()
+  for _ = 1, 6 do
+    sleep(0.5)
+    local w2, h2 = m.getSize()
+    if w2 == w and h2 == h then return w, h end
+    w, h = w2, h2
+  end
+  return w, h
+end
+waitForStableMonitorSize(realMon)
+
 --------------------------------------------------------------------
 -- config
 --------------------------------------------------------------------
@@ -142,6 +165,12 @@ local broker
 local ents = {}       -- name -> {data, meta, lastSeen, stale}
 local registry = {}   -- name -> {kind, online}
 
+-- Forward-declared: handleNet() (below) already wants to raise a banner
+-- through it on the actual command result, but it's only actually
+-- created down in the "status bar" section. Same reasoning as
+-- broker.lua/provider.lua/controller.lua's identical forward decls.
+local setMonBanner
+
 local function findBroker(silent)
   local b = rednet.lookup(PROTOCOL, "broker")
   if b then
@@ -195,6 +224,17 @@ local function handleNet(msg, senderId)
     if msg.update then
       updater.safeCall(updater.applyFromRelay, msg.update.tagName, msg.update.assetUrl, msg.update.checksum)
     end
+    if msg.of == "command" then
+      setMonBanner("command dispatched", false)
+    end
+
+  -- rednet is unreliable and a dropped/rejected command previously left
+  -- the button-tap-time "sent 'x' -> y" banner (see the "button" handling
+  -- below) as the only feedback ever shown, even when the command never
+  -- actually reached anything - this is the broker's real answer,
+  -- overwriting that optimistic banner with what happened.
+  elseif msg.type == "error" and msg.of == "command" then
+    setMonBanner(("FAILED: %s"):format(tostring(msg.reason or "?")), true)
 
   elseif msg.type == "data" and msg.entity then
     ents[msg.entity] = ents[msg.entity] or {}
@@ -240,6 +280,7 @@ local function handleNet(msg, senderId)
   elseif msg.type == "cmdResult" then
     print(("cmd result from %s: %s"):format(
       tostring(msg.entity), tostring(msg.error or msg.result)))
+    setMonBanner(("%s: %s"):format(tostring(msg.entity), tostring(msg.error or msg.result or "ok")), msg.error ~= nil)
   end
   return newFound
 end
@@ -694,10 +735,13 @@ local ANIM_W = 8
 local MON_BANNER_TIME = 3
 local monBanner = nil
 
--- called when a dashboard button is tapped; shown in the top bar for
--- a few seconds so the user gets visible confirmation of the click
-local function setMonBanner(msg)
-  monBanner = { text = msg, time = os.clock() }
+-- called when a dashboard button is tapped (and again when the actual
+-- ack/error/cmdResult for that command arrives, see handleNet's "ack"/
+-- "error"/"cmdResult" branches) - shown in the top bar for a few seconds
+-- so the user gets visible confirmation of what actually happened, not
+-- just that a tap was registered.
+function setMonBanner(msg, isError)
+  monBanner = { text = msg, time = os.clock(), error = isError or false }
 end
 
 local function drawStatusBar()
@@ -736,14 +780,16 @@ local function drawStatusBar()
   local clock = os.date("%H:%M")
   local right = ("%d/%d ok  %s"):format(ok, total, clock)
 
-  -- a fresh button click overrides the right side for a few seconds
-  if monBanner and os.clock() - monBanner.time <= MON_BANNER_TIME then
+  -- a fresh button click (or the real result that follows it, see
+  -- setMonBanner's callers) overrides the right side for a few seconds
+  local bannerActive = monBanner and os.clock() - monBanner.time <= MON_BANNER_TIME
+  if bannerActive then
     right = "> " .. monBanner.text
   end
 
   if #right < W then
     mon.setCursorPos(W - #right + 1, 1)
-    mon.setTextColor((monBanner and os.clock() - monBanner.time <= MON_BANNER_TIME) and colors.yellow
+    mon.setTextColor(bannerActive and (monBanner.error and colors.red or colors.yellow)
       or (ok < total and colors.red or colors.gray))
     mon.write(right)
   end
@@ -866,8 +912,32 @@ end
 
 -- every enabled entity gets a panel (existing panels keep their spot)
 local function ensurePanels()
-  -- migrate any items sitting in the reserved status bar row
-  for _, item in ipairs(cfg.layout) do clampItem(item) end
+  local W, H = mon.getSize()
+  -- cfg.layoutMonW/H is the monitor size the layout was last deliberately
+  -- saved against (set below, and by the layout editor's own saves). If
+  -- the monitor now reports something else, clamping every saved item
+  -- into the new bounds and persisting that is exactly what silently and
+  -- PERMANENTLY corrupted a good layout in the past on nothing more than
+  -- a transient boot-time misread (see waitForStableMonitorSize() above -
+  -- it narrows this window but can't close it completely, e.g. on a
+  -- genuine resize). So: skip the destructive clamp+save here. Panels
+  -- still render fine either way - window.create() silently clips
+  -- anything past the monitor's real bounds - so a stale-size mismatch at
+  -- worst shows a panel cut off at the edge, never an overlapping mess,
+  -- and the saved layout survives for the operator to actually fix (or
+  -- confirm) via setup's auto-layout instead of it being gone already.
+  local sizeKnownAndChanged = cfg.layoutMonW ~= nil
+    and (cfg.layoutMonW ~= W or cfg.layoutMonH ~= H)
+  if sizeKnownAndChanged then
+    print(("[layout] monitor now reports %dx%d, layout was saved for %dx%d - " ..
+      "leaving positions as-is (re-run auto-layout in setup to fix)"):format(
+      W, H, cfg.layoutMonW, cfg.layoutMonH))
+  else
+    -- migrate any items sitting in the reserved status bar row
+    for _, item in ipairs(cfg.layout) do clampItem(item) end
+  end
+
+  local added = false
   for name, c in pairs(cfg.entities) do
     if c.enabled then
       local found = false
@@ -882,10 +952,20 @@ local function ensurePanels()
         autoPlace(item)
         clampItem(item)
         cfg.layout[#cfg.layout + 1] = item
+        added = true
       end
     end
   end
-  saveConfig()
+
+  -- Only stamp/save the new size once positions actually match it again
+  -- (either they always did, or a new panel just got freshly placed
+  -- against it) - never while sizeKnownAndChanged is true and nothing
+  -- else happened, or this would immediately overwrite the "changed"
+  -- marker and silently accept whatever this one boot's reading was.
+  if added or not sizeKnownAndChanged then
+    cfg.layoutMonW, cfg.layoutMonH = W, H
+    saveConfig()
+  end
 end
 
 --------------------------------------------------------------------
@@ -1878,6 +1958,16 @@ end
 
 local function layoutScreen()
   ensurePanels()
+  -- Unlike ensurePanels()'s own unsupervised boot-time call, this is an
+  -- interactive session with a live preview the operator is actually
+  -- looking at (see preview() below) - every add/move/resize from here on
+  -- clamps against the CURRENT monitor size directly, so once we're here
+  -- that size is trustworthy. Stamp it now so ensurePanels()'s "size
+  -- changed, don't touch anything" guard clears - otherwise a real
+  -- resize the operator just fixed by hand here would still print that
+  -- warning (and skip the normal clamp pass) on every future boot.
+  cfg.layoutMonW, cfg.layoutMonH = mon.getSize()
+  saveConfig()
   local sel, offset = 1, 0
 
   local function myDraw(scr)

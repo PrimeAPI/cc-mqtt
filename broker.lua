@@ -1,4 +1,4 @@
--- cc-mqtt broker.lua | release v38 | commit b08e419 | built 2026-07-28T21:37:36Z
+-- cc-mqtt broker.lua | release dev | commit c63c8b9 | built 2026-08-03T18:25:19Z
 -- Generated from src/targets/broker.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -1493,6 +1493,21 @@ local entities  = {}   -- name -> {id, kind, topics, meta, actions, lastSeen, on
 local subs      = {}   -- computerId -> {patterns, name}
 local retained  = {}   -- topic -> last data message (sent to new subscribers)
 
+-- rednet is unreliable (no delivery guarantee, no ordering, no dedup - see
+-- the README's networking notes) and a dropped "command" packet is the
+-- single worst kind of silent failure this system has: a player presses
+-- an action button and nothing happens, with zero indication anywhere that
+-- anything went wrong. Every dispatched command gets a unique cmdId and
+-- sits in pendingCmds until the provider echoes a "cmdAck" for that id
+-- (see handleCommand() in provider.lua, sent immediately on receipt,
+-- before its possibly-slow peripheral call) - checkCommandRetries() below
+-- resends on a timeout and gives up (reporting failure to whoever asked)
+-- after CMD_MAX_ATTEMPTS, instead of the command just vanishing.
+local pendingCmds = {}   -- cmdId -> {entity, action, args, providerId, from, requesterName, sentAt, attempts}
+local nextCmdId = 1
+local CMD_RETRY_TIMEOUT = 3   -- seconds without a cmdAck before re-sending
+local CMD_MAX_ATTEMPTS  = 3   -- total sends (1 + up to 2 retries) before giving up
+
 local actionLog = {}   -- { {time=os.date string, text=...}, ... }, oldest first
 local LOG_MAX   = 200  -- hard cap so a long-running broker doesn't grow forever
 
@@ -1679,23 +1694,70 @@ local function getRetainedForEntity(name)
   return out
 end
 
-local function sendCommand(entName, actionName, rawArgs)
+-- Shared by every command origin (terminal browser, and network "command"
+-- messages from subscribers/tablets/controllers): creates the cmdId,
+-- records it in pendingCmds, and sends the first attempt. Returns
+-- (true, cmdId) on success or (false, reason) if the entity is unknown/
+-- offline (a hard reject - no point retrying something that can't work).
+local function dispatchCommand(entName, actionName, args, from)
   local e = entities[entName]
   if not e then
     return false, "Unknown entity: " .. tostring(entName)
   end
-  if not e.online then
+  if e.kind ~= "provider" or not e.online then
     return false, "Entity '" .. tostring(entName) .. "' is offline"
   end
-  local parsedArgs = Util.parseArg(rawArgs)
 
-  send(e.id, {
-    type = "command",
-    entity = entName,
-    action = actionName,
-    args = parsedArgs,
-    from = os.getComputerID(),
-  })
+  local cmdId = nextCmdId
+  nextCmdId = nextCmdId + 1
+  pendingCmds[cmdId] = {
+    entity = entName, action = actionName, args = args,
+    providerId = e.id, from = from, sentAt = now(), attempts = 1,
+  }
+  send(e.id, { type = "command", cmdId = cmdId, entity = entName,
+               action = actionName, args = args, from = from })
+  return true, cmdId
+end
+
+-- Sweeps pendingCmds every main-loop iteration (cheap - the table is
+-- normally empty or has a handful of entries). Three outcomes per pending
+-- command: still within its timeout (leave it), timed out with attempts
+-- left (resend to the same provider), or timed out with none left / the
+-- provider went offline mid-flight (give up and tell the original
+-- requester it failed, instead of leaving them thinking it worked).
+local function checkCommandRetries()
+  local t = now()
+  for cmdId, p in pairs(pendingCmds) do
+    local e = entities[p.entity]
+    if not e or not e.online then
+      send(p.from, { type = "error", of = "command", entity = p.entity, action = p.action,
+        reason = ("'%s' went offline before confirming '%s'"):format(p.entity, p.action) })
+      logAction(("[%s] %s -> %s FAILED (offline before ack)"):format(
+        (subs[p.from] and subs[p.from].name) or ("#" .. tostring(p.from)), p.entity, p.action), true)
+      pendingCmds[cmdId] = nil
+    elseif t - p.sentAt >= CMD_RETRY_TIMEOUT then
+      if p.attempts >= CMD_MAX_ATTEMPTS then
+        send(p.from, { type = "error", of = "command", entity = p.entity, action = p.action,
+          reason = ("'%s' did not respond to '%s' after %d attempts"):format(p.entity, p.action, p.attempts) })
+        logAction(("[%s] %s -> %s FAILED (no ack after %d attempts)"):format(
+          (subs[p.from] and subs[p.from].name) or ("#" .. tostring(p.from)), p.entity, p.action, p.attempts), true)
+        pendingCmds[cmdId] = nil
+      else
+        p.attempts = p.attempts + 1
+        p.sentAt = t
+        send(e.id, { type = "command", cmdId = cmdId, entity = p.entity,
+                     action = p.action, args = p.args, from = p.from })
+        logAction(("[%s] %s -> %s retry #%d (no ack yet)"):format(
+          (subs[p.from] and subs[p.from].name) or ("#" .. tostring(p.from)), p.entity, p.action, p.attempts))
+      end
+    end
+  end
+end
+
+local function sendCommand(entName, actionName, rawArgs)
+  local parsedArgs = Util.parseArg(rawArgs)
+  local ok, cmdIdOrErr = dispatchCommand(entName, actionName, parsedArgs, os.getComputerID())
+  if not ok then return false, cmdIdOrErr end
   logAction(("[local] %s -> %s(%s)"):format(entName, actionName, fmtArg(parsedArgs)))
   return true, ("Sent '%s' to %s"):format(actionName, entName)
 end
@@ -2362,20 +2424,26 @@ local function handle(id, msg)
     send(id, { type = "registry", entities = list })
 
   elseif msg.type == "command" then
-    local e = entities[msg.entity or ""]
     local requester = (subs[id] and subs[id].name) or ("#" .. tostring(id))
-    if e and e.kind == "provider" and e.online then
-      send(e.id, { type = "command", entity = msg.entity,
-                   action = msg.action, args = msg.args, from = id })
+    local ok, cmdIdOrErr = dispatchCommand(msg.entity, msg.action, msg.args, id)
+    if ok then
       send(id, { type = "ack", of = "command" })
       logAction(("[%s] %s -> %s(%s)"):format(
         requester, msg.entity, msg.action, fmtArg(msg.args)))
     else
-      send(id, { type = "error", of = "command",
-                 reason = "unknown or offline entity: " .. tostring(msg.entity) })
-      logAction(("[%s] %s -> %s FAILED (unknown/offline)"):format(
-        requester, tostring(msg.entity), tostring(msg.action)), true)
+      send(id, { type = "error", of = "command", entity = msg.entity, action = msg.action,
+                 reason = cmdIdOrErr })
+      logAction(("[%s] %s -> %s FAILED (%s)"):format(
+        requester, tostring(msg.entity), tostring(msg.action), cmdIdOrErr), true)
     end
+
+  -- Provider's receipt confirmation for a dispatched command (sent
+  -- immediately on arrival, before it actually runs the - possibly slow -
+  -- peripheral call, see provider.lua's handleCommand()). This is what lets
+  -- checkCommandRetries() tell "provider never got it" (worth retrying)
+  -- apart from "provider is just slow to execute it" (not worth retrying).
+  elseif msg.type == "cmdAck" then
+    pendingCmds[msg.cmdId] = nil
 
   elseif msg.type == "cmdResult" then
     termScreen.banner(("Result [%s]: %s"):format(tostring(msg.entity), fmtArg(msg.error or msg.result)), msg.error ~= nil)
@@ -2441,6 +2509,12 @@ while true do
   -- Drives all update-check scheduling (routine checks, failure retries,
   -- stuck-request recovery) - see updater.tick()'s own comment.
   updater.safeCall(updater.tick)
+
+  -- Cheap even at full traffic - pendingCmds is normally empty or has a
+  -- handful of entries - so this runs every iteration rather than being
+  -- gated behind TICK, keeping retry/failure latency close to
+  -- CMD_RETRY_TIMEOUT instead of adding TICK's own delay on top of it.
+  checkCommandRetries()
 
   local t = now()
   if t >= nextTick then

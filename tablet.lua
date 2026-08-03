@@ -1,4 +1,4 @@
--- cc-mqtt tablet.lua | release v38 | commit b08e419 | built 2026-07-28T21:37:36Z
+-- cc-mqtt tablet.lua | release dev | commit c63c8b9 | built 2026-08-03T18:25:19Z
 -- Generated from src/targets/tablet.lua + src/lib/*.lua - do not edit directly.
 local __inc_lib_updater_lua = (function()
 --------------------------------------------------------------------
@@ -1400,6 +1400,13 @@ local broker = nil
 local ents = {}     -- { entityName = { data = {}, meta = {}, lastSeen = timestamp, kind = "" } }
 local registry = {} -- { entityName = { kind = "", online = bool } }
 
+-- Forward-declared: handleNet() (below) already wants to raise a banner
+-- through it, but it's only actually created down in the "screens
+-- rendering" section. Same reasoning as broker.lua/provider.lua/
+-- controller.lua's identical forward decls - a local assigned later is
+-- still the same upvalue every closure defined in between sees.
+local tabletScreen
+
 local function findBroker()
   local id = rednet.lookup(PROTOCOL, "broker")
   if id then broker = id return true end
@@ -1460,8 +1467,21 @@ local function handleNet(msg, senderId)
       if #acts > 0 then ents[name].actions = acts end
     end
 
+  -- rednet is unreliable and a command sent from here previously always
+  -- showed a static "Sent 'x' to y" banner regardless of what actually
+  -- happened next - identical whether it worked, silently vanished in
+  -- transit, or the provider rejected it. These three replace that with
+  -- what the broker (see broker.lua's dispatchCommand()/
+  -- checkCommandRetries()) and provider actually reported.
+  elseif msg.type == "ack" and msg.of == "command" then
+    tabletScreen.banner("Command dispatched to provider", false)
+
+  elseif msg.type == "error" and msg.of == "command" then
+    tabletScreen.banner(("Command failed: %s"):format(tostring(msg.reason or "unknown error")), true)
+
   elseif msg.type == "cmdResult" then
-    return msg.entity, msg.action, msg.result, msg.error
+    local resultText = msg.error and tostring(msg.error) or tostring(msg.result or "ok")
+    tabletScreen.banner(("%s: %s"):format(tostring(msg.entity), resultText), msg.error ~= nil)
   end
 end
 
@@ -2353,7 +2373,7 @@ end
 -- personal handheld device someone's actively holding, not a fixed
 -- computer nobody's standing at most of the day, so there's no "closed
 -- until first key" state to begin with - the dashboard is always live.
-local tabletScreen = Screen.new(term, { defaultView = "dashboard" })
+tabletScreen = Screen.new(term, { defaultView = "dashboard" })
 tabletScreen.registerView("dashboard", { draw = drawDashboard, onClick = dashboardOnClick })
 tabletScreen.registerView("actions", { draw = drawActions, onClick = actionsOnClick })
 tabletScreen.registerView("entities", { draw = drawEntities, onClick = entitiesOnClick })
